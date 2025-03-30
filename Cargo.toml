@@ -1,0 +1,14 @@
+[package]
+name = "ctc_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.3"
+tokio = { version = "1.44.1", features = ["full"] }
+tokio-modbus = { version = "0.16.1", default-features = false, features = ["rtu"] }
+tokio-serial = "5.4.5"
+tokio-util = "0.7.14"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+serde = { version = "1.0.219", features = ["derive"] }
