@@ -1,11 +1,11 @@
 // Define the modbus parameters for the CTC Heating System 1.
 // see 'Service document-BMS Register-17003548.pdf'
 #![allow(dead_code)]
-use crate::modbus::{Access, ModbusParameter};
+use crate::modbus::{Access, CTCModbusParameter};
 
 // region: --- CTC Heating System 1 Modbus Parameters
 
-pub const HEATSYSTEM_ROOM_SETTEMP: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_ROOM_SETTEMP: CTCModbusParameter = CTCModbusParameter {
     id: 61509,
     signed: true,
     access: Access::RW,
@@ -15,9 +15,11 @@ pub const HEATSYSTEM_ROOM_SETTEMP: ModbusParameter = ModbusParameter {
     visible: 62500,
     bit: 9,
     factor: 0.1,
+    description: "Heating system 1: Set room temperature",
+    // description: String::from("Heating system 1: Setting room temp"),
 };
 
-pub const HEATSYSTEM_INCLINATION: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_INCLINATION: CTCModbusParameter = CTCModbusParameter {
     id: 61513,
     signed: true,
     access: Access::RW,
@@ -27,9 +29,10 @@ pub const HEATSYSTEM_INCLINATION: ModbusParameter = ModbusParameter {
     visible: 62500,
     bit: 13,
     factor: 0.1,
+    description: "Heating system 1: Change inclination",
 };
 
-pub const HEATSYSTEM_ADJUSTMENT: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_ADJUSTMENT: CTCModbusParameter = CTCModbusParameter {
     id: 61517,
     signed: true,
     access: Access::RW,
@@ -39,9 +42,10 @@ pub const HEATSYSTEM_ADJUSTMENT: ModbusParameter = ModbusParameter {
     visible: 62501,
     bit: 1,
     factor: 0.1,
+    description: "Heating system 1: Change adjustment",
 };
 
-pub const HEATSYSTEM_FLOW_MAX_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_FLOW_MAX_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 61534,
     signed: true,
     access: Access::RW,
@@ -51,9 +55,10 @@ pub const HEATSYSTEM_FLOW_MAX_TEMP: ModbusParameter = ModbusParameter {
     visible: 62502,
     bit: 2,
     factor: 0.1,
+    description: "Heating system 1: Max Primary flow °C",
 };
 
-pub const HEATSYSTEM_FLOW_MIN_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_FLOW_MIN_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 61538,
     signed: true,
     access: Access::RW,
@@ -63,9 +68,10 @@ pub const HEATSYSTEM_FLOW_MIN_TEMP: ModbusParameter = ModbusParameter {
     visible: 62502,
     bit: 6,
     factor: 0.1,
+    description: "Heating system 1: Min primary flow °C",
 };
 
-pub const HEATSYSTEM_HEATING_MODE: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_HEATING_MODE: CTCModbusParameter = CTCModbusParameter {
     id: 61542,
     signed: true,
     access: Access::RW,
@@ -75,9 +81,10 @@ pub const HEATSYSTEM_HEATING_MODE: ModbusParameter = ModbusParameter {
     visible: 62502,
     bit: 10,
     factor: 1.0,
+    description: "Heating system 1: Heating mode",
 };
 
-pub const HEATSYSTEM_HEAT_OFF_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_HEAT_OFF_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 61546,
     signed: true,
     access: Access::RW,
@@ -87,9 +94,10 @@ pub const HEATSYSTEM_HEAT_OFF_TEMP: ModbusParameter = ModbusParameter {
     visible: 62502,
     bit: 14,
     factor: 0.1,
+    description: "Heating system 1: Heating off, out °C",
 };
 
-pub const HEATSYSTEM_HEAT_OFF_TIME: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_HEAT_OFF_TIME: CTCModbusParameter = CTCModbusParameter {
     id: 61550,
     signed: true,
     access: Access::RW,
@@ -99,9 +107,10 @@ pub const HEATSYSTEM_HEAT_OFF_TIME: ModbusParameter = ModbusParameter {
     visible: 62503,
     bit: 2,
     factor: 1.0,
+    description: "Heating system 1: Heating off time",
 };
 
-pub const HEATSYSTEM_ROOM_TEMP_NIGHT_REDUCTION: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_ROOM_TEMP_NIGHT_REDUCTION: CTCModbusParameter = CTCModbusParameter {
     id: 61554,
     signed: true,
     access: Access::RW,
@@ -111,9 +120,10 @@ pub const HEATSYSTEM_ROOM_TEMP_NIGHT_REDUCTION: ModbusParameter = ModbusParamete
     visible: 62503,
     bit: 6,
     factor: 0.1,
+    description: "Heating system 1: Room temp night reduction",
 };
 
-pub const HEATSYSTEM_FLOW_NIGHT_REDUCTION: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_FLOW_NIGHT_REDUCTION: CTCModbusParameter = CTCModbusParameter {
     id: 61558,
     signed: true,
     access: Access::RW,
@@ -123,9 +133,10 @@ pub const HEATSYSTEM_FLOW_NIGHT_REDUCTION: ModbusParameter = ModbusParameter {
     visible: 62503,
     bit: 10,
     factor: 0.1,
+    description: "Heating system 1: Primary flow Night reduction",
 };
 
-pub const HEATSYSTEM_OUTDOOR_NIGHT_REDUCTION: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_OUTDOOR_NIGHT_REDUCTION: CTCModbusParameter = CTCModbusParameter {
     id: 61562,
     signed: true,
     access: Access::RW,
@@ -135,9 +146,10 @@ pub const HEATSYSTEM_OUTDOOR_NIGHT_REDUCTION: ModbusParameter = ModbusParameter 
     visible: 62503,
     bit: 14,
     factor: 0.1,
+    description: "Heating system 1: Outdoor temp night reduction",
 };
 
-pub const HEATSYSTEM_ALARM_LOW_ROOM_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_ALARM_LOW_ROOM_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 61566,
     signed: true,
     access: Access::RW,
@@ -147,9 +159,10 @@ pub const HEATSYSTEM_ALARM_LOW_ROOM_TEMP: ModbusParameter = ModbusParameter {
     visible: 62504,
     bit: 2,
     factor: 0.1,
+    description: "Heating system 1: Alarm low room temperature",
 };
 
-pub const HEATSYSTEM_HOLIDAY_REDUCTION: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_HOLIDAY_REDUCTION: CTCModbusParameter = CTCModbusParameter {
     id: 61602,
     signed: true,
     access: Access::RW,
@@ -159,9 +172,10 @@ pub const HEATSYSTEM_HOLIDAY_REDUCTION: ModbusParameter = ModbusParameter {
     visible: 62506,
     bit: 6,
     factor: 0.1,
+    description: "Heating system 1: Holiday reduction",
 };
 
-pub const HEATSYSTEM_FLOW_HOLIDAY_REDUCTION: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_FLOW_HOLIDAY_REDUCTION: CTCModbusParameter = CTCModbusParameter {
     id: 61606,
     signed: true,
     access: Access::RW,
@@ -171,22 +185,23 @@ pub const HEATSYSTEM_FLOW_HOLIDAY_REDUCTION: ModbusParameter = ModbusParameter {
     visible: 62506,
     bit: 10,
     factor: 0.1,
+    description: "Heating system 1: Primary flow Holiday reduction",
 };
 
-pub const HEATSYSTEM_FLOW_SETPOINT: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_FLOW_SETPOINT: CTCModbusParameter = CTCModbusParameter {
     id: 62007,
     signed: true,
     access: Access::R,
-    // Not used for read-only parameters, so max, min, and step are 0.
     reg_max: 0,
     reg_min: 0,
     reg_step: 0,
     visible: 62531,
     bit: 11,
     factor: 0.1,
+    description: "Heating system 1: Temperature setpoint primary flow",
 };
 
-pub const HEATSYSTEM_FLOW_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_FLOW_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62011,
     signed: true,
     access: Access::R,
@@ -196,9 +211,10 @@ pub const HEATSYSTEM_FLOW_TEMP: ModbusParameter = ModbusParameter {
     visible: 62531,
     bit: 15,
     factor: 0.1,
+    description: "Heating system 1: Primary flow temperature",
 };
 
-pub const HEATSYSTEM_STATUS: ModbusParameter = ModbusParameter {
+pub static HEATSYSTEM_STATUS: CTCModbusParameter = CTCModbusParameter {
     id: 62246,
     signed: true,
     access: Access::R,
@@ -208,12 +224,14 @@ pub const HEATSYSTEM_STATUS: ModbusParameter = ModbusParameter {
     visible: 62546,
     bit: 10,
     factor: 1.0,
+    description: "Heating system 1 status",
 };
 
 // endregion: --- CTC Heating System 1 Modbus Parameters
 
 // region: --- CTC Common Modbus Parameters
-pub const CTC_RETURN_TEMP: ModbusParameter = ModbusParameter {
+
+pub static CTC_RETURN_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62015,
     signed: true,
     access: Access::R,
@@ -223,9 +241,10 @@ pub const CTC_RETURN_TEMP: ModbusParameter = ModbusParameter {
     visible: 62532,
     bit: 3,
     factor: 0.1,
+    description: "Return temp",
 };
 
-pub const CTC_HOT_WATER_MODE: ModbusParameter = ModbusParameter {
+pub static CTC_HOT_WATER_MODE: CTCModbusParameter = CTCModbusParameter {
     id: 61500,
     signed: true,
     access: Access::RW,
@@ -235,9 +254,10 @@ pub const CTC_HOT_WATER_MODE: ModbusParameter = ModbusParameter {
     visible: 62500,
     bit: 0,
     factor: 1.0,
+    description: "Hot water mode",
 };
 
-pub const CTC_ROOM_TEMP: ModbusParameter = ModbusParameter {
+pub static CTC_ROOM_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62203,
     signed: true,
     access: Access::R,
@@ -247,9 +267,10 @@ pub const CTC_ROOM_TEMP: ModbusParameter = ModbusParameter {
     visible: 62543,
     bit: 15,
     factor: 0.1,
+    description: "Current room temp 1",
 };
 
-pub const CTC_OUTDOOR_TEMP: ModbusParameter = ModbusParameter {
+pub static CTC_OUTDOOR_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62000,
     signed: true,
     access: Access::R,
@@ -259,9 +280,10 @@ pub const CTC_OUTDOOR_TEMP: ModbusParameter = ModbusParameter {
     visible: 62531,
     bit: 4,
     factor: 0.1,
+    description: "Outdoor temperature",
 };
 
-pub const CTC_VACCATION_DAYS: ModbusParameter = ModbusParameter {
+pub static CTC_VACCATION_DAYS: CTCModbusParameter = CTCModbusParameter {
     id: 61508,
     signed: true,
     access: Access::RW,
@@ -271,13 +293,14 @@ pub const CTC_VACCATION_DAYS: ModbusParameter = ModbusParameter {
     visible: 62500,
     bit: 8,
     factor: 1.0,
+    description: "Number of vacation days timer",
 };
-
 
 // endregion: --- CTC Common Modbus Parameters
 
 // region: --- CTC HeatPump 1 Modbus Parameters
-pub const HEATPUMP_BLOCKED: ModbusParameter = ModbusParameter {
+
+pub static HEATPUMP_BLOCKED: CTCModbusParameter = CTCModbusParameter {
     id: 61521,
     signed: true,
     access: Access::RW,
@@ -287,9 +310,10 @@ pub const HEATPUMP_BLOCKED: ModbusParameter = ModbusParameter {
     visible: 62501,
     bit: 5,
     factor: 1.0,
+    description: "Heat pump 1 (A1): Blocked",
 };
 
-pub const HEATPUMP_MAX_RMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_MAX_RMP: CTCModbusParameter = CTCModbusParameter {
     id: 61572,
     signed: true,
     access: Access::RW,
@@ -299,9 +323,10 @@ pub const HEATPUMP_MAX_RMP: ModbusParameter = ModbusParameter {
     visible: 62504,
     bit: 8,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Max RPS",
 };
 
-pub const HEATPUMP_STATUS: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_STATUS: CTCModbusParameter = CTCModbusParameter {
     id: 62017,
     signed: true,
     access: Access::R,
@@ -311,9 +336,10 @@ pub const HEATPUMP_STATUS: ModbusParameter = ModbusParameter {
     visible: 62532,
     bit: 5,
     factor: 1.0,
+    description: "Heat pump 1 (A1): Status",
 };
 
-pub const HEATPUMP_INLET_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_INLET_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62027,
     signed: true,
     access: Access::R,
@@ -323,9 +349,10 @@ pub const HEATPUMP_INLET_TEMP: ModbusParameter = ModbusParameter {
     visible: 62532,
     bit: 15,
     factor: 0.1,
+    description: "Heat pump 1 (A1) HP in",
 };
 
-pub const HEATPUMP_OUTLET_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_OUTLET_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62037,
     signed: true,
     access: Access::R,
@@ -335,9 +362,10 @@ pub const HEATPUMP_OUTLET_TEMP: ModbusParameter = ModbusParameter {
     visible: 62533,
     bit: 9,
     factor: 0.1,
+    description: "Heat pump 1 (A1) HP out",
 };
 
-pub const HEATPUMP_DISCHARGE_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_DISCHARGE_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62047,
     signed: true,
     access: Access::R,
@@ -347,9 +375,10 @@ pub const HEATPUMP_DISCHARGE_TEMP: ModbusParameter = ModbusParameter {
     visible: 62534,
     bit: 3,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Discharge temperature",
 };
 
-pub const HEATPUMP_SUCTION_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_SUCTION_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62057,
     signed: true,
     access: Access::R,
@@ -359,9 +388,10 @@ pub const HEATPUMP_SUCTION_TEMP: ModbusParameter = ModbusParameter {
     visible: 62534,
     bit: 13,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Suction gas temperature",
 };
 
-pub const HEATPUMP_HIGH_PRESSURE: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_HIGH_PRESSURE: CTCModbusParameter = CTCModbusParameter {
     id: 62067,
     signed: true,
     access: Access::R,
@@ -371,9 +401,10 @@ pub const HEATPUMP_HIGH_PRESSURE: ModbusParameter = ModbusParameter {
     visible: 62535,
     bit: 7,
     factor: 0.1,
+    description: "Heat pump 1 (A1): High pressure",
 };
 
-pub const HEATPUMP_LOW_PRESSURE: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_LOW_PRESSURE: CTCModbusParameter = CTCModbusParameter {
     id: 62077,
     signed: true,
     access: Access::R,
@@ -383,9 +414,10 @@ pub const HEATPUMP_LOW_PRESSURE: ModbusParameter = ModbusParameter {
     visible: 62536,
     bit: 1,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Low Pressure",
 };
 
-pub const HEATPUMP_BRINE_INLET_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_BRINE_INLET_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62087,
     signed: true,
     access: Access::R,
@@ -395,9 +427,10 @@ pub const HEATPUMP_BRINE_INLET_TEMP: ModbusParameter = ModbusParameter {
     visible: 62536,
     bit: 11,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Brine in",
 };
 
-pub const HEATPUMP_BRINE_OUTLET_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_BRINE_OUTLET_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62097,
     signed: true,
     access: Access::R,
@@ -407,9 +440,10 @@ pub const HEATPUMP_BRINE_OUTLET_TEMP: ModbusParameter = ModbusParameter {
     visible: 62537,
     bit: 5,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Brine out",
 };
 
-pub const HEATPUMP_CHARGE_PUMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_CHARGE_PUMP: CTCModbusParameter = CTCModbusParameter {
     id: 62107,
     signed: true,
     access: Access::R,
@@ -419,9 +453,10 @@ pub const HEATPUMP_CHARGE_PUMP: ModbusParameter = ModbusParameter {
     visible: 62537,
     bit: 15,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Charge pump",
 };
 
-pub const HEATPUMP_BRINE_PUMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_BRINE_PUMP: CTCModbusParameter = CTCModbusParameter {
     id: 62117,
     signed: true,
     access: Access::R,
@@ -431,9 +466,10 @@ pub const HEATPUMP_BRINE_PUMP: ModbusParameter = ModbusParameter {
     visible: 62538,
     bit: 9,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Brine pump",
 };
 
-pub const HEATPUMP_FAN_SPEED: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_FAN_SPEED: CTCModbusParameter = CTCModbusParameter {
     id: 62127,
     signed: true,
     access: Access::R,
@@ -443,9 +479,10 @@ pub const HEATPUMP_FAN_SPEED: ModbusParameter = ModbusParameter {
     visible: 62539,
     bit: 3,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Fan",
 };
 
-pub const HEATPUMP_DEFROST_TIMER: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_DEFROST_TIMER: CTCModbusParameter = CTCModbusParameter {
     id: 62137,
     signed: true,
     access: Access::R,
@@ -455,9 +492,10 @@ pub const HEATPUMP_DEFROST_TIMER: ModbusParameter = ModbusParameter {
     visible: 62539,
     bit: 13,
     factor: 1.0,
+    description: "Heat pump 1 (A1): Defrost timer",
 };
 
-pub const HEATPUMP_OUTDOOR_TEMP: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_OUTDOOR_TEMP: CTCModbusParameter = CTCModbusParameter {
     id: 62147,
     signed: true,
     access: Access::R,
@@ -467,9 +505,10 @@ pub const HEATPUMP_OUTDOOR_TEMP: ModbusParameter = ModbusParameter {
     visible: 62540,
     bit: 7,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Outdoor temp",
 };
 
-pub const HEATPUMP_SOFTWARE_VERSION: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_SOFTWARE_VERSION: CTCModbusParameter = CTCModbusParameter {
     id: 62157,
     signed: true,
     access: Access::R,
@@ -479,9 +518,10 @@ pub const HEATPUMP_SOFTWARE_VERSION: ModbusParameter = ModbusParameter {
     visible: 62541,
     bit: 1,
     factor: 1.0,
+    description: "Heat pump 1 (A1): Software version",
 };
 
-pub const HEATPUMP_CURRENT_RPS: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_CURRENT_RPS: CTCModbusParameter = CTCModbusParameter {
     id: 62193,
     signed: true,
     access: Access::R,
@@ -491,9 +531,10 @@ pub const HEATPUMP_CURRENT_RPS: ModbusParameter = ModbusParameter {
     visible: 62543,
     bit: 5,
     factor: 0.1,
+    description: "Heat pump 1 (A1): Current RPS",
 };
 
-pub const HEATPUMP_TYPE: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_TYPE: CTCModbusParameter = CTCModbusParameter {
     id: 62254,
     signed: true,
     access: Access::R,
@@ -503,9 +544,10 @@ pub const HEATPUMP_TYPE: ModbusParameter = ModbusParameter {
     visible: 62547,
     bit: 2,
     factor: 1.0,
+    description: "Heat pump 1 (A1) Type",
 };
 
-pub const HEATPUMP_COMPRESSOR_MODEL: ModbusParameter = ModbusParameter {
+pub static HEATPUMP_COMPRESSOR_MODEL: CTCModbusParameter = CTCModbusParameter {
     id: 62264,
     signed: true,
     access: Access::R,
@@ -515,5 +557,7 @@ pub const HEATPUMP_COMPRESSOR_MODEL: ModbusParameter = ModbusParameter {
     visible: 62547,
     bit: 12,
     factor: 1.0,
+    description: "Heat pump 1 (A1) compressor model",
 };
+
 // endregion: --- CTC HeatPump 1 Modbus Parameters
