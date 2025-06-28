@@ -1,17 +1,15 @@
 #![allow(dead_code)]
 pub mod bms_parameters;
-use tokio::sync::MutexGuard;
-use tokio_modbus::client::{Context, Reader, Writer};
 
 // region: --- Modbus Parameter Struct
 // Define the access type.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Access {
     R,
     RW,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CTCModbusParameter {
     /// This register address contains the value for the parameter.
     pub id: u16,
@@ -36,66 +34,82 @@ pub struct CTCModbusParameter {
 }
 
 impl CTCModbusParameter {
-    /// Returns the scaled value for a given raw register value.
+    /// Determines if the parameter is read-only.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.access == Access::R
+    }
+
+    /// Checks if the parameter is visible based on the provided bit mask from the "Visible" register.
+    ///
+    /// # Arguments
+    /// * `value` - The bit mask to check against
+    ///
+    /// # Returns
+    /// `true` if the bit at position `self.bit` is set in the mask, `false` otherwise
+    #[must_use]
+    pub fn is_visible(&self, value: u16) -> bool {
+        (value & (1 << self.bit)) != 0
+    }
+
+    /// Scales a raw register value according to the parameter's scaling factor.
+    /// Rounds to one decimal place for better readability.
+    ///
+    /// # Arguments
+    /// * `raw_value` - The raw value to scale
+    /// * `signed` - Whether to interpret the raw value as signed
+    ///
+    /// # Returns
+    /// The scaled value rounded to one decimal place
+    #[inline]
+    #[must_use]
+    fn scale_value(&self, raw_value: u16) -> f32 {
+        let value = if self.signed {
+            f32::from(raw_value as i16)
+        } else {
+            f32::from(raw_value)
+        };
+        
+        // Scale and round to one decimal place
+        (value * self.factor * 10.0).round() / 10.0
+    }
+
+    /// Returns a vector of scaled values for a slice of raw register values.
+    ///
+    /// # Arguments
+    /// * `value` - Slice of raw register values
+    ///
+    /// # Returns
+    /// A vector of scaled values
     #[must_use]
     pub fn get_scaled_value_vector(&self, value: &[u16]) -> Vec<f32> {
-        if self.signed {
-            value.iter().map(|v| {(f32::from(*v as i16) * self.factor * 10.0).round() / 10.0}).collect()
-        } else {
-            value.iter().map(|v| {(f32::from(*v) * self.factor * 10.0).round() / 10.0}).collect() 
-        }
+        value.iter().map(|&v| self.scale_value(v)).collect()
     }
 
+    /// Returns the scaled value for a single raw register value.
+    ///
+    /// # Arguments
+    /// * `value` - The raw register value
+    ///
+    /// # Returns
+    /// The scaled value
     #[must_use]
+    pub fn get_scaled_value(&self, value: u16) -> f32 {
+        self.scale_value(value)
+    }
+
+    /// Converts a scaled value back to its raw register value.
+    ///
+    /// # Arguments
+    /// * `value` - The scaled value to convert
+    ///
+    /// # Returns
+    /// A vector containing the raw register value
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)]
     pub fn to_scaled_value_vector(&self, value: f32) -> Vec<u16> {
         vec![(value / self.factor).round() as u16]
-    }
-
-    /// Reads a value from a Modbus register and returns it as a scaled value.
-    /// 
-    /// # Arguments
-    /// * `ctx` - The Modbus context to use for the read operation.
-    /// 
-    /// # Returns
-    /// * The scaled value read from the register.
-    /// 
-    /// # Errors
-    /// * Returns an error if the read operation fails.
-    /// * Returns an error if the response is empty.
-    pub async fn read(&self, mut ctx: MutexGuard<'_, Context>) -> Result<f32, Box<dyn std::error::Error>> {
-        let result = ctx.read_holding_registers(self.id, 1).await?;
-        let raw_values = result?;
-        let scaled_values = self.get_scaled_value_vector(&raw_values);
-        
-        scaled_values.first()
-            .copied()
-            .ok_or_else(|| Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData, 
-                "Empty response"
-            )) as Box<dyn std::error::Error>)
-    }
-
-    /// Writes a scaled value to the Modbus register.
-    /// This is the inverse of `get_scaled_value_vector`.
-    /// For example, if the scaled value is 22.1 and the factor is 0.1,
-    /// the raw value would be 221.
-    /// This function is used for writing values to the Modbus register.
-    /// # Arguments
-    /// * `ctx` - The Modbus context to use for the write operation.
-    /// * `value` - The scaled value to write to the Modbus register.
-    /// # Returns
-    /// * A Result indicating success or failure of the write operation.
-    /// # ERRORS
-    /// * Returns an error if the value is not a valid scaled value for this parameter.
-    /// * Returns an error if the write operation fails.
-    /// * Returns an error if the parameter is read-only.
-    pub async fn write(&self, mut ctx: MutexGuard<'_, Context>, value: f32) -> Result<(), Box<dyn std::error::Error>> {
-        if self.access == Access::R {
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Read-only parameter")));
-        }
-        let scaled_value = self.to_scaled_value_vector(value);
-        ctx.write_multiple_registers(self.id, &scaled_value).await?;
-        Ok(())
     }
 }
 // endregion: --- Modbus Parameter Struct
@@ -229,6 +243,53 @@ mod tests {
         let value = 22_f32;
         let scaled_value = HEATSYSTEM_STATUS.to_scaled_value_vector(value);
         assert_eq!(scaled_value, vec![22]);
+    }
+
+    #[test]
+    fn test_get_scaled_value_0_1() {
+        let raw_value = 221;
+        let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
+        assert_eq!(scaled_value, 22.1);
+    }
+
+    // Test for signed value
+    #[test]
+    fn test_get_scaled_value_signed() {
+        let raw_value = 32767; // Maximum value for i16
+        let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
+        assert_eq!(scaled_value, 3276.7);
+    }
+
+    // Test for signed value with negative value
+    #[test]
+    fn test_get_scaled_value_signed_negative() {
+        let raw_value = 32768; // Minimum value for i16 (as u16)
+        let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
+        assert_eq!(scaled_value, -3276.8); // 32768 as i16 is -32768
+    }
+
+    // Test for different scaling factor
+    #[test]
+    fn test_get_scaled_value_different_factor() {
+        let raw_value = 100; // Example raw value
+        let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
+        assert_eq!(scaled_value, 10.0); // Assuming factor is 0.1
+    }
+
+    // Test for 1 in scaled factor
+    #[test]
+    fn test_get_scaled_value_one_factor() {
+        let raw_value = 10; // Example raw value
+        let scaled_value = HEATSYSTEM_STATUS.get_scaled_value(raw_value);
+        assert_eq!(scaled_value, 10.0); // Assuming factor is 1.0
+    }
+
+    // Test for zero raw value
+    #[test]
+    fn test_get_scaled_value_zero() {
+        let raw_value = 0; // Example raw value
+        let scaled_value = HEATSYSTEM_STATUS.get_scaled_value(raw_value);
+        assert_eq!(scaled_value, 0.0); // Zero should always scale to zero
     }
 
     #[test]

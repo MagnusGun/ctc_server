@@ -2,562 +2,212 @@
 // see 'Service document-BMS Register-17003548.pdf'
 #![allow(dead_code)]
 use crate::modbus::{Access, CTCModbusParameter};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
+/// This module provides constants and utilities for CTC Modbus parameters.
+///
+/// # Macro Usage
+/// The `ctc_parameter!` macro is used to create parameter definitions with minimal boilerplate:
+///
+/// ## Examples
+///
+/// For read-write parameters:
+/// ```rust
+/// // Format: ctc_parameter!(NAME, ID, DESCRIPTION, FACTOR, ACCESS, REG_BASE, VISIBLE, BIT)
+/// ctc_parameter!(HEATSYSTEM_ROOM_SETTEMP, 61509, "Heating system 1: Set room temperature", 0.1, Access::RW, 60027, 62500, 9);
+/// ```
+///
+/// For read-only parameters:
+/// ```rust
+/// // Format: ctc_parameter!(NAME, ID, DESCRIPTION, FACTOR, VISIBLE, BIT)
+/// ctc_parameter!(HEATSYSTEM_FLOW_TEMP, 62011, "Heating system 1: Primary flow temperature", 0.1, 62531, 15);
+/// ```
+// Macro for creating CTC parameters with minimal boilerplate
+macro_rules! ctc_parameter {    
+    // Simplified version for read-write parameters with sequential registers
+    ($name:ident, $id:expr, $desc:expr, $factor:expr, $access:expr, 
+     $reg_base:expr, $visible:expr, $bit:expr) => {
+        pub const $name: CTCModbusParameter = CTCModbusParameter {
+            id: $id,
+            signed: true,
+            access: $access,
+            reg_max: $reg_base,
+            reg_min: $reg_base + 1,
+            reg_step: $reg_base + 2,
+            visible: $visible,
+            bit: $bit,
+            factor: $factor,
+            description: $desc,
+        };
+    };
+    
+    // For read-only parameters (simpler signature, no reg_* values needed)
+    ($name:ident, $id:expr, $desc:expr, $factor:expr, $visible:expr, $bit:expr) => {
+        pub const $name: CTCModbusParameter = CTCModbusParameter {
+            id: $id,
+            signed: true,
+            access: Access::R,
+            reg_max: 0,
+            reg_min: 0,
+            reg_step: 0,
+            visible: $visible,
+            bit: $bit,
+            factor: $factor,
+            description: $desc,
+        };
+    };
+}
 // region: --- CTC Heating System 1 Modbus Parameters
 
-pub static HEATSYSTEM_ROOM_SETTEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 61509,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60027,
-    reg_min: 60028,
-    reg_step: 60029,
-    visible: 62500,
-    bit: 9,
-    factor: 0.1,
-    description: "Heating system 1: Set room temperature",
-    // description: String::from("Heating system 1: Setting room temp"),
-};
-
-pub static HEATSYSTEM_INCLINATION: CTCModbusParameter = CTCModbusParameter {
-    id: 61513,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60039,
-    reg_min: 60040,
-    reg_step: 60041,
-    visible: 62500,
-    bit: 13,
-    factor: 0.1,
-    description: "Heating system 1: Change inclination",
-};
-
-pub static HEATSYSTEM_ADJUSTMENT: CTCModbusParameter = CTCModbusParameter {
-    id: 61517,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60051,
-    reg_min: 60052,
-    reg_step: 60053,
-    visible: 62501,
-    bit: 1,
-    factor: 0.1,
-    description: "Heating system 1: Change adjustment",
-};
-
-pub static HEATSYSTEM_FLOW_MAX_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 61534,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60102,
-    reg_min: 60103,
-    reg_step: 60104,
-    visible: 62502,
-    bit: 2,
-    factor: 0.1,
-    description: "Heating system 1: Max Primary flow °C",
-};
-
-pub static HEATSYSTEM_FLOW_MIN_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 61538,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60114,
-    reg_min: 60115,
-    reg_step: 60116,
-    visible: 62502,
-    bit: 6,
-    factor: 0.1,
-    description: "Heating system 1: Min primary flow °C",
-};
-
-pub static HEATSYSTEM_HEATING_MODE: CTCModbusParameter = CTCModbusParameter {
-    id: 61542,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60126,
-    reg_min: 60127,
-    reg_step: 60128,
-    visible: 62502,
-    bit: 10,
-    factor: 1.0,
-    description: "Heating system 1: Heating mode",
-};
-
-pub static HEATSYSTEM_HEAT_OFF_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 61546,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60138,
-    reg_min: 60139,
-    reg_step: 60140,
-    visible: 62502,
-    bit: 14,
-    factor: 0.1,
-    description: "Heating system 1: Heating off, out °C",
-};
-
-pub static HEATSYSTEM_HEAT_OFF_TIME: CTCModbusParameter = CTCModbusParameter {
-    id: 61550,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60150,
-    reg_min: 60151,
-    reg_step: 60152,
-    visible: 62503,
-    bit: 2,
-    factor: 1.0,
-    description: "Heating system 1: Heating off time",
-};
-
-pub static HEATSYSTEM_ROOM_TEMP_NIGHT_REDUCTION: CTCModbusParameter = CTCModbusParameter {
-    id: 61554,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60162,
-    reg_min: 60163,
-    reg_step: 60164,
-    visible: 62503,
-    bit: 6,
-    factor: 0.1,
-    description: "Heating system 1: Room temp night reduction",
-};
-
-pub static HEATSYSTEM_FLOW_NIGHT_REDUCTION: CTCModbusParameter = CTCModbusParameter {
-    id: 61558,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60174,
-    reg_min: 60175,
-    reg_step: 60176,
-    visible: 62503,
-    bit: 10,
-    factor: 0.1,
-    description: "Heating system 1: Primary flow Night reduction",
-};
-
-pub static HEATSYSTEM_OUTDOOR_NIGHT_REDUCTION: CTCModbusParameter = CTCModbusParameter {
-    id: 61562,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60186,
-    reg_min: 60187,
-    reg_step: 60188,
-    visible: 62503,
-    bit: 14,
-    factor: 0.1,
-    description: "Heating system 1: Outdoor temp night reduction",
-};
-
-pub static HEATSYSTEM_ALARM_LOW_ROOM_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 61566,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60198,
-    reg_min: 60199,
-    reg_step: 60200,
-    visible: 62504,
-    bit: 2,
-    factor: 0.1,
-    description: "Heating system 1: Alarm low room temperature",
-};
-
-pub static HEATSYSTEM_HOLIDAY_REDUCTION: CTCModbusParameter = CTCModbusParameter {
-    id: 61602,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60306,
-    reg_min: 60307,
-    reg_step: 60308,
-    visible: 62506,
-    bit: 6,
-    factor: 0.1,
-    description: "Heating system 1: Holiday reduction",
-};
-
-pub static HEATSYSTEM_FLOW_HOLIDAY_REDUCTION: CTCModbusParameter = CTCModbusParameter {
-    id: 61606,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60318,
-    reg_min: 60319,
-    reg_step: 60320,
-    visible: 62506,
-    bit: 10,
-    factor: 0.1,
-    description: "Heating system 1: Primary flow Holiday reduction",
-};
-
-pub static HEATSYSTEM_FLOW_SETPOINT: CTCModbusParameter = CTCModbusParameter {
-    id: 62007,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62531,
-    bit: 11,
-    factor: 0.1,
-    description: "Heating system 1: Temperature setpoint primary flow",
-};
-
-pub static HEATSYSTEM_FLOW_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62011,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62531,
-    bit: 15,
-    factor: 0.1,
-    description: "Heating system 1: Primary flow temperature",
-};
-
-pub static HEATSYSTEM_STATUS: CTCModbusParameter = CTCModbusParameter {
-    id: 62246,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62546,
-    bit: 10,
-    factor: 1.0,
-    description: "Heating system 1 status",
-};
+ctc_parameter!(HEATSYSTEM_ROOM_SETTEMP, 61509, "Heating system 1: Set room temperature", 0.1, Access::RW, 60027, 62500, 9);
+ctc_parameter!(HEATSYSTEM_INCLINATION, 61513, "Heating system 1: Change inclination", 0.1, Access::RW, 60039, 62500, 13);
+ctc_parameter!(HEATSYSTEM_ADJUSTMENT, 61517, "Heating system 1: Change adjustment", 0.1, Access::RW, 60051, 62501, 1);
+ctc_parameter!(HEATSYSTEM_FLOW_MAX_TEMP, 61534, "Heating system 1: Max Primary flow °C", 0.1, Access::RW, 60102, 62502, 2);
+ctc_parameter!(HEATSYSTEM_FLOW_MIN_TEMP, 61538, "Heating system 1: Min primary flow °C", 0.1, Access::RW, 60114, 62502, 6);
+ctc_parameter!(HEATSYSTEM_HEATING_MODE, 61542, "Heating system 1: Heating mode", 1.0, Access::RW, 60126, 62502, 10);
+ctc_parameter!(HEATSYSTEM_HEAT_OFF_TEMP, 61546, "Heating system 1: Heating off, out °C", 0.1, Access::RW, 60138, 62502, 14);
+ctc_parameter!(HEATSYSTEM_HEAT_OFF_TIME, 61550, "Heating system 1: Heating off time", 1.0, Access::RW, 60150, 62503, 2);
+ctc_parameter!(HEATSYSTEM_ROOM_TEMP_NIGHT_REDUCTION, 61554, "Heating system 1: Room temp night reduction", 0.1, Access::RW, 60162, 62503, 6);
+ctc_parameter!(HEATSYSTEM_FLOW_NIGHT_REDUCTION, 61558, "Heating system 1: Primary flow Night reduction", 0.1, Access::RW, 60174, 62503, 10);
+ctc_parameter!(HEATSYSTEM_OUTDOOR_NIGHT_REDUCTION, 61562, "Heating system 1: Outdoor temp night reduction", 0.1, Access::RW, 60186, 62503, 14);
+ctc_parameter!(HEATSYSTEM_ALARM_LOW_ROOM_TEMP, 61566, "Heating system 1: Alarm low room temperature", 0.1, Access::RW, 60198, 62504, 2);
+ctc_parameter!(HEATSYSTEM_HOLIDAY_REDUCTION, 61602, "Heating system 1: Holiday reduction", 0.1, Access::RW, 60306, 62506, 6);
+ctc_parameter!(HEATSYSTEM_FLOW_HOLIDAY_REDUCTION, 61606, "Heating system 1: Primary flow Holiday reduction", 0.1, Access::RW, 60318, 62506, 10);
+ctc_parameter!(HEATSYSTEM_FLOW_SETPOINT, 62007, "Heating system 1: Temperature setpoint primary flow", 0.1, 62531, 11);
+ctc_parameter!(HEATSYSTEM_FLOW_TEMP, 62011, "Heating system 1: Primary flow temperature", 0.1, 62531, 15);
+ctc_parameter!(HEATSYSTEM_STATUS, 62246, "Heating system 1 status", 1.0, 62546, 10);
 
 // endregion: --- CTC Heating System 1 Modbus Parameters
 
 // region: --- CTC Common Modbus Parameters
 
-pub static CTC_RETURN_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62015,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62532,
-    bit: 3,
-    factor: 0.1,
-    description: "Return temp",
-};
-
-pub static CTC_HOT_WATER_MODE: CTCModbusParameter = CTCModbusParameter {
-    id: 61500,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60000,
-    reg_min: 60001,
-    reg_step: 60002,
-    visible: 62500,
-    bit: 0,
-    factor: 1.0,
-    description: "Hot water mode",
-};
-
-pub static CTC_ROOM_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62203,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62543,
-    bit: 15,
-    factor: 0.1,
-    description: "Current room temp 1",
-};
-
-pub static CTC_OUTDOOR_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62000,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62531,
-    bit: 4,
-    factor: 0.1,
-    description: "Outdoor temperature",
-};
-
-pub static CTC_VACCATION_DAYS: CTCModbusParameter = CTCModbusParameter {
-    id: 61508,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60024,
-    reg_min: 60025,
-    reg_step: 60026,
-    visible: 62500,
-    bit: 8,
-    factor: 1.0,
-    description: "Number of vacation days timer",
-};
+ctc_parameter!(CTC_RETURN_TEMP, 62015, "Return temp", 0.1, 62532, 3);
+ctc_parameter!(CTC_HOT_WATER_MODE, 61500, "Hot water mode", 1.0, Access::RW, 60000, 62500, 0);
+ctc_parameter!(CTC_ROOM_TEMP, 62203, "Current room temp 1", 0.1, 62543, 15);
+ctc_parameter!(CTC_OUTDOOR_TEMP, 62000, "Outdoor temperature", 0.1, 62531, 4);
+ctc_parameter!(CTC_VACCATION_DAYS, 61508, "Number of vacation days timer", 1.0, Access::RW, 60024, 62500, 8);
 
 // endregion: --- CTC Common Modbus Parameters
 
 // region: --- CTC HeatPump 1 Modbus Parameters
 
-pub static HEATPUMP_BLOCKED: CTCModbusParameter = CTCModbusParameter {
-    id: 61521,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60063,
-    reg_min: 60064,
-    reg_step: 60065,
-    visible: 62501,
-    bit: 5,
-    factor: 1.0,
-    description: "Heat pump 1 (A1): Blocked",
-};
-
-pub static HEATPUMP_MAX_RMP: CTCModbusParameter = CTCModbusParameter {
-    id: 61572,
-    signed: true,
-    access: Access::RW,
-    reg_max: 60216,
-    reg_min: 60217,
-    reg_step: 60218,
-    visible: 62504,
-    bit: 8,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Max RPS",
-};
-
-pub static HEATPUMP_STATUS: CTCModbusParameter = CTCModbusParameter {
-    id: 62017,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62532,
-    bit: 5,
-    factor: 1.0,
-    description: "Heat pump 1 (A1): Status",
-};
-
-pub static HEATPUMP_INLET_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62027,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62532,
-    bit: 15,
-    factor: 0.1,
-    description: "Heat pump 1 (A1) HP in",
-};
-
-pub static HEATPUMP_OUTLET_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62037,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62533,
-    bit: 9,
-    factor: 0.1,
-    description: "Heat pump 1 (A1) HP out",
-};
-
-pub static HEATPUMP_DISCHARGE_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62047,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62534,
-    bit: 3,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Discharge temperature",
-};
-
-pub static HEATPUMP_SUCTION_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62057,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62534,
-    bit: 13,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Suction gas temperature",
-};
-
-pub static HEATPUMP_HIGH_PRESSURE: CTCModbusParameter = CTCModbusParameter {
-    id: 62067,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62535,
-    bit: 7,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): High pressure",
-};
-
-pub static HEATPUMP_LOW_PRESSURE: CTCModbusParameter = CTCModbusParameter {
-    id: 62077,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62536,
-    bit: 1,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Low Pressure",
-};
-
-pub static HEATPUMP_BRINE_INLET_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62087,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62536,
-    bit: 11,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Brine in",
-};
-
-pub static HEATPUMP_BRINE_OUTLET_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62097,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62537,
-    bit: 5,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Brine out",
-};
-
-pub static HEATPUMP_CHARGE_PUMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62107,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62537,
-    bit: 15,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Charge pump",
-};
-
-pub static HEATPUMP_BRINE_PUMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62117,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62538,
-    bit: 9,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Brine pump",
-};
-
-pub static HEATPUMP_FAN_SPEED: CTCModbusParameter = CTCModbusParameter {
-    id: 62127,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62539,
-    bit: 3,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Fan",
-};
-
-pub static HEATPUMP_DEFROST_TIMER: CTCModbusParameter = CTCModbusParameter {
-    id: 62137,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62539,
-    bit: 13,
-    factor: 1.0,
-    description: "Heat pump 1 (A1): Defrost timer",
-};
-
-pub static HEATPUMP_OUTDOOR_TEMP: CTCModbusParameter = CTCModbusParameter {
-    id: 62147,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62540,
-    bit: 7,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Outdoor temp",
-};
-
-pub static HEATPUMP_SOFTWARE_VERSION: CTCModbusParameter = CTCModbusParameter {
-    id: 62157,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62541,
-    bit: 1,
-    factor: 1.0,
-    description: "Heat pump 1 (A1): Software version",
-};
-
-pub static HEATPUMP_CURRENT_RPS: CTCModbusParameter = CTCModbusParameter {
-    id: 62193,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62543,
-    bit: 5,
-    factor: 0.1,
-    description: "Heat pump 1 (A1): Current RPS",
-};
-
-pub static HEATPUMP_TYPE: CTCModbusParameter = CTCModbusParameter {
-    id: 62254,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62547,
-    bit: 2,
-    factor: 1.0,
-    description: "Heat pump 1 (A1) Type",
-};
-
-pub static HEATPUMP_COMPRESSOR_MODEL: CTCModbusParameter = CTCModbusParameter {
-    id: 62264,
-    signed: true,
-    access: Access::R,
-    reg_max: 0,
-    reg_min: 0,
-    reg_step: 0,
-    visible: 62547,
-    bit: 12,
-    factor: 1.0,
-    description: "Heat pump 1 (A1) compressor model",
-};
+ctc_parameter!(HEATPUMP_BLOCKED, 61521, "Heat pump 1 (A1): Blocked", 1.0, Access::RW, 60063, 62501, 5);
+ctc_parameter!(HEATPUMP_MAX_RMP, 61572, "Heat pump 1 (A1): Max RPS", 0.1, Access::RW, 60216, 62504, 8);
+ctc_parameter!(HEATPUMP_STATUS, 62017, "Heat pump 1 (A1): Status", 1.0, 62532, 5);
+ctc_parameter!(HEATPUMP_INLET_TEMP, 62027, "Heat pump 1 (A1) HP in", 0.1, 62532, 15);
+ctc_parameter!(HEATPUMP_OUTLET_TEMP, 62037, "Heat pump 1 (A1) HP out", 0.1, 62533, 9);
+ctc_parameter!(HEATPUMP_DISCHARGE_TEMP, 62047, "Heat pump 1 (A1): Discharge temperature", 0.1, 62534, 3);
+ctc_parameter!(HEATPUMP_SUCTION_TEMP, 62057, "Heat pump 1 (A1): Suction gas temperature", 0.1, 62534, 13);
+ctc_parameter!(HEATPUMP_HIGH_PRESSURE, 62067, "Heat pump 1 (A1): High pressure", 0.1, 62535, 7);
+ctc_parameter!(HEATPUMP_LOW_PRESSURE, 62077, "Heat pump 1 (A1): Low Pressure", 0.1, 62536, 1);
+ctc_parameter!(HEATPUMP_BRINE_INLET_TEMP, 62087, "Heat pump 1 (A1): Brine in", 0.1, 62536, 11);
+ctc_parameter!(HEATPUMP_BRINE_OUTLET_TEMP, 62097, "Heat pump 1 (A1): Brine out", 0.1, 62537, 5);
+ctc_parameter!(HEATPUMP_CHARGE_PUMP, 62107, "Heat pump 1 (A1): Charge pump", 0.1, 62537, 15);
+ctc_parameter!(HEATPUMP_BRINE_PUMP, 62117, "Heat pump 1 (A1): Brine pump", 0.1, 62538, 9);
+ctc_parameter!(HEATPUMP_FAN_SPEED, 62127, "Heat pump 1 (A1): Fan", 0.1, 62539, 3);
+ctc_parameter!(HEATPUMP_DEFROST_TIMER, 62137, "Heat pump 1 (A1): Defrost timer", 1.0, 62539, 13);
+ctc_parameter!(HEATPUMP_OUTDOOR_TEMP, 62147, "Heat pump 1 (A1): Outdoor temp", 0.1, 62540, 7);
+ctc_parameter!(HEATPUMP_SOFTWARE_VERSION, 62157, "Heat pump 1 (A1): Software version", 1.0, 62541, 1);
+ctc_parameter!(HEATPUMP_CURRENT_RPS, 62193, "Heat pump 1 (A1): Current RPS", 0.1, 62543, 5);
+ctc_parameter!(HEATPUMP_TYPE, 62254, "Heat pump 1 (A1) Type", 1.0, 62547, 2);
+ctc_parameter!(HEATPUMP_COMPRESSOR_MODEL, 62264, "Heat pump 1 (A1) compressor model", 1.0, 62547, 12);
 
 // endregion: --- CTC HeatPump 1 Modbus Parameters
+
+// region: --- CTC Diagnostic Modbus Parameters
+
+ctc_parameter!(CTC_DAYS_FILTER_MAINTENANCE, 62283, "Days until next filter maintenance", 1.0, 62548, 15);
+
+
+/// Returns all CTC Modbus parameters as a slice
+fn all_ctc_parameters() -> &'static [&'static CTCModbusParameter] {
+    static PARAMETERS: OnceLock<Vec<&'static CTCModbusParameter>> = OnceLock::new();
+    PARAMETERS.get_or_init(|| {
+        vec![
+            // Heating System parameters
+            &HEATSYSTEM_ROOM_SETTEMP,
+            &HEATSYSTEM_INCLINATION,
+            &HEATSYSTEM_ADJUSTMENT,
+            &HEATSYSTEM_FLOW_MAX_TEMP,
+            &HEATSYSTEM_FLOW_MIN_TEMP,
+            &HEATSYSTEM_HEATING_MODE,
+            &HEATSYSTEM_HEAT_OFF_TEMP,
+            &HEATSYSTEM_HEAT_OFF_TIME,
+            &HEATSYSTEM_ROOM_TEMP_NIGHT_REDUCTION,
+            &HEATSYSTEM_FLOW_NIGHT_REDUCTION,
+            &HEATSYSTEM_OUTDOOR_NIGHT_REDUCTION,
+            &HEATSYSTEM_ALARM_LOW_ROOM_TEMP,
+            &HEATSYSTEM_HOLIDAY_REDUCTION,
+            &HEATSYSTEM_FLOW_HOLIDAY_REDUCTION,
+            &HEATSYSTEM_FLOW_SETPOINT,
+            &HEATSYSTEM_FLOW_TEMP,
+            &HEATSYSTEM_STATUS,
+            
+            // Common parameters
+            &CTC_RETURN_TEMP,
+            &CTC_HOT_WATER_MODE,
+            &CTC_ROOM_TEMP,
+            &CTC_OUTDOOR_TEMP,
+            &CTC_VACCATION_DAYS,
+            
+            // Heat Pump parameters
+            &HEATPUMP_BLOCKED,
+            &HEATPUMP_MAX_RMP,
+            &HEATPUMP_STATUS,
+            &HEATPUMP_INLET_TEMP,
+            &HEATPUMP_OUTLET_TEMP,
+            &HEATPUMP_DISCHARGE_TEMP,
+            &HEATPUMP_SUCTION_TEMP,
+            &HEATPUMP_HIGH_PRESSURE,
+            &HEATPUMP_LOW_PRESSURE,
+            &HEATPUMP_BRINE_INLET_TEMP,
+            &HEATPUMP_BRINE_OUTLET_TEMP,
+            &HEATPUMP_CHARGE_PUMP,
+            &HEATPUMP_BRINE_PUMP,
+            &HEATPUMP_FAN_SPEED,
+            &HEATPUMP_DEFROST_TIMER,
+            &HEATPUMP_OUTDOOR_TEMP,
+            &HEATPUMP_SOFTWARE_VERSION,
+            &HEATPUMP_CURRENT_RPS,
+            &HEATPUMP_TYPE,
+            &HEATPUMP_COMPRESSOR_MODEL,
+
+            // Diagnostic parameters
+            &CTC_DAYS_FILTER_MAINTENANCE,
+        ]
+    }).as_slice()
+}
+
+/// Returns a `HashMap` of all CTC Modbus parameters by their ID
+fn ctc_parameters_by_id() -> &'static HashMap<u16, &'static CTCModbusParameter> {
+    static PARAMETERS_MAP: OnceLock<HashMap<u16, &'static CTCModbusParameter>> = OnceLock::new();
+    PARAMETERS_MAP.get_or_init(|| {
+        let mut map = HashMap::new();
+        for &param in all_ctc_parameters() {
+            map.insert(param.id, param);
+        }
+        map
+    })
+}
+
+#[must_use]
+pub fn get_ctc_parameter_by_id(id: u16) -> Option<&'static CTCModbusParameter> {
+    ctc_parameters_by_id().get(&id).copied()
+}
+
+#[must_use]
+pub fn get_custom_ctc_parameter_by_addr(addr: u16) -> CTCModbusParameter {
+    CTCModbusParameter {
+        id: addr,
+        signed: true,
+        access: Access::R,
+        reg_max: 0,
+        reg_min: 0,
+        reg_step: 0,
+        visible: 62500,
+        bit: 0,
+        factor: 1.0,
+        description: "Custom CTC Parameter",
+    }
+}
