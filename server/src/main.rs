@@ -1,9 +1,12 @@
 mod routes;
+mod modbus;
+
 use std::{env, str, time::Duration};
 use axum::Router;
 use tokio_serial::{Parity, StopBits};
 use tracing::debug;
 use crate::routes::{ctc_actor::{CtcActorBuilder, ParameterOperation}};
+
 
 const DEFAULT_TTY: &str = "/dev/ttyAMA4";
 // const SCALE_BASE: u16 = 10;

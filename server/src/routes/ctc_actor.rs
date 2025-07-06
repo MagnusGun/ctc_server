@@ -1,4 +1,4 @@
-use ctc_server::modbus::CTCModbusParameter;
+use crate::modbus::CTCModbusParameter;
 use tokio_modbus::client::Writer;
 use tokio_serial::SerialPortBuilderExt;
 use tokio::sync::{mpsc, oneshot};
@@ -169,6 +169,8 @@ impl CtcActor {
         }
     }
 
+    /// Main actor loop that processes incoming parameter operations.
+    /// Handles both read and write operations for Modbus parameters.
     pub async fn run(&mut self) {
         loop {
             tokio::select! {
@@ -200,8 +202,9 @@ impl CtcActor {
                                         Ok(return_value) => {
                                             debug!("ctc_actor::run: Successfully read back value {return_value} for parameter {param:?}");
 
-                                            #[allow(clippy::float_cmp)]
-                                            if return_value == value {
+                                            // Consider using an epsilon-based comparison for better float handling
+                                            // #[allow(clippy::float_cmp)]
+                                            if (return_value - value).abs() < f32::EPSILON {
                                                 debug!("ctc_actor::run: Read-back value matches written value for parameter {param:?}");
                                                 respond_to.send(Ok(value)).unwrap_or_else(|e| {
                                                     error!("ctc_actor::run: Failed to send read-back response on the one-shot channel: {e:?}");

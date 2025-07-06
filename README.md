@@ -11,21 +11,24 @@
 - Modular and extensible design.
 
 ## Project Structure
+The project is organized as a Rust workspace with the following structure:
 ```
 ctc_server/
-├── src/
-│   ├── main.rs               # Application entry point
-│   ├── lib.rs                # Library module
-│   ├── modbus/               # Modbus parameter definitions and utilities
-│   │   ├── mod.rs            # Core Modbus logic
-│   │   ├── bms_parameters.rs # Predefined Modbus parameters for the heating system
-│   ├── routes/               # API route handlers
-│   │   ├── mod.rs            # Route module definitions
-│   │   ├── temperatures.rs   # Temperature-related endpoints
-│   │   ├── ctc.rs            # CTC-specific endpoints
-│   │   ├── ctc_actor.rs      # Actor-based Modbus request handling
+├── server/                   # Main server implementation
+│   ├── src/
+│   │   ├── main.rs           # Application entry point
+│   │   ├── lib.rs            # Library module
+│   │   ├── modbus/           # Modbus parameter definitions and utilities
+│   │   │   ├── mod.rs        # Core Modbus logic
+│   │   │   ├── bms_parameters.rs # Predefined Modbus parameters for the heating system
+│   │   ├── routes/           # API route handlers
+│   │   │   ├── mod.rs        # Route module definitions
+│   │   │   ├── temperatures.rs # Temperature-related endpoints
+│   │   │   ├── ctc.rs        # CTC-specific endpoints
+│   │   │   ├── ctc_actor.rs  # Actor-based Modbus request handling
+│   ├── Cargo.toml            # Server crate dependencies
 ├── test_client/              # Placeholder for testing client
-├── Cargo.toml                # Project dependencies and metadata
+├── Cargo.toml                # Workspace definition and dependencies
 ├── LICENSE                   # License information
 ├── README.md                 # Project documentation
 ```
@@ -34,7 +37,7 @@ ctc_server/
 ### Temperature Routes
 - `GET /api/v1/temperature/room`: Get the current room temperature.
 - `GET /api/v1/temperature/room/setpoint`: Get the room temperature setpoint.
-- `POST /api/v1/temperature/room/setpoint`: Set the room temperature setpoint.
+- `POST /api/v1/temperature/room/setpoint/`: Set the room temperature setpoint.
 - `GET /api/v1/temperature/outdoor`: Get the outdoor temperature.
 - `GET /api/v1/temperature/flow`: Get the outgoing flow temperature.
 - `GET /api/v1/temperature/flow/return`: Get the return flow temperature.
@@ -64,11 +67,11 @@ ctc_server/
 ### Running the Server
 Run the server with the default serial port:
 ```sh
-cargo run --release
+cargo run --release -p server
 ```
 Or specify a custom serial port:
 ```sh
-cargo run --release /dev/ttyUSB0
+cargo run --release -p server -- /dev/ttyUSB0
 ```
 
 The server will start on `http://0.0.0.0:3000`.
@@ -81,9 +84,7 @@ curl -X GET http://localhost:3000/api/v1/temperature/room
 ```
 #### Set Room Temperature Setpoint
 ```sh
-curl -X POST http://localhost:3000/api/v1/temperature/room/setpoint \
-     -H "Content-Type: application/json" \
-     -d '{"setpoint": 22.5}'
+curl -X POST "http://localhost:3000/api/v1/temperature/room/setpoint/?value=22.5"
 ```
 #### Get Outdoor Temperature
 ```sh
