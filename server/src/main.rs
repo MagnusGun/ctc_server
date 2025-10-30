@@ -1,5 +1,6 @@
 mod routes;
 mod modbus;
+mod helpers;
 
 use std::{env, str, time::Duration};
 use axum::Router;

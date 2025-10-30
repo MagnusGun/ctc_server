@@ -136,37 +136,37 @@
 
 ### 1C. Eliminate Code Duplication
 
-**Status**: ⏸️ Not Started
+**Status**: ✅ Complete (2025-10-30)
 **Priority**: Critical
 **Effort**: 2-4 hours
 
 **Problem**: Every API endpoint repeats 15-line request/response pattern (~200 lines of duplicate code)
 
-**Solution**:
-1. Create `server/src/helpers.rs` module
-2. Implement helper functions:
-   ```rust
-   pub async fn read_parameter(
-       tx: &ModbusSender,
-       param: &'static CTCModbusParameter
-   ) -> Result<f32, ApiError>
-
-   pub async fn write_parameter(
-       tx: &ModbusSender,
-       param: &'static CTCModbusParameter,
-       value: f32
-   ) -> Result<f32, ApiError>
-   ```
-3. Refactor all 16 route handlers to use helpers
-4. Estimated reduction: 200+ lines removed
+**Fix Applied**:
+1. Created `server/src/helpers.rs` module with three helper functions:
+   - `read_parameter()` - Generic read with JSON response
+   - `read_parameter_value()` - Generic read returning raw value
+   - `write_parameter()` - Generic write with JSON response
+2. Refactored `server/src/routes/temperatures.rs`:
+   - 6 endpoints reduced from ~120 lines to ~40 lines
+   - All functions now 1-3 lines instead of 15-20 lines
+3. Refactored `server/src/routes/ctc.rs`:
+   - 4 endpoints reduced from ~150 lines to ~30 lines
+   - `set_power_save()` reduced from 80+ lines to 15 lines
+   - `get_power_save()` reduced from 40+ lines to 5 lines
+4. Total reduction: ~200 lines eliminated
 
 **Files Affected**:
-- New: `server/src/helpers.rs`
-- Modified: `server/src/routes/ctc.rs`
-- Modified: `server/src/routes/temperatures.rs`
-- Modified: `server/src/lib.rs` (add helpers module)
+- New: `server/src/helpers.rs` (130 lines)
+- Modified: `server/src/routes/ctc.rs` (90 lines, was ~180 lines)
+- Modified: `server/src/routes/temperatures.rs` (57 lines, was ~167 lines)
+- Modified: `server/src/main.rs` (added helpers module)
 
-**Testing**: Verify all endpoints still work correctly
+**Testing**:
+- ✅ Code compiles successfully
+- ✅ All 19 unit tests pass
+- ✅ Zero clippy warnings (pedantic mode)
+- ✅ All imports cleaned up
 
 ---
 
