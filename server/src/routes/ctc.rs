@@ -66,7 +66,7 @@ struct PowerSave {
 }
 
 async fn set_power_save(State((tx, config)): State<(ModbusSender, PowerSaveConfig)>, Query(params): Query<PowerSave>) -> Result<String, (StatusCode, String)>{
-    debug!("set_power_save: {params:?}");
+    debug!("set_power_save: START - {params:?}");
 
     let (room_temp, vacation_days) = if params.active {
         (config.low_temp, config.low_days)
@@ -74,12 +74,33 @@ async fn set_power_save(State((tx, config)): State<(ModbusSender, PowerSaveConfi
         (config.high_temp, config.high_days)
     };
 
+    debug!("set_power_save: Target values - room_temp={}, vacation_days={}", room_temp, vacation_days);
+
     // Update room temperature setpoint
-    write_parameter(&tx, HEATSYSTEM_ROOM_SETTEMP, room_temp, "room_temperature_setpoint", "set_power_save").await?;
+    debug!("set_power_save: Calling write_parameter for HEATSYSTEM_ROOM_SETTEMP");
+    match write_parameter(&tx, HEATSYSTEM_ROOM_SETTEMP, room_temp, "room_temperature_setpoint", "set_power_save").await {
+        Ok(result) => {
+            debug!("set_power_save: HEATSYSTEM_ROOM_SETTEMP write succeeded: {}", result);
+        }
+        Err(e) => {
+            debug!("set_power_save: HEATSYSTEM_ROOM_SETTEMP write FAILED: {:?}", e);
+            return Err(e);
+        }
+    }
 
     // Update vacation days
-    write_parameter(&tx, CTC_VACCATION_DAYS, vacation_days, "vacation_days", "set_power_save").await?;
+    debug!("set_power_save: Calling write_parameter for CTC_VACCATION_DAYS");
+    match write_parameter(&tx, CTC_VACCATION_DAYS, vacation_days, "vacation_days", "set_power_save").await {
+        Ok(result) => {
+            debug!("set_power_save: CTC_VACCATION_DAYS write succeeded: {}", result);
+        }
+        Err(e) => {
+            debug!("set_power_save: CTC_VACCATION_DAYS write FAILED: {:?}", e);
+            return Err(e);
+        }
+    }
 
+    debug!("set_power_save: SUCCESS - Both writes completed");
     Ok(format!("{{\"powersave\": {}}}\n", params.active))
 }
 

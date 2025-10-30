@@ -1,0 +1,42 @@
+# Build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+ROADMAP.md
+CLAUDE.md
+LICENSE
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Configuration (will be mounted or set via env vars)
+config.toml
+.env
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Docker
+docker-compose.override.yml
+Dockerfile
+.dockerignore
+
+# Scripts
+script.sh
+*.sh
+
+# Claude
+.claude/

@@ -23,3 +23,8 @@ assets/
 
 /target
 Service document-BMS Register-17003548.pdf
+
+# Docker
+docker-compose.override.yml
+.env
+*.tar

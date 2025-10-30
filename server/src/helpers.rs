@@ -107,26 +107,32 @@ pub async fn write_parameter(
     json_key: &str,
     log_context: &str,
 ) -> Result<String, (StatusCode, String)> {
+    debug!("{log_context}: write_parameter START - param={:?}, value={}", param, value);
+
     // Create a oneshot channel for this request
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    debug!("{log_context}: write_parameter - Sending to actor channel");
 
     // Send the operation and response channel to the actor
     tx.send((ParameterOperation::Write(param, value), response_tx))
         .await
         .unwrap();
 
+    debug!("{log_context}: write_parameter - Message sent, awaiting response");
+
     // Wait for response on this request's channel
     match response_rx.await {
         Ok(Ok(_)) => {
-            debug!("{log_context}: {value}");
+            debug!("{log_context}: write_parameter - Response received: SUCCESS");
             Ok(format!("{{\"{json_key}\": {value}}}\n"))
         }
         Ok(Err(e)) => {
-            error!("Error writing parameter in {log_context}: {e}");
+            error!("{log_context}: write_parameter - Response received: ERROR - {e}");
             Err((StatusCode::INTERNAL_SERVER_ERROR, e))
         }
         Err(e) => {
-            error!("Failed to receive response in {log_context}: {e}");
+            error!("{log_context}: write_parameter - Failed to receive response: {e}");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to receive response".to_string(),

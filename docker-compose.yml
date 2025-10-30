@@ -1,0 +1,47 @@
+services:
+  ctc_server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
+    image: ctc_server:latest
+    container_name: ctc_server
+    platform: linux/arm64
+
+    # Map serial device from host (adjust for your device)
+    devices:
+      - /dev/ttyAMA4:/dev/ttyAMA4
+
+    # Expose HTTP API port
+    ports:
+      - "3000:3000"
+
+    # Environment variables for configuration
+    environment:
+      - RUST_LOG=debug
+      - CTC_SERVER_HOST=0.0.0.0
+      - CTC_SERVER_PORT=3000
+      - CTC_SERIAL_DEFAULT_PORT=/dev/ttyAMA4
+      # Uncomment to override other settings
+      # - CTC_SERIAL_BAUD_RATE=9600
+      # - CTC_SERIAL_PARITY=even
+      # - CTC_SERIAL_FLOW_CONTROL=hardware
+      # - CTC_MODBUS_SLAVE_ID=1
+      # - CTC_POWER_SAVE_LOW_TEMP=15.0
+      # - CTC_POWER_SAVE_HIGH_TEMP=21.5
+
+    # Optional: Mount custom config file (overrides defaults)
+    # volumes:
+    #   - ./config.toml:/app/config.toml:ro
+
+    # Restart policy for production
+    restart: unless-stopped
+
+    # Health check configuration
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/v1/temperature/outdoor"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

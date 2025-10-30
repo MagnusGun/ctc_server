@@ -149,98 +149,128 @@ impl CtcActor {
     }
 
     async fn write_parameter(&mut self, param: &CTCModbusParameter, value: f32) -> Result<(), String> {
+        debug!("ctc_actor::write_parameter: START - param={:?}, value={}", param, value);
+
         if param.is_read_only() {
+            error!("ctc_actor::write_parameter: Parameter {} is read-only", param.id);
             return Err(format!("ctc_actor::write_parameter: Parameter {} is read-only and cannot be written to", param.id));
         }
+
         let raw_value = param.get_raw_value(value);
+        debug!("ctc_actor::write_parameter: Converted to raw_value={}", raw_value);
 
-
+        debug!("ctc_actor::write_parameter: Reading min/max/step for validation");
         match self.read_min_max_step(param).await {
             Ok((max, min, step)) => {
+                debug!("ctc_actor::write_parameter: Validation bounds - min={}, max={}, step={}", min, max, step);
                 // Check if value is within range and is a valid step from the minimum
                 if raw_value < min || raw_value > max  || !(raw_value - min).is_multiple_of(step) {
+                    error!("ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not in range [{}, {}] or not valid step from min", raw_value, min, max);
                     return Err(format!("ctc_actor::write_parameter: Value {value} didnt fit in min/max/step for parameter {}: max {}, min {}, step {}", param.description, param.get_scaled_value(max), param.get_scaled_value(min), param.get_scaled_value(step)));
                 }
+                debug!("ctc_actor::write_parameter: Validation PASSED");
             }
-            Err(e) => return Err(format!("ctc_actor::write_parameter: Error reading min/max for parameter {param:?}: {e}"))
+            Err(e) => {
+                error!("ctc_actor::write_parameter: Failed to read min/max/step: {}", e);
+                return Err(format!("ctc_actor::write_parameter: Error reading min/max for parameter {param:?}: {e}"));
+            }
         }
 
-        debug!("ctc_actor::write_parameter: Writing value {value} to parameter {param:?} as scaled value {raw_value:?}");
+        debug!("ctc_actor::write_parameter: Calling Modbus write_single_register for register {}", param.id);
         match self.context.write_single_register(param.id, raw_value).await{
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("ctc_actor::write_parameter: Error writing value {value} to parameter {param:?}: {e}")),
+            Ok(_) => {
+                debug!("ctc_actor::write_parameter: Modbus write SUCCESS");
+                Ok(())
+            }
+            Err(e) => {
+                error!("ctc_actor::write_parameter: Modbus write FAILED: {}", e);
+                Err(format!("ctc_actor::write_parameter: Error writing value {value} to parameter {param:?}: {e}"))
+            }
         }
     }
 
     /// Main actor loop that processes incoming parameter operations.
     /// Handles both read and write operations for Modbus parameters.
     pub async fn run(&mut self) {
+        info!("ctc_actor::run: Actor loop starting");
         loop {
+            debug!("ctc_actor::run: Waiting for next message");
             tokio::select! {
                 Some((operation, respond_to)) = self.receiver.recv() => {
+                    debug!("ctc_actor::run: Message received from channel");
                     match operation {
                         ParameterOperation::Read(param) => {
-                            debug!("ctc_actor::run: Reading parameter {param:?}");
+                            debug!("ctc_actor::run: Operation=READ, parameter={:?}", param);
                             match self.read_parameter(&param).await {
                                 Ok(value) => {
-                                    debug!("ctc_actor::run: Successfully read value {value} for parameter {param:?}");
+                                    debug!("ctc_actor::run: Read SUCCESS, value={}, sending response", value);
                                     respond_to.send(Ok(value)).unwrap_or_else(|e| {
-                                        error!("ctc_actor::run: Failed to send read response on the one-shot channel: {e:?}");
+                                        error!("ctc_actor::run: CRITICAL - Failed to send read response on oneshot channel: {e:?}");
                                     });
+                                    debug!("ctc_actor::run: Read response sent");
                                 },
                                 Err(e) => {
-                                    debug!("ctc_actor::run: Error reading parameter {param:?}: {e}");
+                                    error!("ctc_actor::run: Read FAILED: {}", e);
                                     respond_to.send(Err(e)).unwrap_or_else(|e| {
-                                        error!("ctc_actor::run: Failed to send read error response on the one-shot channel: {e:?}");
+                                        error!("ctc_actor::run: CRITICAL - Failed to send read error response: {e:?}");
                                     });
+                                    debug!("ctc_actor::run: Read error response sent");
                                 }
                             }
                         },
                         ParameterOperation::Write(param, value) => {
-                            debug!("ctc_actor::run: Writing value {value} to parameter {param:?}");
+                            debug!("ctc_actor::run: Operation=WRITE, parameter={:?}, value={}", param, value);
                             match self.write_parameter(&param, value).await {
                                 Ok(()) => {
-                                    debug!("ctc_actor::run: Successfully wrote value {value} to parameter {param:?}, reading back to confirm");
+                                    debug!("ctc_actor::run: Write SUCCESS, reading back to verify");
                                     match self.read_parameter(&param).await {
                                         Ok(return_value) => {
-                                            debug!("ctc_actor::run: Successfully read back value {return_value} for parameter {param:?}");
+                                            debug!("ctc_actor::run: Read-back value={}, comparing with written value={}", return_value, value);
 
                                             // Consider using an epsilon-based comparison for better float handling
                                             // #[allow(clippy::float_cmp)]
                                             if (return_value - value).abs() < f32::EPSILON {
-                                                debug!("ctc_actor::run: Read-back value matches written value for parameter {param:?}");
+                                                debug!("ctc_actor::run: Read-back MATCHES, sending success response");
                                                 respond_to.send(Ok(value)).unwrap_or_else(|e| {
-                                                    error!("ctc_actor::run: Failed to send read-back response on the one-shot channel: {e:?}");
+                                                    error!("ctc_actor::run: CRITICAL - Failed to send success response: {e:?}");
                                                 });
+                                                debug!("ctc_actor::run: Write operation COMPLETE");
                                             }
                                             else {
-                                                error!("ctc_actor::run: Read-back value {return_value} does not match written value {value} for parameter {param:?}");
+                                                error!("ctc_actor::run: Read-back MISMATCH: wrote {} but read {}", value, return_value);
                                                 respond_to.send(Err(format!("Read-back value {return_value} does not match written value {value} for parameter {param:?}"))).unwrap_or_else(|e| {
-                                                    error!("ctc_actor::run: Failed to send read-back mismatch response on the one-shot channel: {e:?}");
+                                                    error!("ctc_actor::run: CRITICAL - Failed to send mismatch error: {e:?}");
                                                 });
-
+                                                debug!("ctc_actor::run: Write operation FAILED (mismatch)");
                                             }
                                         },
                                         Err(e) => {
-                                            error!("ctc_actor::run: Error reading back parameter {param:?} after write: {e}");
+                                            error!("ctc_actor::run: Read-back FAILED: {}", e);
                                             respond_to.send(Err(e)).unwrap_or_else(|e| {
-                                                error!("ctc_actor::run: Failed to send read-back error response on the one-shot channel: {e:?}");
+                                                error!("ctc_actor::run: CRITICAL - Failed to send read-back error: {e:?}");
                                             });
+                                            debug!("ctc_actor::run: Write operation FAILED (read-back error)");
                                         }
                                     }
                                 },
                                 Err(e) => {
-                                    debug!("ctc_actor::run: Error writing parameter {param:?}: {e}");
+                                    error!("ctc_actor::run: Write FAILED: {}", e);
                                     respond_to.send(Err(e)).unwrap_or_else(|e| {
-                                        error!("ctc_actor::run: Failed to send write error response on the one-shot channel: {e:?}");
+                                        error!("ctc_actor::run: CRITICAL - Failed to send write error response: {e:?}");
                                     });
+                                    debug!("ctc_actor::run: Write error response sent");
                                 }
                             }
                         }
                     }
+                    debug!("ctc_actor::run: Message processing complete, looping back");
                 }
-                else => break,
+                else => {
+                    error!("ctc_actor::run: Channel closed or error, actor loop TERMINATING");
+                    break;
+                }
             }
         }
+        error!("ctc_actor::run: Actor loop has EXITED - this should not happen in normal operation!");
     }
 }
