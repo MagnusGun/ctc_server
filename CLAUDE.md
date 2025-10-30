@@ -167,3 +167,75 @@ This is a Cargo workspace using Rust edition 2024:
 - All Modbus parameters use signed 16-bit values internally, even for unsigned physical values
 - Temperature values typically use 0.1 scaling (raw value 221 = 22.1°C)
 - The server uses single-threaded Tokio runtime (`current_thread` flavor) since Modbus is inherently sequential
+
+## Coding Standards
+
+### Code Quality Requirements
+
+All code in this project must meet these standards before committing:
+
+1. **Zero Clippy Warnings**
+   ```bash
+   cargo clippy --all-targets -- -W clippy::pedantic
+   ```
+   - Must produce zero warnings
+   - Do not use `#[allow(...)]` without clear justification
+   - Fix issues rather than suppressing warnings
+
+2. **All Tests Pass**
+   ```bash
+   cargo test --all-targets
+   ```
+   - All existing tests must pass
+   - Add tests for new functionality
+   - Add tests for bug fixes to prevent regressions
+
+3. **Code Formatting**
+   ```bash
+   cargo fmt
+   ```
+   - All code must be formatted with rustfmt
+
+4. **Float Comparisons in Tests**
+   - Never use `assert_eq!` for float comparisons
+   - Use epsilon-based comparison helper:
+   ```rust
+   fn assert_float_eq(a: f32, b: f32, msg: &str) {
+       assert!((a - b).abs() < f32::EPSILON, "{msg}: expected {b}, got {a}");
+   }
+   ```
+
+### Git Commit Message Guidelines
+
+Follow these standards for all commits:
+
+1. **Subject Line**
+   - Maximum 50 characters
+   - Start with imperative verb (Fix, Add, Update, Remove, Refactor)
+   - Do not end with a period
+   - Example: `Fix step validation and add proper float tests`
+
+2. **Body** (optional, for complex changes)
+   - Separate from subject with blank line
+   - Wrap at 72 characters
+   - Explain what and why, not how
+   - Use bullet points for multiple changes
+
+3. **Examples**
+   ```
+   Fix step validation from minimum value
+
+   Add configurable retry logic for Modbus
+
+   Refactor temperature endpoints to use helpers
+
+   Update API response format to match spec
+   ```
+
+### Pre-Commit Checklist
+
+Before committing, verify:
+- [ ] `cargo fmt` - Code is formatted
+- [ ] `cargo clippy --all-targets -- -W clippy::pedantic` - Zero warnings
+- [ ] `cargo test --all-targets` - All tests pass
+- [ ] Commit message follows guidelines (≤50 chars, imperative verb)

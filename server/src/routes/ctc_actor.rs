@@ -155,7 +155,8 @@ impl CtcActor {
 
         match self.read_min_max_step(param).await {
             Ok((max, min, step)) => {
-                if raw_value < min || raw_value > max  || !raw_value.is_multiple_of(step) {
+                // Check if value is within range and is a valid step from the minimum
+                if raw_value < min || raw_value > max  || !(raw_value - min).is_multiple_of(step) {
                     return Err(format!("ctc_actor::write_parameter: Value {value} didnt fit in min/max/step for parameter {}: max {}, min {}, step {}", param.description, param.get_scaled_value(max), param.get_scaled_value(min), param.get_scaled_value(step)));
                 }
             }

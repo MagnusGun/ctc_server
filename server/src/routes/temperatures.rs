@@ -52,7 +52,7 @@ async fn get_room_set_temp(State(tx): State<ModbusSender>) -> Result<String, (St
     match response_rx.await {
         Ok(Ok(rsp)) => {
             debug!("get_room_set_temp: {rsp}");
-            Ok(format!("{{\"room_temperarure_setpoint\": {rsp}}}\n"))
+            Ok(format!("{{\"room_temperature_setpoint\": {rsp}}}\n"))
         },
         Ok(Err(e)) => {
             error!("Error reading room set temperature: {e}");
@@ -84,7 +84,7 @@ async fn set_room_set_temp(State(tx): State<ModbusSender>, Query(param): Query<R
     match response_rx.await {
         Ok(Ok(_)) => {
             debug!("set_room_set_temp: {}", param.value);
-            Ok(format!("{{\"room_temperarure_setpoint\": {}}}\n", param.value))
+            Ok(format!("{{\"room_temperature_setpoint\": {}}}\n", param.value))
         },
         Ok(Err(e)) => {
             error!("Error setting room set temperature: {e}");

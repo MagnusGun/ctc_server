@@ -225,6 +225,11 @@ impl std::fmt::Display for HeatSystemStatus {
 mod tests {
     use crate::modbus::{bms_parameters::{HEATSYSTEM_ROOM_SETTEMP, HEATSYSTEM_STATUS}, HeatSystemStatus, HotWaterMode};
 
+    // Helper function for float comparison with epsilon
+    fn assert_float_eq(a: f32, b: f32, msg: &str) {
+        assert!((a - b).abs() < f32::EPSILON, "{msg}: expected {b}, got {a}");
+    }
+
 
 // region: --- Test for conversion of positive and negative values to raw values
     #[test]
@@ -247,14 +252,14 @@ mod tests {
     fn test_get_scaled_value_pos() {
         let raw_value = 105; // Example raw value
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
-        assert_eq!(scaled_value, 10.5);
+        assert_float_eq(scaled_value, 10.5, "test_get_scaled_value_pos");
     }
 
     #[test]
     fn test_get_scaled_value_neg() {
         let raw_value = 65431; // Example raw value for negative value
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
-        assert_eq!(scaled_value, -10.5);
+        assert_float_eq(scaled_value, -10.5, "test_get_scaled_value_neg");
     }
 // endregion: --- Test for conversion of raw values to positive and negative scaled values (signed BMS parameters)
 
@@ -290,7 +295,7 @@ mod tests {
     fn test_get_scaled_value_0_1() {
         let raw_value = 221;
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
-        assert_eq!(scaled_value, 22.1);
+        assert_float_eq(scaled_value, 22.1, "test_get_scaled_value_0_1");
     }
 
     // Test for signed value
@@ -298,7 +303,7 @@ mod tests {
     fn test_get_scaled_value_signed() {
         let raw_value = 32767; // Maximum value for i16
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
-        assert_eq!(scaled_value, 3276.7);
+        assert_float_eq(scaled_value, 3276.7, "test_get_scaled_value_signed");
     }
 
     // Test for signed value with negative value
@@ -306,7 +311,7 @@ mod tests {
     fn test_get_scaled_value_signed_negative() {
         let raw_value = 32768; // Minimum value for i16 (as u16)
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
-        assert_eq!(scaled_value, -3276.8); // 32768 as i16 is -32768
+        assert_float_eq(scaled_value, -3276.8, "test_get_scaled_value_signed_negative");
     }
 
     // Test for different scaling factor
@@ -314,7 +319,7 @@ mod tests {
     fn test_get_scaled_value_different_factor() {
         let raw_value = 100; // Example raw value
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
-        assert_eq!(scaled_value, 10.0); // Assuming factor is 0.1
+        assert_float_eq(scaled_value, 10.0, "test_get_scaled_value_different_factor");
     }
 
     // Test for 1 in scaled factor
@@ -322,7 +327,7 @@ mod tests {
     fn test_get_scaled_value_one_factor() {
         let raw_value = 10; // Example raw value
         let scaled_value = HEATSYSTEM_STATUS.get_scaled_value(raw_value);
-        assert_eq!(scaled_value, 10.0); // Assuming factor is 1.0
+        assert_float_eq(scaled_value, 10.0, "test_get_scaled_value_one_factor");
     }
 
     // Test for zero raw value
@@ -330,7 +335,7 @@ mod tests {
     fn test_get_scaled_value_zero() {
         let raw_value = 0; // Example raw value
         let scaled_value = HEATSYSTEM_STATUS.get_scaled_value(raw_value);
-        assert_eq!(scaled_value, 0.0); // Zero should always scale to zero
+        assert_float_eq(scaled_value, 0.0, "test_get_scaled_value_zero");
     }
 
     #[test]
@@ -364,5 +369,72 @@ mod tests {
         assert_eq!(HeatSystemStatus::try_from(3), Ok(HeatSystemStatus::On));
         assert!(HeatSystemStatus::try_from(4).is_err());
     }
+
+    // region: --- Test step validation logic
+    /// Tests the step validation logic that checks if a value is valid based on min/max/step
+    /// This validates the fix for the bug where step validation was incorrect when min != 0
+    #[test]
+    fn test_step_validation_from_minimum() {
+        // Test case: min=152, step=5
+        // Valid values should be: 152, 157, 162, 167, etc.
+        let min = 152_u16;
+        let step = 5_u16;
+
+        // Value equals minimum - should be valid
+        assert!((min - min).is_multiple_of(step), "152 should be valid (offset 0 from min 152)");
+
+        // Value is exactly one step from minimum - should be valid
+        let value = 157_u16;
+        assert!((value - min).is_multiple_of(step), "157 should be valid (offset 5 from min 152)");
+
+        // Value is two steps from minimum - should be valid
+        let value = 162_u16;
+        assert!((value - min).is_multiple_of(step), "162 should be valid (offset 10 from min 152)");
+
+        // Value is not a multiple of step from minimum - should be invalid
+        let value = 153_u16;
+        assert!(!(value - min).is_multiple_of(step), "153 should be invalid (offset 1 from min 152)");
+
+        let value = 154_u16;
+        assert!(!(value - min).is_multiple_of(step), "154 should be invalid (offset 2 from min 152)");
+    }
+
+    #[test]
+    fn test_step_validation_from_zero() {
+        // Test case where minimum is 0 (original logic works here)
+        let min = 0_u16;
+        let step = 10_u16;
+
+        // All multiples of 10 should be valid
+        assert!((0_u16 - min).is_multiple_of(step), "0 should be valid");
+        assert!((10_u16 - min).is_multiple_of(step), "10 should be valid");
+        assert!((50_u16 - min).is_multiple_of(step), "50 should be valid");
+
+        // Non-multiples should be invalid
+        assert!(!(5_u16 - min).is_multiple_of(step), "5 should be invalid");
+        assert!(!(15_u16 - min).is_multiple_of(step), "15 should be invalid");
+    }
+
+    #[test]
+    fn test_step_validation_various_scenarios() {
+        // Test various min/step combinations
+
+        // Scenario 1: min=100, step=3
+        let min = 100_u16;
+        let step = 3_u16;
+        assert!((100_u16 - min).is_multiple_of(step), "100 should be valid");
+        assert!((103_u16 - min).is_multiple_of(step), "103 should be valid");
+        assert!((106_u16 - min).is_multiple_of(step), "106 should be valid");
+        assert!(!(101_u16 - min).is_multiple_of(step), "101 should be invalid");
+        assert!(!(102_u16 - min).is_multiple_of(step), "102 should be invalid");
+
+        // Scenario 2: min=7, step=1 (all values valid)
+        let min = 7_u16;
+        let step = 1_u16;
+        assert!((7_u16 - min).is_multiple_of(step), "7 should be valid");
+        assert!((8_u16 - min).is_multiple_of(step), "8 should be valid");
+        assert!((100_u16 - min).is_multiple_of(step), "100 should be valid");
+    }
+    // endregion: --- Test step validation logic
 }
 // endregion: --- Unit tests

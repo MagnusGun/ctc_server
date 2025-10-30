@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git clone:*)",
+      "Read(//tmp/anthropic-skills/**)",
+      "Bash(cloc:*)",
+      "Bash(tokei:*)",
+      "Bash(find:*)",
+      "Bash(awk:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

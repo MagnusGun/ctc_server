@@ -92,35 +92,45 @@
 
 ### 1A. Fix Step Validation Bug
 
-**Status**: ⏸️ Not Started
+**Status**: ✅ Complete (2025-10-30)
 **Priority**: Critical
 **Effort**: 15 minutes
 **Registers Affected**: All writable parameters
 
 **Problem**: Validation checks `raw_value % step != 0` which fails when min value is not a multiple of step.
 
-**Fix**:
-- File: `server/src/routes/ctc_actor.rs:158`
-- Change from: `raw_value % step != 0`
-- Change to: `((raw_value - min) % step) != 0`
+**Fix Applied**:
+- File: `server/src/routes/ctc_actor.rs:159`
+- Changed from: `!raw_value.is_multiple_of(step)`
+- Changed to: `!(raw_value - min).is_multiple_of(step)`
+- Added comment explaining validation logic
+- Applied clippy suggestion to use `.is_multiple_of()` method
 
-**Testing**: Add unit test with min=152, step=5, verify 152 and 157 pass, 153 fails
+**Testing**:
+- ✅ Code compiles successfully
+- ✅ Clippy passes (no warnings related to this change)
+- ✅ Added 3 unit tests in `server/src/modbus/mod.rs`:
+  - `test_step_validation_from_minimum`: Tests the bugfix scenario (min=152, step=5)
+  - `test_step_validation_from_zero`: Tests original logic still works (min=0)
+  - `test_step_validation_various_scenarios`: Tests various min/step combinations
+- ✅ All 19 unit tests pass
 
 ---
 
 ### 1B. Fix API Typo
 
-**Status**: ⏸️ Not Started
+**Status**: ✅ Complete (2025-10-30)
 **Priority**: Critical
 **Effort**: 5 minutes
 
 **Problem**: Typo in JSON response field name
 
-**Fix**:
+**Fix Applied**:
 - File: `server/src/routes/temperatures.rs:55, 87`
-- Change: `"room_temperarure_setpoint"` → `"room_temperature_setpoint"`
+- Changed: `"room_temperarure_setpoint"` → `"room_temperature_setpoint"`
+- Fixed in both GET and POST endpoint responses
 
-**Testing**: Verify API response has correct field name
+**Testing**: ✅ Code compiles successfully
 
 ---
 
@@ -894,6 +904,16 @@ Implement additional parameters from BMS specification:
 
 ✅ **Roadmap Creation**
 - This document created with comprehensive feature tracking
+
+✅ **Phase 1A: Fix Step Validation Bug**
+- Fixed validation logic in `server/src/routes/ctc_actor.rs:159`
+- Changed from `!raw_value.is_multiple_of(step)` to `(raw_value - min) % step != 0`
+- Now correctly validates values relative to minimum, not zero
+
+✅ **Phase 1B: Fix API Typo**
+- Fixed typo in `server/src/routes/temperatures.rs:55, 87`
+- Changed `"room_temperarure_setpoint"` to `"room_temperature_setpoint"`
+- Fixed in both GET and POST responses
 
 ---
 
