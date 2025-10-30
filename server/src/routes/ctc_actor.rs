@@ -1,4 +1,5 @@
 use crate::modbus::CTCModbusParameter;
+use crate::error::ModbusError;
 use tokio_modbus::client::Writer;
 use tokio_serial::SerialPortBuilderExt;
 use tokio::sync::{mpsc, oneshot};
@@ -8,7 +9,7 @@ use tracing::{debug, error, info};
 use std::time::Duration;
 use std::io;
 
-pub type ModbusResponse = Result<f32, String>;
+pub type ModbusResponse = Result<f32, ModbusError>;
 pub type ResponseChannel = oneshot::Sender<ModbusResponse>;
 pub type ModbusRequest = (ParameterOperation, ResponseChannel);
 pub type ModbusSender = mpsc::Sender<ModbusRequest>;
@@ -20,7 +21,7 @@ pub enum ParameterOperation {
 }
 
 pub struct CtcActor {
-    pub receiver: mpsc::Receiver<(ParameterOperation, oneshot::Sender<Result<f32, String>>)>,
+    pub receiver: mpsc::Receiver<(ParameterOperation, oneshot::Sender<Result<f32, ModbusError>>)>,
     context: tokio_modbus::client::Context,
 }
 
@@ -89,7 +90,7 @@ impl CtcActorBuilder {
         self
     }
 
-    pub fn build(self, receiver: mpsc::Receiver<(ParameterOperation, oneshot::Sender<Result<f32, String>>)>) -> io::Result<CtcActor> {
+    pub fn build(self, receiver: mpsc::Receiver<(ParameterOperation, oneshot::Sender<Result<f32, ModbusError>>)>) -> io::Result<CtcActor> {
         // Set up the serial port
         let port = tokio_serial::new(&self.tty_path, self.baud_rate)
             .baud_rate(self.baud_rate)
@@ -112,35 +113,56 @@ impl CtcActorBuilder {
 }
 
 impl CtcActor {
-    async fn read_parameter(&mut self, param: &CTCModbusParameter) -> Result<f32, String> {
+    async fn read_parameter(&mut self, param: &CTCModbusParameter) -> Result<f32, ModbusError> {
         self.context.read_holding_registers(param.id, 1)
             .await
-            .map_err(|e| format!("ctc_actor::read_parameter: Error reading parameter {param:?}: {e}"))
+            .map_err(|e| ModbusError::ProtocolError {
+                reason: format!("Error reading register {}: {e}", param.id),
+            })
             .and_then(|raw_values| {
                 raw_values
-                    .map_err(|e| format!("ctc_actor::read_parameter: Error reading raw values for parameter {param:?}: {e}"))
+                    .map_err(|e| ModbusError::ReadError {
+                        register: param.id,
+                        reason: format!("{e}"),
+                    })
                     .and_then(|raw_values| {
                         debug!("ctc_actor::read_parameter: Raw values for parameter {param:?}: {raw_values:?}");
                         let scaled_values = param.get_scaled_value_vector(&raw_values);
                         scaled_values.first()
                             .copied()
-                            .ok_or_else(|| format!("ctc_actor::read_parameter: No value returned for parameter {param:?}"))
+                            .ok_or_else(|| ModbusError::ReadError {
+                                register: param.id,
+                                reason: "No value returned".to_string(),
+                            })
                     })
             })
     }
 
-    async fn read_min_max_step(&mut self, param: &CTCModbusParameter) -> Result<(u16, u16, u16), String> {
-        let Some(reg_max) = param.reg_max else { return Err(format!("ctc_actor::read_min_max: Parameter {param:?} is not configured for min/max reading (as reg_max is None)")) };
-        
+    async fn read_min_max_step(&mut self, param: &CTCModbusParameter) -> Result<(u16, u16, u16), ModbusError> {
+        let Some(reg_max) = param.reg_max else {
+            return Err(ModbusError::ValidationReadError {
+                register: param.id,
+                reason: "Parameter not configured for min/max reading".to_string(),
+            })
+        };
+
         self.context.read_holding_registers(reg_max, 3)
             .await
-            .map_err(|e| format!("ctc_actor::read_min_max: Error reading min/max for parameter {param:?}: {e}"))
+            .map_err(|e| ModbusError::ProtocolError {
+                reason: format!("Error reading validation parameters at register {reg_max}: {e}"),
+            })
             .and_then(|raw_values| {
                 raw_values
-                    .map_err(|e| format!("ctc_actor::read_min_max: Error reading raw values for parameter {param:?}: {e}"))
+                    .map_err(|e| ModbusError::ValidationReadError {
+                        register: param.id,
+                        reason: format!("{e}"),
+                    })
                     .and_then(|raw_values| {
                         if raw_values.len() < 2 {
-                            return Err(format!("ctc_actor::read_min_max: Not enough values returned for parameter {param:?}"));
+                            return Err(ModbusError::ValidationReadError {
+                                register: param.id,
+                                reason: "Not enough values returned".to_string(),
+                            });
                         }
                         debug!("ctc_actor::read_min_max: Raw values max/min {raw_values:?}");
                         Ok((raw_values[0], raw_values[1], raw_values[2]))
@@ -148,45 +170,62 @@ impl CtcActor {
             })
     }
 
-    async fn write_parameter(&mut self, param: &CTCModbusParameter, value: f32) -> Result<(), String> {
+    async fn write_parameter(&mut self, param: &CTCModbusParameter, value: f32) -> Result<(), ModbusError> {
         debug!("ctc_actor::write_parameter: START - param={:?}, value={}", param, value);
 
         if param.is_read_only() {
             error!("ctc_actor::write_parameter: Parameter {} is read-only", param.id);
-            return Err(format!("ctc_actor::write_parameter: Parameter {} is read-only and cannot be written to", param.id));
+            return Err(ModbusError::ReadOnly {
+                register: param.id,
+            });
         }
 
         let raw_value = param.get_raw_value(value);
         debug!("ctc_actor::write_parameter: Converted to raw_value={}", raw_value);
 
         debug!("ctc_actor::write_parameter: Reading min/max/step for validation");
-        match self.read_min_max_step(param).await {
-            Ok((max, min, step)) => {
-                debug!("ctc_actor::write_parameter: Validation bounds - min={}, max={}, step={}", min, max, step);
-                // Check if value is within range and is a valid step from the minimum
-                if raw_value < min || raw_value > max  || !(raw_value - min).is_multiple_of(step) {
-                    error!("ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not in range [{}, {}] or not valid step from min", raw_value, min, max);
-                    return Err(format!("ctc_actor::write_parameter: Value {value} didnt fit in min/max/step for parameter {}: max {}, min {}, step {}", param.description, param.get_scaled_value(max), param.get_scaled_value(min), param.get_scaled_value(step)));
-                }
-                debug!("ctc_actor::write_parameter: Validation PASSED");
-            }
-            Err(e) => {
-                error!("ctc_actor::write_parameter: Failed to read min/max/step: {}", e);
-                return Err(format!("ctc_actor::write_parameter: Error reading min/max for parameter {param:?}: {e}"));
-            }
+        let (max, min, step) = self.read_min_max_step(param).await?;
+
+        debug!("ctc_actor::write_parameter: Validation bounds - min={}, max={}, step={}", min, max, step);
+
+        // Check if value is within range
+        if raw_value < min || raw_value > max {
+            error!("ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not in range [{}, {}]", raw_value, min, max);
+            return Err(ModbusError::OutOfRange {
+                value,
+                min: param.get_scaled_value(min),
+                max: param.get_scaled_value(max),
+                register: param.id,
+            });
         }
 
-        debug!("ctc_actor::write_parameter: Calling Modbus write_single_register for register {}", param.id);
-        match self.context.write_single_register(param.id, raw_value).await{
-            Ok(_) => {
-                debug!("ctc_actor::write_parameter: Modbus write SUCCESS");
-                Ok(())
-            }
-            Err(e) => {
-                error!("ctc_actor::write_parameter: Modbus write FAILED: {}", e);
-                Err(format!("ctc_actor::write_parameter: Error writing value {value} to parameter {param:?}: {e}"))
-            }
+        // Check if value is valid step from minimum
+        if !(raw_value - min).is_multiple_of(step) {
+            error!("ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not valid step from min", raw_value);
+            return Err(ModbusError::InvalidStep {
+                value,
+                min: param.get_scaled_value(min),
+                step: param.get_scaled_value(step),
+                register: param.id,
+            });
         }
+
+        debug!("ctc_actor::write_parameter: Validation PASSED");
+
+        debug!("ctc_actor::write_parameter: Calling Modbus write_single_register for register {}", param.id);
+        let _ = self.context.write_single_register(param.id, raw_value)
+            .await
+            .map_err(|e| {
+                error!("ctc_actor::write_parameter: Modbus write FAILED: {}", e);
+                ModbusError::WriteError {
+                    register: param.id,
+                    value,
+                    reason: format!("{e}"),
+                }
+            })?;
+
+        debug!("ctc_actor::write_parameter: Modbus write SUCCESS");
+        Ok(())
     }
 
     /// Main actor loop that processes incoming parameter operations.
@@ -238,7 +277,11 @@ impl CtcActor {
                                             }
                                             else {
                                                 error!("ctc_actor::run: Read-back MISMATCH: wrote {} but read {}", value, return_value);
-                                                respond_to.send(Err(format!("Read-back value {return_value} does not match written value {value} for parameter {param:?}"))).unwrap_or_else(|e| {
+                                                respond_to.send(Err(ModbusError::VerificationError {
+                                                    expected: value,
+                                                    actual: return_value,
+                                                    register: param.id,
+                                                })).unwrap_or_else(|e| {
                                                     error!("ctc_actor::run: CRITICAL - Failed to send mismatch error: {e:?}");
                                                 });
                                                 debug!("ctc_actor::run: Write operation FAILED (mismatch)");

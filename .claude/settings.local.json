@@ -11,7 +11,13 @@
       "Bash(cargo tree:*)",
       "Bash(cargo check:*)",
       "Bash(cargo clippy:*)",
-      "Bash(cargo update:*)"
+      "Bash(cargo update:*)",
+      "Bash(cargo audit:*)",
+      "Bash(timeout 10 cargo audit:*)",
+      "Bash(echo:*)",
+      "Bash(cargo deny check:*)",
+      "Bash(cargo tarpaulin:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

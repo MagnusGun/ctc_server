@@ -2,11 +2,13 @@ mod routes;
 mod modbus;
 mod helpers;
 mod config;
+mod error;
 
 use std::{env, time::Duration};
 use axum::Router;
 use tracing::{debug, info};
 use crate::config::Config;
+use crate::error::ModbusError;
 use crate::routes::{ctc_actor::{CtcActorBuilder, ParameterOperation}};
 // const SCALE_BASE: u16 = 10;
 
@@ -40,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let ctx = rtu::attach_slave(port, Slave(1));
     // let shared_ctx = Arc::new(Mutex::new(ctx));
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<(ParameterOperation, tokio::sync::oneshot::Sender<Result<f32, String>>)>(config.modbus.channel_buffer_size);
+    let (tx, rx) = tokio::sync::mpsc::channel::<(ParameterOperation, tokio::sync::oneshot::Sender<Result<f32, ModbusError>>)>(config.modbus.channel_buffer_size);
 
     let mut ctc_actor = CtcActorBuilder::new(tty_path)
         .baud_rate(config.serial.baud_rate)

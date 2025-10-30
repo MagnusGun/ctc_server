@@ -1,14 +1,15 @@
 use crate::config::PowerSaveConfig;
+use crate::error::ApiError;
 use crate::modbus::bms_parameters::{get_ctc_parameter_by_id, get_custom_ctc_parameter_by_addr, CTC_VACCATION_DAYS, HEATSYSTEM_ROOM_SETTEMP};
-use axum::{extract::{Query, State}, http::StatusCode, routing::{get, post}, Router};
+use axum::{extract::{Query, State}, routing::{get, post}, Router};
 use serde::Deserialize;
 use tracing::debug;
 
 use crate::helpers::{read_parameter, read_parameter_value, write_parameter};
-use crate::routes::ctc_actor::{ModbusSender, ParameterOperation};
+use crate::routes::ctc_actor::ModbusSender;
 
 pub fn routes(
-    sender: tokio::sync::mpsc::Sender<(ParameterOperation, tokio::sync::oneshot::Sender<Result<f32,String>>)>,
+    sender: ModbusSender,
     power_save_config: PowerSaveConfig,
 ) -> Router {
     Router::new()
@@ -35,26 +36,26 @@ struct CtcParams {
 // signed: whether the value is signed or not
 // returns a JSON object with the parameter value
 // e.g. {"ctc_data": 23.5}
-async fn get_ctc_data(State((tx, _)): State<(ModbusSender, PowerSaveConfig)>, Query(params): Query<CtcParams>) -> Result<String, (StatusCode, String)>{
+async fn get_ctc_data(State((tx, _)): State<(ModbusSender, PowerSaveConfig)>, Query(params): Query<CtcParams>) -> Result<String, ApiError>{
     debug!("get_ctc_data: reveived a request for reading CTC parameter with address: {}", params.addr);
 
     let param = match params.custom {
         Some(true) => get_custom_ctc_parameter_by_addr(params.addr, params.factor),
         _ => *get_ctc_parameter_by_id(params.addr)
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("get_ctc_data: No CTC parameter found with address: {}", params.addr)))?,
+            .ok_or(ApiError::BadRequest)?,
     };
 
     debug!("get_ctc_data: Found CTC parameter: {param:?}");
     read_parameter(&tx, param, "ctc_data", "get_ctc_data").await
 }
 
-async fn post_ctc_data(State((tx, _)): State<(ModbusSender, PowerSaveConfig)>, Query(params): Query<CtcParams>) -> Result<String, (StatusCode, String)> {
+async fn post_ctc_data(State((tx, _)): State<(ModbusSender, PowerSaveConfig)>, Query(params): Query<CtcParams>) -> Result<String, ApiError> {
     debug!("post_ctc_data: received a request to write CTC parameter with address: {}", params.addr);
     let param = *get_ctc_parameter_by_id(params.addr)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("post_ctc_data: No CTC parameter found with address: {}", params.addr)))?;
+        .ok_or(ApiError::BadRequest)?;
 
     let value = params.value
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "post_ctc_data: No value provided to write".to_string()))?;
+        .ok_or(ApiError::BadRequest)?;
 
     debug!("post_ctc_data: Found CTC parameter: {param:?}");
     write_parameter(&tx, param, value, "ctc_data", "post_ctc_data").await
@@ -65,7 +66,7 @@ struct PowerSave {
     active: bool,
 }
 
-async fn set_power_save(State((tx, config)): State<(ModbusSender, PowerSaveConfig)>, Query(params): Query<PowerSave>) -> Result<String, (StatusCode, String)>{
+async fn set_power_save(State((tx, config)): State<(ModbusSender, PowerSaveConfig)>, Query(params): Query<PowerSave>) -> Result<String, ApiError>{
     debug!("set_power_save: START - {params:?}");
 
     let (room_temp, vacation_days) = if params.active {
@@ -104,7 +105,7 @@ async fn set_power_save(State((tx, config)): State<(ModbusSender, PowerSaveConfi
     Ok(format!("{{\"powersave\": {}}}\n", params.active))
 }
 
-async fn get_power_save(State((tx, _)): State<(ModbusSender, PowerSaveConfig)>) -> Result<String, (StatusCode, String)>{
+async fn get_power_save(State((tx, _)): State<(ModbusSender, PowerSaveConfig)>) -> Result<String, ApiError>{
     debug!("get_power_save");
 
     let room_setpoint = read_parameter_value(&tx, HEATSYSTEM_ROOM_SETTEMP, "get_power_save:room_setpoint").await?;

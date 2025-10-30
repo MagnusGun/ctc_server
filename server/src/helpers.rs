@@ -3,9 +3,9 @@
 //! This module provides generic helper functions to reduce code duplication
 //! across API endpoint handlers.
 
-use axum::http::StatusCode;
 use tracing::{debug, error};
 
+use crate::error::ApiError;
 use crate::modbus::CTCModbusParameter;
 use crate::routes::ctc_actor::{ModbusSender, ParameterOperation};
 
@@ -16,7 +16,7 @@ pub async fn read_parameter_value(
     tx: &ModbusSender,
     param: CTCModbusParameter,
     log_context: &str,
-) -> Result<f32, (StatusCode, String)> {
+) -> Result<f32, ApiError> {
     // Create a oneshot channel for this request
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
@@ -32,15 +32,14 @@ pub async fn read_parameter_value(
             Ok(value)
         }
         Ok(Err(e)) => {
+            // Log full error details internally
             error!("Error reading parameter in {log_context}: {e}");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+            // Convert to ApiError (minimal exposure to client)
+            Err(ApiError::from(e))
         }
         Err(e) => {
             error!("Failed to receive response in {log_context}: {e}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            ))
+            Err(ApiError::ServiceUnavailable)
         }
     }
 }
@@ -60,7 +59,7 @@ pub async fn read_parameter(
     param: CTCModbusParameter,
     json_key: &str,
     log_context: &str,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<String, ApiError> {
     // Create a oneshot channel for this request
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
@@ -76,15 +75,14 @@ pub async fn read_parameter(
             Ok(format!("{{\"{json_key}\": {value}}}\n"))
         }
         Ok(Err(e)) => {
+            // Log full error details internally
             error!("Error reading parameter in {log_context}: {e}");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+            // Convert to ApiError (minimal exposure to client)
+            Err(ApiError::from(e))
         }
         Err(e) => {
             error!("Failed to receive response in {log_context}: {e}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            ))
+            Err(ApiError::ServiceUnavailable)
         }
     }
 }
@@ -106,7 +104,7 @@ pub async fn write_parameter(
     value: f32,
     json_key: &str,
     log_context: &str,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<String, ApiError> {
     debug!("{log_context}: write_parameter START - param={:?}, value={}", param, value);
 
     // Create a oneshot channel for this request
@@ -128,15 +126,14 @@ pub async fn write_parameter(
             Ok(format!("{{\"{json_key}\": {value}}}\n"))
         }
         Ok(Err(e)) => {
+            // Log full error details internally
             error!("{log_context}: write_parameter - Response received: ERROR - {e}");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+            // Convert to ApiError (minimal exposure to client)
+            Err(ApiError::from(e))
         }
         Err(e) => {
             error!("{log_context}: write_parameter - Failed to receive response: {e}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to receive response".to_string(),
-            ))
+            Err(ApiError::ServiceUnavailable)
         }
     }
 }
