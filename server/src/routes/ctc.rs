@@ -19,6 +19,7 @@ pub fn routes(sender: tokio::sync::mpsc::Sender<(ParameterOperation, tokio::sync
 struct CtcParams {
     addr: u16,
     value: Option<f32>,
+    factor: Option<f32>,
     custom: Option<bool>,
 }
 
@@ -34,7 +35,7 @@ async fn get_ctc_data(State(tx): State<ModbusSender>, Query(params): Query<CtcPa
     debug!("get_ctc_data: reveived a request for reading CTC parameter with address: {}", params.addr);
 
     let param = match params.custom {
-        Some(true) => &get_custom_ctc_parameter_by_addr(params.addr),
+        Some(true) => &get_custom_ctc_parameter_by_addr(params.addr, params.factor),
         _ => get_ctc_parameter_by_id(params.addr)
             .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("get_ctc_data: No CTC parameter found with address: {}", params.addr)))?,
     };

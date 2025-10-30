@@ -118,6 +118,7 @@ impl CtcActor {
                 raw_values
                     .map_err(|e| format!("ctc_actor::read_parameter: Error reading raw values for parameter {param:?}: {e}"))
                     .and_then(|raw_values| {
+                        debug!("ctc_actor::read_parameter: Raw values for parameter {param:?}: {raw_values:?}");
                         let scaled_values = param.get_scaled_value_vector(&raw_values);
                         scaled_values.first()
                             .copied()
@@ -127,10 +128,9 @@ impl CtcActor {
     }
 
     async fn read_min_max_step(&mut self, param: &CTCModbusParameter) -> Result<(u16, u16, u16), String> {
-        if param.reg_max == 0 {
-            return Err(format!("ctc_actor::read_min_max: Parameter {param:?} is not configured for min/max reading (as reg_max is 0)"));
-        }
-        self.context.read_holding_registers(param.reg_max, 3)
+        let Some(reg_max) = param.reg_max else { return Err(format!("ctc_actor::read_min_max: Parameter {param:?} is not configured for min/max reading (as reg_max is None)")) };
+        
+        self.context.read_holding_registers(reg_max, 3)
             .await
             .map_err(|e| format!("ctc_actor::read_min_max: Error reading min/max for parameter {param:?}: {e}"))
             .and_then(|raw_values| {
@@ -150,20 +150,20 @@ impl CtcActor {
         if param.is_read_only() {
             return Err(format!("ctc_actor::write_parameter: Parameter {} is read-only and cannot be written to", param.id));
         }
-        let scaled_value = param.to_scaled_value_vector(value);
+        let raw_value = param.get_raw_value(value);
 
 
         match self.read_min_max_step(param).await {
             Ok((max, min, step)) => {
-                if scaled_value[0] < min || scaled_value[0] > max  || scaled_value[0] % step != 0 {
+                if raw_value < min || raw_value > max  || !raw_value.is_multiple_of(step) {
                     return Err(format!("ctc_actor::write_parameter: Value {value} didnt fit in min/max/step for parameter {}: max {}, min {}, step {}", param.description, param.get_scaled_value(max), param.get_scaled_value(min), param.get_scaled_value(step)));
                 }
             }
             Err(e) => return Err(format!("ctc_actor::write_parameter: Error reading min/max for parameter {param:?}: {e}"))
         }
 
-        debug!("ctc_actor::write_parameter: Writing value {value} to parameter {param:?} as scaled value {scaled_value:?}");
-        match self.context.write_single_register(param.id, scaled_value[0]).await{
+        debug!("ctc_actor::write_parameter: Writing value {value} to parameter {param:?} as scaled value {raw_value:?}");
+        match self.context.write_single_register(param.id, raw_value).await{
             Ok(_) => Ok(()),
             Err(e) => Err(format!("ctc_actor::write_parameter: Error writing value {value} to parameter {param:?}: {e}")),
         }

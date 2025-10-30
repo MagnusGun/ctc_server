@@ -18,11 +18,11 @@ pub struct CTCModbusParameter {
     /// Access type: either read-only (R) or read/write (RW).
     pub access: Access,
     /// This register address contains the maximum value for the parameter.
-    pub reg_max: u16,
+    pub reg_max: Option<u16>,
     /// This register address contains the minimum value for the parameter.
-    pub reg_min: u16,
+    pub reg_min: Option<u16>,
     /// This register address contains the step size for the parameter e.g., 0.1 for temperature.
-    pub reg_step: u16,
+    pub reg_step: Option<u16>,
     /// This register contains a bit field (mask) indicating which parameters are supported or active.
     pub visible: u16,
     /// The bit position within the bit field from the "Visible" register corresponding to this parameter.
@@ -62,9 +62,10 @@ impl CTCModbusParameter {
     /// # Returns
     /// The scaled value rounded to one decimal place
     #[inline]
-    #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
     fn scale_value(&self, raw_value: u16) -> f32 {
         let value = if self.signed {
+            // Direct cast to i16 preserves the bit pattern and correctly interprets negative values
             f32::from(raw_value as i16)
         } else {
             f32::from(raw_value)
@@ -108,8 +109,15 @@ impl CTCModbusParameter {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
-    pub fn to_scaled_value_vector(&self, value: f32) -> Vec<u16> {
-        vec![(value / self.factor).round() as u16]
+    pub fn get_raw_value(&self, value: f32) -> u16 {
+        let raw_value = (value / self.factor).round();
+        
+        if self.signed {
+            // First convert to i16, then cast to u16 to preserve bit pattern
+            raw_value as i16 as u16
+        } else {
+            raw_value as u16
+        }
     }
 }
 // endregion: --- Modbus Parameter Struct
@@ -217,6 +225,39 @@ impl std::fmt::Display for HeatSystemStatus {
 mod tests {
     use crate::modbus::{bms_parameters::{HEATSYSTEM_ROOM_SETTEMP, HEATSYSTEM_STATUS}, HeatSystemStatus, HotWaterMode};
 
+
+// region: --- Test for conversion of positive and negative values to raw values
+    #[test]
+    fn test_get_raw_value_pos() {
+        let value: f32 = 10.5;
+        let raw_value = HEATSYSTEM_ROOM_SETTEMP.get_raw_value(value);
+        assert_eq!(raw_value, 105);
+    }
+
+    #[test]
+    fn test_get_raw_value_neg() {
+        let value: f32 = -10.5;
+        let raw_value = HEATSYSTEM_ROOM_SETTEMP.get_raw_value(value);
+        assert_eq!(raw_value, 65431);
+    }
+// endregion: --- Test for conversion of positive and negative values to raw values (signed BMS parameters)
+
+// region: --- Test for conversion of raw values to positive and negative scaled values (signed BMS parameters)
+    #[test]
+    fn test_get_scaled_value_pos() {
+        let raw_value = 105; // Example raw value
+        let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
+        assert_eq!(scaled_value, 10.5);
+    }
+
+    #[test]
+    fn test_get_scaled_value_neg() {
+        let raw_value = 65431; // Example raw value for negative value
+        let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
+        assert_eq!(scaled_value, -10.5);
+    }
+// endregion: --- Test for conversion of raw values to positive and negative scaled values (signed BMS parameters)
+
     #[test]
     fn test_get_scaled_value_vector_0_1() {
         let raw_values = vec![221, 222, 223];
@@ -234,15 +275,15 @@ mod tests {
     #[test]
     fn test_to_scaled_value_vector_0_1() {
         let value = 22.1;
-        let scaled_value = HEATSYSTEM_ROOM_SETTEMP.to_scaled_value_vector(value);
-        assert_eq!(scaled_value, vec![221]);
+        let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_raw_value(value);
+        assert_eq!(scaled_value, 221);
     }
 
     #[test]
     fn test_to_scaled_value_vector_1_0() {
         let value = 22_f32;
-        let scaled_value = HEATSYSTEM_STATUS.to_scaled_value_vector(value);
-        assert_eq!(scaled_value, vec![22]);
+        let scaled_value = HEATSYSTEM_STATUS.get_raw_value(value);
+        assert_eq!(scaled_value, 22);
     }
 
     #[test]

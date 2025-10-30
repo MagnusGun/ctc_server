@@ -32,9 +32,9 @@ macro_rules! ctc_parameter {
             id: $id,
             signed: true,
             access: $access,
-            reg_max: $reg_base,
-            reg_min: $reg_base + 1,
-            reg_step: $reg_base + 2,
+            reg_max: Some($reg_base),
+            reg_min: Some($reg_base + 1),
+            reg_step: Some($reg_base + 2),
             visible: $visible,
             bit: $bit,
             factor: $factor,
@@ -48,9 +48,9 @@ macro_rules! ctc_parameter {
             id: $id,
             signed: true,
             access: Access::R,
-            reg_max: 0,
-            reg_min: 0,
-            reg_step: 0,
+            reg_max: None,
+            reg_min: None,
+            reg_step: None,
             visible: $visible,
             bit: $bit,
             factor: $factor,
@@ -197,17 +197,17 @@ pub fn get_ctc_parameter_by_id(id: u16) -> Option<&'static CTCModbusParameter> {
 }
 
 #[must_use]
-pub fn get_custom_ctc_parameter_by_addr(addr: u16) -> CTCModbusParameter {
+pub fn get_custom_ctc_parameter_by_addr(addr: u16, factor: Option<f32>) -> CTCModbusParameter {
     CTCModbusParameter {
         id: addr,
         signed: true,
         access: Access::R,
-        reg_max: 0,
-        reg_min: 0,
-        reg_step: 0,
+        reg_max: None,
+        reg_min: None,
+        reg_step: None,
         visible: 62500,
         bit: 0,
-        factor: 1.0,
+        factor: factor.unwrap_or(1.0),
         description: "Custom CTC Parameter",
     }
 }

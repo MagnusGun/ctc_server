@@ -11,6 +11,6 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 
 # Local-only dependencies
-axum = "0.8.4"
-tokio-modbus = { version = "0.16.1", default-features = false, features = ["rtu"] }
+axum = "0.8.6"
+tokio-modbus = { version = "0.17.0", default-features = false, features = ["rtu"] }
 tokio-serial = "5.4.5"
