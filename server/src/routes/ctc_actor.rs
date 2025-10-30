@@ -38,16 +38,18 @@ pub struct CtcActorBuilder {
 
 #[allow(dead_code)]
 impl CtcActorBuilder {
+    /// Create a new builder with just the TTY path
+    /// All other parameters should be set via builder methods
     pub fn new(tty_path: impl Into<String>) -> Self {
         Self {
             tty_path: tty_path.into(),
-            baud_rate: 9600,
-            data_bits: DataBits::Eight,
-            parity: Parity::Even,
-            stop_bits: StopBits::One,
-            flow_control: FlowControl::Hardware,
-            timeout: Duration::from_secs(1),
-            slave_id: 1,
+            baud_rate: 9600,              // Will be overridden by config
+            data_bits: DataBits::Eight,    // Will be overridden by config
+            parity: Parity::Even,          // Will be overridden by config
+            stop_bits: StopBits::One,      // Will be overridden by config
+            flow_control: FlowControl::Hardware, // Will be overridden by config
+            timeout: Duration::from_secs(1),     // Will be overridden by config
+            slave_id: 1,                   // Will be overridden by config
         }
     }
 

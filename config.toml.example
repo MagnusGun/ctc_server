@@ -1,0 +1,83 @@
+# CTC Server Configuration
+#
+# All settings are optional and use sensible defaults if not specified.
+# Uncomment and modify only the settings you want to change.
+#
+# Configuration priority (highest to lowest):
+# 1. CLI arguments
+# 2. Environment variables (CTC_SERVER_PORT, CTC_SERIAL_BAUD_RATE, etc.)
+# 3. This config file (config.toml)
+# 4. Built-in defaults (shown in comments below)
+
+[server]
+# HTTP server bind address (default: "0.0.0.0")
+# Set to "127.0.0.1" to only allow local connections
+# host = "0.0.0.0"
+
+# HTTP server port (default: 3000)
+# port = 3000
+
+[serial]
+# Default serial port path (default: "/dev/ttyAMA4")
+# Can be overridden via CLI argument: cargo run -- /dev/ttyUSB0
+# Common values: /dev/ttyAMA4, /dev/ttyUSB0, /dev/ttyS0
+# default_port = "/dev/ttyAMA4"
+
+# Serial port baud rate (default: 9600)
+# Must match CTC device settings
+# baud_rate = 9600
+
+# Data bits (default: 8)
+# Options: 5, 6, 7, or 8
+# data_bits = 8
+
+# Parity (default: "even")
+# Options: "none", "even", or "odd"
+# parity = "even"
+
+# Stop bits (default: 1)
+# Options: 1 or 2
+# stop_bits = 1
+
+# Flow control (default: "hardware")
+# Options: "none", "software", or "hardware"
+# flow_control = "hardware"
+
+# Serial port operation timeout in seconds (default: 1)
+# timeout_secs = 1
+
+[modbus]
+# Modbus RTU slave ID (default: 1)
+# Typically 1 for CTC systems
+# slave_id = 1
+
+# Message queue buffer size (default: 24)
+# Number of pending requests the server can queue
+# channel_buffer_size = 24
+
+# Request timeout in seconds (default: 5)
+# How long to wait for a response (future use in Phase 2C)
+# request_timeout_secs = 5
+
+[power_save]
+# Room temperature setpoint when power save mode is ACTIVE (default: 15.0°C)
+# low_temp = 15.0
+
+# Room temperature setpoint when power save mode is INACTIVE (default: 21.5°C)
+# high_temp = 21.5
+
+# Vacation days when power save mode is ACTIVE (default: 2.0)
+# low_days = 2.0
+
+# Vacation days when power save mode is INACTIVE (default: 0.0)
+# high_days = 0.0
+
+[temperature_validation]
+# Minimum allowed room temperature setpoint for API (default: 5.0°C)
+# Prevents accidentally setting extremely low temperatures
+# This is an API-level safety check; the CTC device has its own validation
+# min = 5.0
+
+# Maximum allowed room temperature setpoint for API (default: 30.0°C)
+# Prevents accidentally setting extremely high temperatures
+# max = 30.0
