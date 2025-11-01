@@ -2,9 +2,8 @@
 # Uses cargo-chef for optimized dependency caching
 
 # Stage 1: Planner - Generate recipe.json for dependency caching
-FROM rust:latest AS planner
+FROM lukemathwalker/cargo-chef:latest-rust-latest AS planner
 WORKDIR /app
-RUN cargo install cargo-chef
 COPY Cargo.toml Cargo.lock ./
 COPY server/Cargo.toml ./server/
 # Create minimal source structure for cargo-chef to analyze workspace
@@ -12,7 +11,7 @@ RUN mkdir -p server/src && echo "fn main() {}" > server/src/main.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2: Cacher - Build and cache dependencies
-FROM rust:latest AS cacher
+FROM lukemathwalker/cargo-chef:latest-rust-latest AS cacher
 WORKDIR /app
 
 # Install build dependencies for serial port libraries
@@ -20,9 +19,6 @@ RUN apt-get update && apt-get install -y \
     libudev-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
-
-# Install cargo-chef
-RUN cargo install cargo-chef
 
 # Copy recipe and build dependencies
 COPY --from=planner /app/recipe.json recipe.json

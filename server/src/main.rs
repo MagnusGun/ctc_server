@@ -62,6 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flow_control(config.serial.get_flow_control())
         .timeout(Duration::from_secs(config.serial.timeout_secs))
         .slave_id(config.modbus.slave_id)
+        .operation_timeout(Duration::from_secs(config.modbus.operation_timeout_secs))
+        .max_retries(config.modbus.max_retries)
+        .initial_retry_delay(Duration::from_millis(config.modbus.initial_retry_delay_ms))
+        .backoff_multiplier(config.modbus.backoff_multiplier)
+        .max_consecutive_failures(config.modbus.max_consecutive_failures)
         .build(rx)?;
 
     tokio::spawn(async move {

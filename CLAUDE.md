@@ -190,13 +190,21 @@ All code in this project must meet these standards before committing:
    - Add tests for new functionality
    - Add tests for bug fixes to prevent regressions
 
-3. **Code Formatting**
+3. **Code Coverage** (≥90%)
+   ```bash
+   cargo tarpaulin --all-targets --workspace --out Stdout
+   ```
+   - Minimum 90% code coverage across all targets
+   - Ensure all critical paths are tested
+   - Use `cargo tarpaulin --all-targets --workspace --out Html` for detailed reports
+
+4. **Code Formatting**
    ```bash
    cargo fmt
    ```
    - All code must be formatted with rustfmt
 
-4. **Float Comparisons in Tests**
+5. **Float Comparisons in Tests**
    - Never use `assert_eq!` for float comparisons
    - Use epsilon-based comparison helper:
    ```rust
@@ -232,10 +240,31 @@ Follow these standards for all commits:
    Update API response format to match spec
    ```
 
+### Git Operation Restrictions
+
+**CRITICAL: Claude Code is NEVER allowed to perform the following Git operations:**
+
+- `git add` - Adding files to staging area
+- `git commit` - Creating commits
+- `git push` - Pushing to remote repository
+- `git merge` - Merging branches
+- `git rebase` - Rebasing branches
+- Any other Git write operations
+
+**Allowed Git operations:**
+- `git status` - Check repository status
+- `git diff` - View changes
+- `git log` - View commit history
+- `git show` - View specific commits
+- Other read-only Git commands
+
+**Rationale:** The user maintains full control over version control operations. Claude Code should prepare code and documentation but leave all commit decisions to the user.
+
 ### Pre-Commit Checklist
 
 Before committing, verify:
 - [ ] `cargo fmt` - Code is formatted
 - [ ] `cargo clippy --all-targets -- -W clippy::pedantic` - Zero warnings
 - [ ] `cargo test --all-targets` - All tests pass
+- [ ] `cargo tarpaulin --all-targets --workspace` - Coverage ≥ 90%
 - [ ] Commit message follows guidelines (≤50 chars, imperative verb)

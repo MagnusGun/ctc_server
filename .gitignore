@@ -28,3 +28,6 @@ Service document-BMS Register-17003548.pdf
 docker-compose.override.yml
 .env
 *.tar
+
+# python
+.venv/

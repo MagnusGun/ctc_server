@@ -57,9 +57,16 @@ pub struct ModbusConfig {
     pub slave_id: u8,
     /// Channel buffer size for actor message queue
     pub channel_buffer_size: usize,
-    /// Request timeout in seconds (will be used in Phase 2C)
-    #[allow(dead_code)]
-    pub request_timeout_secs: u64,
+    /// Operation timeout in seconds (timeout for individual Modbus read/write operations)
+    pub operation_timeout_secs: u64,
+    /// Maximum number of retry attempts for failed operations
+    pub max_retries: u32,
+    /// Initial delay in milliseconds before first retry
+    pub initial_retry_delay_ms: u64,
+    /// Exponential backoff multiplier for retry delays
+    pub backoff_multiplier: f64,
+    /// Number of consecutive failures before logging critical warning
+    pub max_consecutive_failures: u32,
 }
 
 /// Power save mode configuration
@@ -131,7 +138,11 @@ impl Config {
             // Modbus defaults
             .set_default("modbus.slave_id", 1)?
             .set_default("modbus.channel_buffer_size", 24)?
-            .set_default("modbus.request_timeout_secs", 5)?
+            .set_default("modbus.operation_timeout_secs", 5)?
+            .set_default("modbus.max_retries", 2)?
+            .set_default("modbus.initial_retry_delay_ms", 100)?
+            .set_default("modbus.backoff_multiplier", 2.0)?
+            .set_default("modbus.max_consecutive_failures", 5)?
             // Power save defaults
             .set_default("power_save.low_temp", 15.0)?
             .set_default("power_save.high_temp", 21.5)?
@@ -270,7 +281,15 @@ mod tests {
             .unwrap()
             .set_default("modbus.channel_buffer_size", 24)
             .unwrap()
-            .set_default("modbus.request_timeout_secs", 5)
+            .set_default("modbus.operation_timeout_secs", 5)
+            .unwrap()
+            .set_default("modbus.max_retries", 2)
+            .unwrap()
+            .set_default("modbus.initial_retry_delay_ms", 100)
+            .unwrap()
+            .set_default("modbus.backoff_multiplier", 2.0)
+            .unwrap()
+            .set_default("modbus.max_consecutive_failures", 5)
             .unwrap()
             .set_default("power_save.low_temp", 15.0)
             .unwrap()
@@ -294,5 +313,42 @@ mod tests {
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.serial.baud_rate, 9600);
         assert_eq!(config.modbus.slave_id, 1);
+    }
+
+    #[test]
+    fn test_retry_config_defaults() {
+        let config = Config::load(None).expect("Failed to load default config");
+
+        assert_eq!(config.modbus.operation_timeout_secs, 5);
+        assert_eq!(config.modbus.max_retries, 2);
+        assert_eq!(config.modbus.initial_retry_delay_ms, 100);
+        assert!((config.modbus.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.modbus.max_consecutive_failures, 5);
+    }
+
+    #[test]
+    fn test_retry_backoff_multiplier_is_positive() {
+        let config = Config::load(None).expect("Failed to load default config");
+        assert!(config.modbus.backoff_multiplier > 0.0);
+    }
+
+    #[test]
+    fn test_max_retries_reasonable() {
+        let config = Config::load(None).expect("Failed to load default config");
+        // Should be between 0 and 10
+        assert!(config.modbus.max_retries <= 10);
+    }
+
+    #[test]
+    fn test_initial_retry_delay_positive() {
+        let config = Config::load(None).expect("Failed to load default config");
+        assert!(config.modbus.initial_retry_delay_ms > 0);
+    }
+
+    #[test]
+    fn test_max_consecutive_failures_reasonable() {
+        let config = Config::load(None).expect("Failed to load default config");
+        assert!(config.modbus.max_consecutive_failures > 0);
+        assert!(config.modbus.max_consecutive_failures < 100);
     }
 }

@@ -61,6 +61,16 @@ pub enum ModbusError {
         actual: f32,
         register: u16,
     },
+
+    /// Operation timed out
+    Timeout { register: u16, operation: String },
+
+    /// Maximum retry attempts exceeded
+    MaxRetriesExceeded {
+        register: u16,
+        retries: u32,
+        last_error: String,
+    },
 }
 
 impl fmt::Display for ModbusError {
@@ -126,6 +136,25 @@ impl fmt::Display for ModbusError {
                     "Read-back verification failed for register {register}: expected {expected}, got {actual}"
                 )
             }
+            Self::Timeout {
+                register,
+                operation,
+            } => {
+                write!(
+                    f,
+                    "Operation timed out for register {register}: {operation}"
+                )
+            }
+            Self::MaxRetriesExceeded {
+                register,
+                retries,
+                last_error,
+            } => {
+                write!(
+                    f,
+                    "Maximum retries ({retries}) exceeded for register {register}: {last_error}"
+                )
+            }
         }
     }
 }
@@ -148,7 +177,6 @@ pub enum ApiError {
     ServiceUnavailable,
 
     /// Request timeout (408 Request Timeout)
-    #[allow(dead_code)]
     Timeout,
 }
 
@@ -177,13 +205,17 @@ impl From<ModbusError> for ApiError {
             | ModbusError::OutOfRange { .. }
             | ModbusError::InvalidStep { .. } => Self::BadRequest,
 
+            // Timeout errors
+            ModbusError::Timeout { .. } => Self::Timeout,
+
             // Server errors (internal failures)
             ModbusError::ReadError { .. }
             | ModbusError::WriteError { .. }
             | ModbusError::ValidationReadError { .. }
             | ModbusError::SerialError { .. }
             | ModbusError::ProtocolError { .. }
-            | ModbusError::VerificationError { .. } => Self::InternalError,
+            | ModbusError::VerificationError { .. }
+            | ModbusError::MaxRetriesExceeded { .. } => Self::InternalError,
         }
     }
 }
@@ -438,6 +470,114 @@ mod tests {
     #[test]
     fn test_error_trait_implemented_for_api_error() {
         let err = ApiError::InternalError;
+        // This compiles only if Error trait is implemented
+        let _: &dyn std::error::Error = &err;
+    }
+
+    // Tests for new Timeout and MaxRetriesExceeded variants
+
+    #[test]
+    fn test_modbus_error_display_timeout() {
+        let err = ModbusError::Timeout {
+            register: 61509,
+            operation: "read_holding_registers".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Operation timed out for register 61509: read_holding_registers"
+        );
+    }
+
+    #[test]
+    fn test_modbus_error_display_max_retries_exceeded() {
+        let err = ModbusError::MaxRetriesExceeded {
+            register: 61509,
+            retries: 3,
+            last_error: "Connection refused".to_string(),
+        };
+        assert!(err.to_string().contains("Maximum retries (3) exceeded"));
+        assert!(err.to_string().contains("61509"));
+        assert!(err.to_string().contains("Connection refused"));
+    }
+
+    #[test]
+    fn test_modbus_timeout_to_api_error() {
+        let modbus_err = ModbusError::Timeout {
+            register: 61509,
+            operation: "read".to_string(),
+        };
+        let api_err: ApiError = modbus_err.into();
+        assert_eq!(get_status_code(api_err), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn test_modbus_max_retries_to_api_error_is_internal_error() {
+        let modbus_err = ModbusError::MaxRetriesExceeded {
+            register: 61509,
+            retries: 3,
+            last_error: "timeout".to_string(),
+        };
+        let api_err: ApiError = modbus_err.into();
+        assert_eq!(get_status_code(api_err), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_timeout_error_contains_register_id() {
+        let err = ModbusError::Timeout {
+            register: 12345,
+            operation: "test_op".to_string(),
+        };
+        let err_string = err.to_string();
+        assert!(err_string.contains("12345"));
+        assert!(err_string.contains("test_op"));
+    }
+
+    #[test]
+    fn test_max_retries_error_contains_retry_count() {
+        let err = ModbusError::MaxRetriesExceeded {
+            register: 100,
+            retries: 5,
+            last_error: "fail".to_string(),
+        };
+        let err_string = err.to_string();
+        assert!(err_string.contains('5'));
+    }
+
+    #[test]
+    fn test_timeout_api_error_returns_408_status() {
+        let api_err = ApiError::Timeout;
+        assert_eq!(get_status_code(api_err), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn test_timeout_display_format() {
+        let err = ModbusError::Timeout {
+            register: 999,
+            operation: "write_single_register".to_string(),
+        };
+        assert!(err.to_string().contains("timed out"));
+        assert!(err.to_string().contains("999"));
+    }
+
+    #[test]
+    fn test_max_retries_display_includes_last_error() {
+        let err = ModbusError::MaxRetriesExceeded {
+            register: 777,
+            retries: 2,
+            last_error: "Hardware failure detected".to_string(),
+        };
+        let err_string = err.to_string();
+        assert!(err_string.contains("Hardware failure detected"));
+        assert!(err_string.contains("777"));
+        assert!(err_string.contains('2'));
+    }
+
+    #[test]
+    fn test_error_trait_for_timeout_variant() {
+        let err = ModbusError::Timeout {
+            register: 1,
+            operation: "test".to_string(),
+        };
         // This compiles only if Error trait is implemented
         let _: &dyn std::error::Error = &err;
     }

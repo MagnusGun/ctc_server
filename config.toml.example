@@ -55,9 +55,33 @@
 # Number of pending requests the server can queue
 # channel_buffer_size = 24
 
-# Request timeout in seconds (default: 5)
-# How long to wait for a response (future use in Phase 2C)
-# request_timeout_secs = 5
+# Operation timeout in seconds (default: 5)
+# Timeout for individual Modbus read/write operations
+# Prevents indefinite hangs if heating system stops responding
+# operation_timeout_secs = 5
+
+# Maximum retry attempts (default: 2)
+# Total attempts = initial + max_retries (e.g., 2 retries = 3 total attempts)
+# Set to 0 to disable retries
+# max_retries = 2
+
+# Initial retry delay in milliseconds (default: 100)
+# Delay before first retry attempt
+# Subsequent retries use exponential backoff
+# initial_retry_delay_ms = 100
+
+# Exponential backoff multiplier (default: 2.0)
+# Each retry delay = previous_delay × backoff_multiplier
+# Example with default settings:
+#   - Attempt 1: immediate
+#   - Attempt 2: 100ms delay
+#   - Attempt 3: 200ms delay (100ms × 2.0)
+# backoff_multiplier = 2.0
+
+# Maximum consecutive failures before critical warning (default: 5)
+# Logs a warning when this threshold is reached
+# Helps detect persistent communication issues
+# max_consecutive_failures = 5
 
 [power_save]
 # Room temperature setpoint when power save mode is ACTIVE (default: 15.0°C)

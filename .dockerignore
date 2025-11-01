@@ -40,3 +40,6 @@ script.sh
 
 # Claude
 .claude/
+
+# python
+.venv/
