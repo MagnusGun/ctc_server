@@ -24,7 +24,9 @@
       "Bash(RUSTFLAGS=\"-C instrument-coverage\" LLVM_PROFILE_FILE=\"target/coverage/ctc_server-%p-%m.profraw\" cargo test:*)",
       "Bash(cargo llvm-cov:*)",
       "Skill(pdf)",
-      "Bash(pip3 install:*)"
+      "Bash(pip3 install:*)",
+      "Bash(python3:*)",
+      "Bash(pdftotext:*)"
     ],
     "deny": [],
     "ask": []

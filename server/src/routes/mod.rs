@@ -1,3 +1,3 @@
 pub mod ctc;
-pub mod ctc_actor;
+pub mod smartgrid;
 pub mod temperatures;

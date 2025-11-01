@@ -1,5 +1,17 @@
 #![allow(dead_code)]
+pub mod actor;
 pub mod bms_parameters;
+pub mod keepalive;
+pub mod operations;
+
+// Re-export actor types for easier access
+pub use actor::{CtcActorBuilder, ModbusSender, ParameterOperation};
+
+// Re-export keepalive for convenience
+pub use keepalive::SmartGridKeepalive;
+
+// Re-export operations for convenience
+pub use operations::{read_parameter, read_parameter_value, write_parameter};
 
 // region: --- Modbus Parameter Struct
 // Define the access type.
@@ -220,6 +232,82 @@ impl std::fmt::Display for HeatSystemStatus {
 }
 // endregion: --- Heating system 1 status Enum
 
+// region: --- SmartGrid Control
+/// `SmartGrid` control modes for register 1100
+/// Uses bits 6-7 (0x00, 0x40, 0x80, 0xC0) for virtual digital inputs
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmartGridMode {
+    /// Normal operation (0b00000000)
+    Normal = 0b0000_0000,
+    /// Blocking - stop heating/cooling (0b01000000)
+    /// Equivalent to power-save mode without exhausting config register write cycles
+    Blocking = 0b0100_0000,
+    /// Low Price - prioritize operation when energy is cheap (0b10000000)
+    LowPrice = 0b1000_0000,
+    /// Overcapacity - maximum operation when excess energy available (0b11000000)
+    Overcapacity = 0b1100_0000,
+}
+
+impl SmartGridMode {
+    /// Convert `SmartGridMode` to u16 for Modbus register write
+    #[must_use]
+    pub fn to_register_value(self) -> u16 {
+        u16::from(self as u8)
+    }
+
+    /// Parse `SmartGridMode` from u16 Modbus register value
+    /// Masks out bits 6-7 (0xC0) to extract the `SmartGrid` mode
+    ///
+    /// # Errors
+    /// Returns error if the extracted bits don't match a valid mode
+    pub fn from_register_value(value: u16) -> Result<Self, &'static str> {
+        let masked = (value & 0x00C0) as u8;
+        match masked {
+            0b0000_0000 => Ok(Self::Normal),
+            0b0100_0000 => Ok(Self::Blocking),
+            0b1000_0000 => Ok(Self::LowPrice),
+            0b1100_0000 => Ok(Self::Overcapacity),
+            _ => Err("Invalid SmartGrid mode bits"),
+        }
+    }
+}
+
+impl std::fmt::Display for SmartGridMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Normal => write!(f, "Normal"),
+            Self::Blocking => write!(f, "Blocking"),
+            Self::LowPrice => write!(f, "LowPrice"),
+            Self::Overcapacity => write!(f, "Overcapacity"),
+        }
+    }
+}
+
+impl std::str::FromStr for SmartGridMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "normal" => Ok(Self::Normal),
+            "blocking" => Ok(Self::Blocking),
+            "lowprice" | "low_price" | "low-price" => Ok(Self::LowPrice),
+            "overcapacity" | "over_capacity" | "over-capacity" => Ok(Self::Overcapacity),
+            _ => Err("Invalid SmartGrid mode string"),
+        }
+    }
+}
+
+/// `SmartGrid` control register address (Control Parameters)
+/// BMS Manual page 5: Control Parameters (1000-1999) for frequent writes with keepalive
+pub const SMARTGRID_CONTROL_REGISTER: u16 = 1100;
+
+/// `SmartGrid` keepalive requirement: must refresh every 5 minutes
+/// We use 4 minutes (240 seconds) to provide a safety margin
+pub const SMARTGRID_KEEPALIVE_INTERVAL_SECS: u64 = 240;
+
+// endregion: --- SmartGrid Control
+
 // region: --- Unit tests
 #[cfg(test)]
 mod tests {
@@ -383,6 +471,92 @@ mod tests {
         );
         assert_eq!(HeatSystemStatus::try_from(3), Ok(HeatSystemStatus::On));
         assert!(HeatSystemStatus::try_from(4).is_err());
+    }
+
+    #[test]
+    fn test_smartgrid_mode_to_register() {
+        use crate::modbus::SmartGridMode;
+
+        assert_eq!(SmartGridMode::Normal.to_register_value(), 0x0000);
+        assert_eq!(SmartGridMode::Blocking.to_register_value(), 0x0040);
+        assert_eq!(SmartGridMode::LowPrice.to_register_value(), 0x0080);
+        assert_eq!(SmartGridMode::Overcapacity.to_register_value(), 0x00C0);
+    }
+
+    #[test]
+    fn test_smartgrid_mode_from_register() {
+        use crate::modbus::SmartGridMode;
+
+        assert_eq!(
+            SmartGridMode::from_register_value(0x0000),
+            Ok(SmartGridMode::Normal)
+        );
+        assert_eq!(
+            SmartGridMode::from_register_value(0x0040),
+            Ok(SmartGridMode::Blocking)
+        );
+        assert_eq!(
+            SmartGridMode::from_register_value(0x0080),
+            Ok(SmartGridMode::LowPrice)
+        );
+        assert_eq!(
+            SmartGridMode::from_register_value(0x00C0),
+            Ok(SmartGridMode::Overcapacity)
+        );
+
+        // Test with other bits set (should mask correctly)
+        assert_eq!(
+            SmartGridMode::from_register_value(0x003F),
+            Ok(SmartGridMode::Normal)
+        );
+        assert_eq!(
+            SmartGridMode::from_register_value(0x007F),
+            Ok(SmartGridMode::Blocking)
+        );
+    }
+
+    #[test]
+    fn test_smartgrid_mode_from_str() {
+        use crate::modbus::SmartGridMode;
+        use std::str::FromStr;
+
+        assert_eq!(SmartGridMode::from_str("normal"), Ok(SmartGridMode::Normal));
+        assert_eq!(SmartGridMode::from_str("Normal"), Ok(SmartGridMode::Normal));
+        assert_eq!(
+            SmartGridMode::from_str("blocking"),
+            Ok(SmartGridMode::Blocking)
+        );
+        assert_eq!(
+            SmartGridMode::from_str("Blocking"),
+            Ok(SmartGridMode::Blocking)
+        );
+        assert_eq!(
+            SmartGridMode::from_str("lowprice"),
+            Ok(SmartGridMode::LowPrice)
+        );
+        assert_eq!(
+            SmartGridMode::from_str("low_price"),
+            Ok(SmartGridMode::LowPrice)
+        );
+        assert_eq!(
+            SmartGridMode::from_str("overcapacity"),
+            Ok(SmartGridMode::Overcapacity)
+        );
+        assert_eq!(
+            SmartGridMode::from_str("over_capacity"),
+            Ok(SmartGridMode::Overcapacity)
+        );
+        assert!(SmartGridMode::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_smartgrid_mode_display() {
+        use crate::modbus::SmartGridMode;
+
+        assert_eq!(format!("{}", SmartGridMode::Normal), "Normal");
+        assert_eq!(format!("{}", SmartGridMode::Blocking), "Blocking");
+        assert_eq!(format!("{}", SmartGridMode::LowPrice), "LowPrice");
+        assert_eq!(format!("{}", SmartGridMode::Overcapacity), "Overcapacity");
     }
 
     // region: --- Test step validation logic

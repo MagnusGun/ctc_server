@@ -1,9 +1,12 @@
+use std::time::Duration;
+
 use crate::config::PowerSaveConfig;
 use crate::error::ApiError;
 use crate::modbus::bms_parameters::{
     CTC_VACCATION_DAYS, HEATSYSTEM_ROOM_SETTEMP, get_ctc_parameter_by_id,
     get_custom_ctc_parameter_by_addr,
 };
+use crate::modbus::{ModbusSender, read_parameter, read_parameter_value, write_parameter};
 use axum::{
     Router,
     extract::{Query, State},
@@ -12,16 +15,17 @@ use axum::{
 use serde::Deserialize;
 use tracing::debug;
 
-use crate::helpers::{read_parameter, read_parameter_value, write_parameter};
-use crate::routes::ctc_actor::ModbusSender;
-
-pub fn routes(sender: ModbusSender, power_save_config: PowerSaveConfig) -> Router {
+pub fn routes(
+    sender: ModbusSender,
+    power_save_config: PowerSaveConfig,
+    request_timeout_secs: u64,
+) -> Router {
     Router::new()
         .route("/api/v1/ctc", get(get_ctc_data))
         .route("/api/v1/ctc", post(post_ctc_data))
         .route("/api/v1/ctc/powersave", post(set_power_save))
         .route("/api/v1/ctc/powersave", get(get_power_save))
-        .with_state((sender, power_save_config))
+        .with_state((sender, power_save_config, request_timeout_secs))
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -40,7 +44,7 @@ struct CtcParams {
 // returns a JSON object with the parameter value
 // e.g. {"ctc_data": 23.5}
 async fn get_ctc_data(
-    State((tx, _)): State<(ModbusSender, PowerSaveConfig)>,
+    State((tx, _, timeout_secs)): State<(ModbusSender, PowerSaveConfig, u64)>,
     Query(params): Query<CtcParams>,
 ) -> Result<String, ApiError> {
     debug!(
@@ -54,11 +58,18 @@ async fn get_ctc_data(
     };
 
     debug!("get_ctc_data: Found CTC parameter: {param:?}");
-    read_parameter(&tx, param, "ctc_data", "get_ctc_data").await
+    read_parameter(
+        &tx,
+        param,
+        "ctc_data",
+        "get_ctc_data",
+        Duration::from_secs(timeout_secs),
+    )
+    .await
 }
 
 async fn post_ctc_data(
-    State((tx, _)): State<(ModbusSender, PowerSaveConfig)>,
+    State((tx, _, timeout_secs)): State<(ModbusSender, PowerSaveConfig, u64)>,
     Query(params): Query<CtcParams>,
 ) -> Result<String, ApiError> {
     debug!(
@@ -70,7 +81,15 @@ async fn post_ctc_data(
     let value = params.value.ok_or(ApiError::BadRequest)?;
 
     debug!("post_ctc_data: Found CTC parameter: {param:?}");
-    write_parameter(&tx, param, value, "ctc_data", "post_ctc_data").await
+    write_parameter(
+        &tx,
+        param,
+        value,
+        "ctc_data",
+        "post_ctc_data",
+        Duration::from_secs(timeout_secs),
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,7 +98,7 @@ struct PowerSave {
 }
 
 async fn set_power_save(
-    State((tx, config)): State<(ModbusSender, PowerSaveConfig)>,
+    State((tx, config, timeout_secs)): State<(ModbusSender, PowerSaveConfig, u64)>,
     Query(params): Query<PowerSave>,
 ) -> Result<String, ApiError> {
     debug!("set_power_save: START - {params:?}");
@@ -89,6 +108,8 @@ async fn set_power_save(
     } else {
         (config.high_temp, config.high_days)
     };
+
+    let timeout = Duration::from_secs(timeout_secs);
 
     debug!(
         "set_power_save: Target values - room_temp={}, vacation_days={}",
@@ -103,6 +124,7 @@ async fn set_power_save(
         room_temp,
         "room_temperature_setpoint",
         "set_power_save",
+        timeout,
     )
     .await
     {
@@ -129,6 +151,7 @@ async fn set_power_save(
         vacation_days,
         "vacation_days",
         "set_power_save",
+        timeout,
     )
     .await
     {
@@ -149,14 +172,26 @@ async fn set_power_save(
 }
 
 async fn get_power_save(
-    State((tx, _)): State<(ModbusSender, PowerSaveConfig)>,
+    State((tx, _, timeout_secs)): State<(ModbusSender, PowerSaveConfig, u64)>,
 ) -> Result<String, ApiError> {
     debug!("get_power_save");
 
-    let room_setpoint =
-        read_parameter_value(&tx, HEATSYSTEM_ROOM_SETTEMP, "get_power_save:room_setpoint").await?;
-    let vaccation_days =
-        read_parameter_value(&tx, CTC_VACCATION_DAYS, "get_power_save:vacation_days").await?;
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let room_setpoint = read_parameter_value(
+        &tx,
+        HEATSYSTEM_ROOM_SETTEMP,
+        "get_power_save:room_setpoint",
+        timeout,
+    )
+    .await?;
+    let vaccation_days = read_parameter_value(
+        &tx,
+        CTC_VACCATION_DAYS,
+        "get_power_save:vacation_days",
+        timeout,
+    )
+    .await?;
 
     Ok(format!(
         "{{\"room_temp_setpoint\": {room_setpoint}, \"vaccation_days\": {vaccation_days}}}\n"

@@ -1,12 +1,11 @@
 mod config;
 mod error;
-mod helpers;
 mod modbus;
 mod routes;
 
 use crate::config::Config;
 use crate::error::ModbusError;
-use crate::routes::ctc_actor::{CtcActorBuilder, ParameterOperation};
+use crate::modbus::{CtcActorBuilder, ParameterOperation, SmartGridKeepalive, SmartGridMode};
 use axum::Router;
 use std::{env, time::Duration};
 use tracing::{debug, info};
@@ -73,13 +72,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ctc_actor.run().await;
     });
 
+    // Create SmartGrid keepalive manager and spawn keepalive task
+    let smartgrid_keepalive = SmartGridKeepalive::new(
+        tx.clone(),
+        SmartGridMode::Normal, // Initial mode
+        None,                  // Use default interval (240 seconds)
+    );
+    let keepalive_handle = smartgrid_keepalive.clone();
+    tokio::spawn(async move {
+        keepalive_handle.run().await;
+    });
+    info!("SmartGrid keepalive task spawned");
+
     let app = Router::new()
         // .route("/ctc", get(ctx_handler))
         .merge(routes::temperatures::routes(
             tx.clone(),
             config.temperature_validation.clone(),
+            config.modbus.request_timeout_secs,
         ))
-        .merge(routes::ctc::routes(tx.clone(), config.power_save.clone()));
+        .merge(routes::ctc::routes(
+            tx.clone(),
+            config.power_save.clone(),
+            config.modbus.request_timeout_secs,
+        ))
+        .merge(routes::smartgrid::routes(
+            tx.clone(),
+            smartgrid_keepalive,
+            config.modbus.request_timeout_secs,
+        ));
 
     // Set up the server to listen
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);

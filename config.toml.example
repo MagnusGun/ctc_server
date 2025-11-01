@@ -60,6 +60,12 @@
 # Prevents indefinite hangs if heating system stops responding
 # operation_timeout_secs = 5
 
+# Request timeout in seconds (default: 10)
+# Timeout for HTTP handlers waiting for actor response
+# Should be higher than operation_timeout_secs to allow for retries
+# Prevents HTTP requests from hanging indefinitely if actor is unresponsive
+# request_timeout_secs = 10
+
 # Maximum retry attempts (default: 2)
 # Total attempts = initial + max_retries (e.g., 2 retries = 3 total attempts)
 # Set to 0 to disable retries

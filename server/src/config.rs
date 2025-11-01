@@ -67,6 +67,9 @@ pub struct ModbusConfig {
     pub backoff_multiplier: f64,
     /// Number of consecutive failures before logging critical warning
     pub max_consecutive_failures: u32,
+    /// Request timeout in seconds (timeout for HTTP handlers waiting for actor response)
+    /// Should be higher than `operation_timeout_secs` to allow for retries
+    pub request_timeout_secs: u64,
 }
 
 /// Power save mode configuration
@@ -143,6 +146,7 @@ impl Config {
             .set_default("modbus.initial_retry_delay_ms", 100)?
             .set_default("modbus.backoff_multiplier", 2.0)?
             .set_default("modbus.max_consecutive_failures", 5)?
+            .set_default("modbus.request_timeout_secs", 10)?
             // Power save defaults
             .set_default("power_save.low_temp", 15.0)?
             .set_default("power_save.high_temp", 21.5)?
@@ -286,6 +290,8 @@ mod tests {
             .set_default("modbus.max_retries", 2)
             .unwrap()
             .set_default("modbus.initial_retry_delay_ms", 100)
+            .unwrap()
+            .set_default("modbus.request_timeout_secs", 10)
             .unwrap()
             .set_default("modbus.backoff_multiplier", 2.0)
             .unwrap()

@@ -1,5 +1,11 @@
+//! Modbus actor for CTC heating system
+//!
+//! This module provides an actor-based interface to the Modbus RTU protocol
+//! for communicating with CTC heating systems. The actor ensures exclusive
+//! access to the serial port and processes operations sequentially.
+
 use crate::error::ModbusError;
-use crate::modbus::CTCModbusParameter;
+use crate::modbus::{CTCModbusParameter, SmartGridMode};
 use std::io;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -19,6 +25,9 @@ pub enum ParameterOperation {
     Read(CTCModbusParameter),
     // ReadVector(&Vec<'static CTCModbusParameter>),
     Write(CTCModbusParameter, f32),
+    /// Write `SmartGrid` mode to register 1100
+    /// This uses Control Parameters that support unlimited writes with keepalive
+    WriteSmartGrid(crate::modbus::SmartGridMode),
 }
 
 pub struct CtcActor {
@@ -618,6 +627,245 @@ impl CtcActor {
         })
     }
 
+    /// Write `SmartGrid` mode to register 1100
+    /// This is a simplified write without validation since `SmartGrid` control
+    /// uses Control Parameters (1000-1999) that support unlimited writes
+    async fn write_smartgrid(
+        &mut self,
+        mode: crate::modbus::SmartGridMode,
+    ) -> Result<(), ModbusError> {
+        use crate::modbus::SMARTGRID_CONTROL_REGISTER;
+
+        let register = SMARTGRID_CONTROL_REGISTER;
+        let raw_value = mode.to_register_value();
+
+        debug!(
+            "ctc_actor::write_smartgrid: Writing mode={} (0x{:04X}) to register {}",
+            mode, raw_value, register
+        );
+
+        // Write with retry and timeout
+        let mut last_error = None;
+
+        for attempt in 0..=self.max_retries {
+            // Add delay with exponential backoff (except first attempt)
+            if attempt > 0 {
+                let delay = self.calculate_retry_delay(attempt);
+                debug!(
+                    "Retry attempt {}/{} for write_smartgrid (register {}), delay: {}ms",
+                    attempt,
+                    self.max_retries,
+                    register,
+                    delay.as_millis()
+                );
+                sleep(delay).await;
+            }
+
+            // Execute with timeout
+            let operation = async {
+                self.context
+                    .write_single_register(register, raw_value)
+                    .await
+                    .map_err(|e| {
+                        error!("ctc_actor::write_smartgrid: Modbus write FAILED: {}", e);
+                        ModbusError::WriteError {
+                            register,
+                            value: f32::from(raw_value),
+                            reason: format!("{e}"),
+                        }
+                    })
+                    .and_then(|result| {
+                        result.map_err(|e| ModbusError::WriteError {
+                            register,
+                            value: f32::from(raw_value),
+                            reason: format!("Modbus exception: {e}"),
+                        })
+                    })
+            };
+
+            match timeout(self.operation_timeout, operation).await {
+                Ok(Ok(())) => {
+                    self.record_success();
+                    debug!(
+                        "write_smartgrid succeeded on attempt {} (register {})",
+                        attempt + 1,
+                        register
+                    );
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "write_smartgrid failed on attempt {}/{}: {} (register {})",
+                        attempt + 1,
+                        self.max_retries + 1,
+                        e,
+                        register
+                    );
+                    last_error = Some(e);
+                }
+                Err(_elapsed) => {
+                    let timeout_err = ModbusError::Timeout {
+                        register,
+                        operation: format!(
+                            "write_smartgrid timed out after {:?}",
+                            self.operation_timeout
+                        ),
+                    };
+                    warn!(
+                        "write_smartgrid timeout on attempt {}/{} (register {})",
+                        attempt + 1,
+                        self.max_retries + 1,
+                        register
+                    );
+                    last_error = Some(timeout_err);
+                }
+            }
+        }
+
+        // All retries exhausted
+        self.record_failure();
+
+        let final_error = last_error.unwrap_or_else(|| ModbusError::ProtocolError {
+            reason: "No error captured during retries".to_string(),
+        });
+
+        error!(
+            "write_smartgrid failed after {} attempts (register {}): {}",
+            self.max_retries + 1,
+            register,
+            final_error
+        );
+
+        Err(ModbusError::MaxRetriesExceeded {
+            register,
+            retries: self.max_retries,
+            last_error: final_error.to_string(),
+        })
+    }
+
+    /// Handle a read operation
+    async fn handle_read_operation(
+        &mut self,
+        param: &CTCModbusParameter,
+        respond_to: ResponseChannel,
+    ) {
+        debug!("ctc_actor::run: Operation=READ, parameter={:?}", param);
+        match self.read_parameter(param).await {
+            Ok(value) => {
+                debug!(
+                    "ctc_actor::run: Read SUCCESS, value={}, sending response",
+                    value
+                );
+                respond_to.send(Ok(value)).unwrap_or_else(|e| {
+                    error!(
+                        "ctc_actor::run: CRITICAL - Failed to send read response on oneshot channel: {e:?}"
+                    );
+                });
+                debug!("ctc_actor::run: Read response sent");
+            }
+            Err(e) => {
+                error!("ctc_actor::run: Read FAILED: {}", e);
+                respond_to.send(Err(e)).unwrap_or_else(|e| {
+                    error!("ctc_actor::run: CRITICAL - Failed to send read error response: {e:?}");
+                });
+                debug!("ctc_actor::run: Read error response sent");
+            }
+        }
+    }
+
+    /// Handle a `SmartGrid` write operation
+    async fn handle_smartgrid_operation(
+        &mut self,
+        mode: SmartGridMode,
+        respond_to: ResponseChannel,
+    ) {
+        debug!("ctc_actor::run: Operation=WRITE_SMARTGRID, mode={}", mode);
+        match self.write_smartgrid(mode).await {
+            Ok(()) => {
+                debug!("ctc_actor::run: WriteSmartGrid SUCCESS");
+                // Return 0.0 as dummy value since WriteSmartGrid doesn't return a value
+                respond_to.send(Ok(0.0)).unwrap_or_else(|e| {
+                    error!("ctc_actor::run: CRITICAL - Failed to send success response: {e:?}");
+                });
+            }
+            Err(e) => {
+                error!("ctc_actor::run: WriteSmartGrid FAILED: {}", e);
+                respond_to.send(Err(e)).unwrap_or_else(|e| {
+                    error!("ctc_actor::run: CRITICAL - Failed to send error response: {e:?}");
+                });
+            }
+        }
+    }
+
+    /// Handle a write operation with verification
+    async fn handle_write_operation(
+        &mut self,
+        param: &CTCModbusParameter,
+        value: f32,
+        respond_to: ResponseChannel,
+    ) {
+        debug!(
+            "ctc_actor::run: Operation=WRITE, parameter={:?}, value={}",
+            param, value
+        );
+        match self.write_parameter(param, value).await {
+            Ok(()) => {
+                debug!("ctc_actor::run: Write SUCCESS, reading back to verify");
+                match self.read_parameter(param).await {
+                    Ok(return_value) => {
+                        debug!(
+                            "ctc_actor::run: Read-back value={}, comparing with written value={}",
+                            return_value, value
+                        );
+
+                        if (return_value - value).abs() < f32::EPSILON {
+                            debug!("ctc_actor::run: Read-back MATCHES, sending success response");
+                            respond_to.send(Ok(value)).unwrap_or_else(|e| {
+                                error!(
+                                    "ctc_actor::run: CRITICAL - Failed to send success response: {e:?}"
+                                );
+                            });
+                            debug!("ctc_actor::run: Write operation COMPLETE");
+                        } else {
+                            error!(
+                                "ctc_actor::run: Read-back MISMATCH: wrote {} but read {}",
+                                value, return_value
+                            );
+                            respond_to
+                                .send(Err(ModbusError::VerificationError {
+                                    expected: value,
+                                    actual: return_value,
+                                    register: param.id,
+                                }))
+                                .unwrap_or_else(|e| {
+                                    error!(
+                                        "ctc_actor::run: CRITICAL - Failed to send mismatch error: {e:?}"
+                                    );
+                                });
+                            debug!("ctc_actor::run: Write operation FAILED (mismatch)");
+                        }
+                    }
+                    Err(e) => {
+                        error!("ctc_actor::run: Read-back FAILED: {}", e);
+                        respond_to.send(Err(e)).unwrap_or_else(|e| {
+                            error!(
+                                "ctc_actor::run: CRITICAL - Failed to send read-back error: {e:?}"
+                            );
+                        });
+                        debug!("ctc_actor::run: Write operation FAILED (read-back error)");
+                    }
+                }
+            }
+            Err(e) => {
+                error!("ctc_actor::run: Write FAILED: {}", e);
+                respond_to.send(Err(e)).unwrap_or_else(|e| {
+                    error!("ctc_actor::run: CRITICAL - Failed to send write error response: {e:?}");
+                });
+                debug!("ctc_actor::run: Write error response sent");
+            }
+        }
+    }
+
     /// Main actor loop that processes incoming parameter operations.
     /// Handles both read and write operations for Modbus parameters.
     pub async fn run(&mut self) {
@@ -629,71 +877,13 @@ impl CtcActor {
                     debug!("ctc_actor::run: Message received from channel");
                     match operation {
                         ParameterOperation::Read(param) => {
-                            debug!("ctc_actor::run: Operation=READ, parameter={:?}", param);
-                            match self.read_parameter(&param).await {
-                                Ok(value) => {
-                                    debug!("ctc_actor::run: Read SUCCESS, value={}, sending response", value);
-                                    respond_to.send(Ok(value)).unwrap_or_else(|e| {
-                                        error!("ctc_actor::run: CRITICAL - Failed to send read response on oneshot channel: {e:?}");
-                                    });
-                                    debug!("ctc_actor::run: Read response sent");
-                                },
-                                Err(e) => {
-                                    error!("ctc_actor::run: Read FAILED: {}", e);
-                                    respond_to.send(Err(e)).unwrap_or_else(|e| {
-                                        error!("ctc_actor::run: CRITICAL - Failed to send read error response: {e:?}");
-                                    });
-                                    debug!("ctc_actor::run: Read error response sent");
-                                }
-                            }
+                            self.handle_read_operation(&param, respond_to).await;
+                        },
+                        ParameterOperation::WriteSmartGrid(mode) => {
+                            self.handle_smartgrid_operation(mode, respond_to).await;
                         },
                         ParameterOperation::Write(param, value) => {
-                            debug!("ctc_actor::run: Operation=WRITE, parameter={:?}, value={}", param, value);
-                            match self.write_parameter(&param, value).await {
-                                Ok(()) => {
-                                    debug!("ctc_actor::run: Write SUCCESS, reading back to verify");
-                                    match self.read_parameter(&param).await {
-                                        Ok(return_value) => {
-                                            debug!("ctc_actor::run: Read-back value={}, comparing with written value={}", return_value, value);
-
-                                            // Consider using an epsilon-based comparison for better float handling
-                                            // #[allow(clippy::float_cmp)]
-                                            if (return_value - value).abs() < f32::EPSILON {
-                                                debug!("ctc_actor::run: Read-back MATCHES, sending success response");
-                                                respond_to.send(Ok(value)).unwrap_or_else(|e| {
-                                                    error!("ctc_actor::run: CRITICAL - Failed to send success response: {e:?}");
-                                                });
-                                                debug!("ctc_actor::run: Write operation COMPLETE");
-                                            }
-                                            else {
-                                                error!("ctc_actor::run: Read-back MISMATCH: wrote {} but read {}", value, return_value);
-                                                respond_to.send(Err(ModbusError::VerificationError {
-                                                    expected: value,
-                                                    actual: return_value,
-                                                    register: param.id,
-                                                })).unwrap_or_else(|e| {
-                                                    error!("ctc_actor::run: CRITICAL - Failed to send mismatch error: {e:?}");
-                                                });
-                                                debug!("ctc_actor::run: Write operation FAILED (mismatch)");
-                                            }
-                                        },
-                                        Err(e) => {
-                                            error!("ctc_actor::run: Read-back FAILED: {}", e);
-                                            respond_to.send(Err(e)).unwrap_or_else(|e| {
-                                                error!("ctc_actor::run: CRITICAL - Failed to send read-back error: {e:?}");
-                                            });
-                                            debug!("ctc_actor::run: Write operation FAILED (read-back error)");
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("ctc_actor::run: Write FAILED: {}", e);
-                                    respond_to.send(Err(e)).unwrap_or_else(|e| {
-                                        error!("ctc_actor::run: CRITICAL - Failed to send write error response: {e:?}");
-                                    });
-                                    debug!("ctc_actor::run: Write error response sent");
-                                }
-                            }
+                            self.handle_write_operation(&param, value, respond_to).await;
                         }
                     }
                     debug!("ctc_actor::run: Message processing complete, looping back");
