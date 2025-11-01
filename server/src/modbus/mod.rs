@@ -70,7 +70,7 @@ impl CTCModbusParameter {
         } else {
             f32::from(raw_value)
         };
-        
+
         // Scale and round to one decimal place
         (value * self.factor * 10.0).round() / 10.0
     }
@@ -111,7 +111,7 @@ impl CTCModbusParameter {
     #[allow(clippy::cast_sign_loss)]
     pub fn get_raw_value(&self, value: f32) -> u16 {
         let raw_value = (value / self.factor).round();
-        
+
         if self.signed {
             // First convert to i16, then cast to u16 to preserve bit pattern
             raw_value as i16 as u16
@@ -128,7 +128,7 @@ pub enum HotWaterMode {
     Economy,
     Normal,
     Comfort,
-    Manual,    
+    Manual,
 }
 
 impl From<HotWaterMode> for u16 {
@@ -144,7 +144,7 @@ impl From<HotWaterMode> for u16 {
 
 impl TryFrom<u16> for HotWaterMode {
     type Error = &'static str;
-    
+
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(HotWaterMode::Economy),
@@ -160,9 +160,9 @@ impl std::fmt::Display for HotWaterMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HotWaterMode::Economy => write!(f, "Economy"),
-            HotWaterMode::Normal  => write!(f, "Normal"),
+            HotWaterMode::Normal => write!(f, "Normal"),
             HotWaterMode::Comfort => write!(f, "Comfort"),
-            HotWaterMode::Manual  => write!(f, "Manual"),
+            HotWaterMode::Manual => write!(f, "Manual"),
         }
     }
 }
@@ -170,17 +170,17 @@ impl std::fmt::Display for HotWaterMode {
 
 // region: --- Heating system 1 status Enum
 /* Heating system 1 status
-    0 = Heating off
-    1 = Vacation
-    2= Night reduction
-    3= On (normal mode)
-    */
+0 = Heating off
+1 = Vacation
+2= Night reduction
+3= On (normal mode)
+*/
 #[derive(PartialEq, Debug)]
 pub enum HeatSystemStatus {
     HeatingOff,
     Vacation,
     NightReduction,
-    On, 
+    On,
 }
 
 impl From<HeatSystemStatus> for u16 {
@@ -196,7 +196,7 @@ impl From<HeatSystemStatus> for u16 {
 
 impl TryFrom<u16> for HeatSystemStatus {
     type Error = &'static str;
-    
+
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(HeatSystemStatus::HeatingOff),
@@ -223,15 +223,17 @@ impl std::fmt::Display for HeatSystemStatus {
 // region: --- Unit tests
 #[cfg(test)]
 mod tests {
-    use crate::modbus::{bms_parameters::{HEATSYSTEM_ROOM_SETTEMP, HEATSYSTEM_STATUS}, HeatSystemStatus, HotWaterMode};
+    use crate::modbus::{
+        HeatSystemStatus, HotWaterMode,
+        bms_parameters::{HEATSYSTEM_ROOM_SETTEMP, HEATSYSTEM_STATUS},
+    };
 
     // Helper function for float comparison with epsilon
     fn assert_float_eq(a: f32, b: f32, msg: &str) {
         assert!((a - b).abs() < f32::EPSILON, "{msg}: expected {b}, got {a}");
     }
 
-
-// region: --- Test for conversion of positive and negative values to raw values
+    // region: --- Test for conversion of positive and negative values to raw values
     #[test]
     fn test_get_raw_value_pos() {
         let value: f32 = 10.5;
@@ -245,9 +247,9 @@ mod tests {
         let raw_value = HEATSYSTEM_ROOM_SETTEMP.get_raw_value(value);
         assert_eq!(raw_value, 65431);
     }
-// endregion: --- Test for conversion of positive and negative values to raw values (signed BMS parameters)
+    // endregion: --- Test for conversion of positive and negative values to raw values (signed BMS parameters)
 
-// region: --- Test for conversion of raw values to positive and negative scaled values (signed BMS parameters)
+    // region: --- Test for conversion of raw values to positive and negative scaled values (signed BMS parameters)
     #[test]
     fn test_get_scaled_value_pos() {
         let raw_value = 105; // Example raw value
@@ -261,7 +263,7 @@ mod tests {
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
         assert_float_eq(scaled_value, -10.5, "test_get_scaled_value_neg");
     }
-// endregion: --- Test for conversion of raw values to positive and negative scaled values (signed BMS parameters)
+    // endregion: --- Test for conversion of raw values to positive and negative scaled values (signed BMS parameters)
 
     #[test]
     fn test_get_scaled_value_vector_0_1() {
@@ -311,7 +313,11 @@ mod tests {
     fn test_get_scaled_value_signed_negative() {
         let raw_value = 32768; // Minimum value for i16 (as u16)
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_scaled_value(raw_value);
-        assert_float_eq(scaled_value, -3276.8, "test_get_scaled_value_signed_negative");
+        assert_float_eq(
+            scaled_value,
+            -3276.8,
+            "test_get_scaled_value_signed_negative",
+        );
     }
 
     // Test for different scaling factor
@@ -345,7 +351,7 @@ mod tests {
         assert_eq!(u16::from(HotWaterMode::Normal), 1);
         assert_eq!(u16::from(HotWaterMode::Comfort), 2);
         assert_eq!(u16::from(HotWaterMode::Manual), 3);
-        
+
         // u16 to Enum
         assert_eq!(HotWaterMode::try_from(0), Ok(HotWaterMode::Economy));
         assert_eq!(HotWaterMode::try_from(1), Ok(HotWaterMode::Normal));
@@ -361,11 +367,20 @@ mod tests {
         assert_eq!(u16::from(HeatSystemStatus::Vacation), 1);
         assert_eq!(u16::from(HeatSystemStatus::NightReduction), 2);
         assert_eq!(u16::from(HeatSystemStatus::On), 3);
-        
+
         // u16 to Enum
-        assert_eq!(HeatSystemStatus::try_from(0), Ok(HeatSystemStatus::HeatingOff));
-        assert_eq!(HeatSystemStatus::try_from(1), Ok(HeatSystemStatus::Vacation));
-        assert_eq!(HeatSystemStatus::try_from(2), Ok(HeatSystemStatus::NightReduction));
+        assert_eq!(
+            HeatSystemStatus::try_from(0),
+            Ok(HeatSystemStatus::HeatingOff)
+        );
+        assert_eq!(
+            HeatSystemStatus::try_from(1),
+            Ok(HeatSystemStatus::Vacation)
+        );
+        assert_eq!(
+            HeatSystemStatus::try_from(2),
+            Ok(HeatSystemStatus::NightReduction)
+        );
         assert_eq!(HeatSystemStatus::try_from(3), Ok(HeatSystemStatus::On));
         assert!(HeatSystemStatus::try_from(4).is_err());
     }
@@ -381,22 +396,37 @@ mod tests {
         let step = 5_u16;
 
         // Value equals minimum - should be valid
-        assert!((min - min).is_multiple_of(step), "152 should be valid (offset 0 from min 152)");
+        assert!(
+            (min - min).is_multiple_of(step),
+            "152 should be valid (offset 0 from min 152)"
+        );
 
         // Value is exactly one step from minimum - should be valid
         let value = 157_u16;
-        assert!((value - min).is_multiple_of(step), "157 should be valid (offset 5 from min 152)");
+        assert!(
+            (value - min).is_multiple_of(step),
+            "157 should be valid (offset 5 from min 152)"
+        );
 
         // Value is two steps from minimum - should be valid
         let value = 162_u16;
-        assert!((value - min).is_multiple_of(step), "162 should be valid (offset 10 from min 152)");
+        assert!(
+            (value - min).is_multiple_of(step),
+            "162 should be valid (offset 10 from min 152)"
+        );
 
         // Value is not a multiple of step from minimum - should be invalid
         let value = 153_u16;
-        assert!(!(value - min).is_multiple_of(step), "153 should be invalid (offset 1 from min 152)");
+        assert!(
+            !(value - min).is_multiple_of(step),
+            "153 should be invalid (offset 1 from min 152)"
+        );
 
         let value = 154_u16;
-        assert!(!(value - min).is_multiple_of(step), "154 should be invalid (offset 2 from min 152)");
+        assert!(
+            !(value - min).is_multiple_of(step),
+            "154 should be invalid (offset 2 from min 152)"
+        );
     }
 
     #[test]
@@ -425,8 +455,14 @@ mod tests {
         assert!((100_u16 - min).is_multiple_of(step), "100 should be valid");
         assert!((103_u16 - min).is_multiple_of(step), "103 should be valid");
         assert!((106_u16 - min).is_multiple_of(step), "106 should be valid");
-        assert!(!(101_u16 - min).is_multiple_of(step), "101 should be invalid");
-        assert!(!(102_u16 - min).is_multiple_of(step), "102 should be invalid");
+        assert!(
+            !(101_u16 - min).is_multiple_of(step),
+            "101 should be invalid"
+        );
+        assert!(
+            !(102_u16 - min).is_multiple_of(step),
+            "102 should be invalid"
+        );
 
         // Scenario 2: min=7, step=1 (all values valid)
         let min = 7_u16;

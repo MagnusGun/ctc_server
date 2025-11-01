@@ -1,13 +1,13 @@
-use crate::modbus::CTCModbusParameter;
 use crate::error::ModbusError;
-use tokio_modbus::client::Writer;
-use tokio_serial::SerialPortBuilderExt;
-use tokio::sync::{mpsc, oneshot};
-use tokio_serial::{DataBits, Parity, StopBits, FlowControl};
-use tokio_modbus::prelude::{Slave, rtu, Reader};
-use tracing::{debug, error, info};
-use std::time::Duration;
+use crate::modbus::CTCModbusParameter;
 use std::io;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use tokio_modbus::client::Writer;
+use tokio_modbus::prelude::{Reader, Slave, rtu};
+use tokio_serial::SerialPortBuilderExt;
+use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
+use tracing::{debug, error, info};
 
 pub type ModbusResponse = Result<f32, ModbusError>;
 pub type ResponseChannel = oneshot::Sender<ModbusResponse>;
@@ -21,7 +21,10 @@ pub enum ParameterOperation {
 }
 
 pub struct CtcActor {
-    pub receiver: mpsc::Receiver<(ParameterOperation, oneshot::Sender<Result<f32, ModbusError>>)>,
+    pub receiver: mpsc::Receiver<(
+        ParameterOperation,
+        oneshot::Sender<Result<f32, ModbusError>>,
+    )>,
     context: tokio_modbus::client::Context,
 }
 
@@ -44,16 +47,15 @@ impl CtcActorBuilder {
     pub fn new(tty_path: impl Into<String>) -> Self {
         Self {
             tty_path: tty_path.into(),
-            baud_rate: 9600,              // Will be overridden by config
-            data_bits: DataBits::Eight,    // Will be overridden by config
-            parity: Parity::Even,          // Will be overridden by config
-            stop_bits: StopBits::One,      // Will be overridden by config
+            baud_rate: 9600,                     // Will be overridden by config
+            data_bits: DataBits::Eight,          // Will be overridden by config
+            parity: Parity::Even,                // Will be overridden by config
+            stop_bits: StopBits::One,            // Will be overridden by config
             flow_control: FlowControl::Hardware, // Will be overridden by config
             timeout: Duration::from_secs(1),     // Will be overridden by config
-            slave_id: 1,                   // Will be overridden by config
+            slave_id: 1,                         // Will be overridden by config
         }
     }
-
 
     pub fn baud_rate(mut self, baud_rate: u32) -> Self {
         self.baud_rate = baud_rate;
@@ -90,7 +92,13 @@ impl CtcActorBuilder {
         self
     }
 
-    pub fn build(self, receiver: mpsc::Receiver<(ParameterOperation, oneshot::Sender<Result<f32, ModbusError>>)>) -> io::Result<CtcActor> {
+    pub fn build(
+        self,
+        receiver: mpsc::Receiver<(
+            ParameterOperation,
+            oneshot::Sender<Result<f32, ModbusError>>,
+        )>,
+    ) -> io::Result<CtcActor> {
         // Set up the serial port
         let port = tokio_serial::new(&self.tty_path, self.baud_rate)
             .baud_rate(self.baud_rate)
@@ -105,9 +113,9 @@ impl CtcActorBuilder {
         // Create the Modbus RTU context
         let ctx = rtu::attach_slave(port, Slave(self.slave_id));
 
-        Ok(CtcActor { 
-            receiver, 
-            context: ctx 
+        Ok(CtcActor {
+            receiver,
+            context: ctx,
         })
     }
 }
@@ -138,15 +146,19 @@ impl CtcActor {
             })
     }
 
-    async fn read_min_max_step(&mut self, param: &CTCModbusParameter) -> Result<(u16, u16, u16), ModbusError> {
+    async fn read_min_max_step(
+        &mut self,
+        param: &CTCModbusParameter,
+    ) -> Result<(u16, u16, u16), ModbusError> {
         let Some(reg_max) = param.reg_max else {
             return Err(ModbusError::ValidationReadError {
                 register: param.id,
                 reason: "Parameter not configured for min/max reading".to_string(),
-            })
+            });
         };
 
-        self.context.read_holding_registers(reg_max, 3)
+        self.context
+            .read_holding_registers(reg_max, 3)
             .await
             .map_err(|e| ModbusError::ProtocolError {
                 reason: format!("Error reading validation parameters at register {reg_max}: {e}"),
@@ -170,27 +182,44 @@ impl CtcActor {
             })
     }
 
-    async fn write_parameter(&mut self, param: &CTCModbusParameter, value: f32) -> Result<(), ModbusError> {
-        debug!("ctc_actor::write_parameter: START - param={:?}, value={}", param, value);
+    async fn write_parameter(
+        &mut self,
+        param: &CTCModbusParameter,
+        value: f32,
+    ) -> Result<(), ModbusError> {
+        debug!(
+            "ctc_actor::write_parameter: START - param={:?}, value={}",
+            param, value
+        );
 
         if param.is_read_only() {
-            error!("ctc_actor::write_parameter: Parameter {} is read-only", param.id);
-            return Err(ModbusError::ReadOnly {
-                register: param.id,
-            });
+            error!(
+                "ctc_actor::write_parameter: Parameter {} is read-only",
+                param.id
+            );
+            return Err(ModbusError::ReadOnly { register: param.id });
         }
 
         let raw_value = param.get_raw_value(value);
-        debug!("ctc_actor::write_parameter: Converted to raw_value={}", raw_value);
+        debug!(
+            "ctc_actor::write_parameter: Converted to raw_value={}",
+            raw_value
+        );
 
         debug!("ctc_actor::write_parameter: Reading min/max/step for validation");
         let (max, min, step) = self.read_min_max_step(param).await?;
 
-        debug!("ctc_actor::write_parameter: Validation bounds - min={}, max={}, step={}", min, max, step);
+        debug!(
+            "ctc_actor::write_parameter: Validation bounds - min={}, max={}, step={}",
+            min, max, step
+        );
 
         // Check if value is within range
         if raw_value < min || raw_value > max {
-            error!("ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not in range [{}, {}]", raw_value, min, max);
+            error!(
+                "ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not in range [{}, {}]",
+                raw_value, min, max
+            );
             return Err(ModbusError::OutOfRange {
                 value,
                 min: param.get_scaled_value(min),
@@ -201,7 +230,10 @@ impl CtcActor {
 
         // Check if value is valid step from minimum
         if !(raw_value - min).is_multiple_of(step) {
-            error!("ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not valid step from min", raw_value);
+            error!(
+                "ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not valid step from min",
+                raw_value
+            );
             return Err(ModbusError::InvalidStep {
                 value,
                 min: param.get_scaled_value(min),
@@ -212,8 +244,13 @@ impl CtcActor {
 
         debug!("ctc_actor::write_parameter: Validation PASSED");
 
-        debug!("ctc_actor::write_parameter: Calling Modbus write_single_register for register {}", param.id);
-        let _ = self.context.write_single_register(param.id, raw_value)
+        debug!(
+            "ctc_actor::write_parameter: Calling Modbus write_single_register for register {}",
+            param.id
+        );
+        let _ = self
+            .context
+            .write_single_register(param.id, raw_value)
             .await
             .map_err(|e| {
                 error!("ctc_actor::write_parameter: Modbus write FAILED: {}", e);
@@ -314,6 +351,8 @@ impl CtcActor {
                 }
             }
         }
-        error!("ctc_actor::run: Actor loop has EXITED - this should not happen in normal operation!");
+        error!(
+            "ctc_actor::run: Actor loop has EXITED - this should not happen in normal operation!"
+        );
     }
 }

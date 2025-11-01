@@ -35,27 +35,32 @@ Use this skill when the user asks for:
 
 ## Process
 
-1. **ALWAYS check staged changes first** (this is what will be committed):
+1. **NEVER run `git add` or `git commit`** - this skill only generates the command
+
+2. **ALWAYS check staged changes first** (this is what will be committed):
    ```bash
    git diff --cached --stat
    git diff --cached --name-only
    ```
 
-2. **If no staged changes**, check unstaged changes:
+3. **If no staged changes**, check unstaged changes:
    ```bash
    git status
    git diff --stat
    ```
 
-3. **Analyze changes** to identify the primary purpose
+4. **Analyze changes** to identify the primary purpose
 
-4. **Generate message** following format:
+5. **Generate message** following format:
    - Count characters (max 50)
    - Use imperative verb
    - Be specific about what changed
    - Omit implementation details
 
-5. **Output ONLY** the commit message, nothing else
+6. **Output the full git commit command** in this format:
+   ```bash
+   git commit -m "Your message here"
+   ```
 
 ## Important: Staged vs Unstaged
 
@@ -67,13 +72,13 @@ Use this skill when the user asks for:
 ## Examples
 
 **Good (under 50 chars):**
-```
-Add custom error types with unit tests
-Fix step validation bug in actor
-Update Docker config for ARM64 build
-Remove unused helper functions
-Refactor temperature routes to use helpers
-Implement timeout handling for Modbus ops
+```bash
+git commit -m "Add custom error types with unit tests"
+git commit -m "Fix step validation bug in actor"
+git commit -m "Update Docker config for ARM64 build"
+git commit -m "Remove unused helper functions"
+git commit -m "Refactor temperature routes to use helpers"
+git commit -m "Implement timeout handling for Modbus ops"
 ```
 
 **Bad (too long or poor format):**

@@ -155,7 +155,10 @@ impl SerialConfig {
             "none" => Parity::None,
             "even" => Parity::Even,
             "odd" => Parity::Odd,
-            _ => panic!("Invalid parity value: {}. Must be 'none', 'even', or 'odd'", self.parity),
+            _ => panic!(
+                "Invalid parity value: {}. Must be 'none', 'even', or 'odd'",
+                self.parity
+            ),
         }
     }
 
@@ -169,7 +172,10 @@ impl SerialConfig {
             6 => DataBits::Six,
             7 => DataBits::Seven,
             8 => DataBits::Eight,
-            _ => panic!("Invalid data_bits value: {}. Must be 5, 6, 7, or 8", self.data_bits),
+            _ => panic!(
+                "Invalid data_bits value: {}. Must be 5, 6, 7, or 8",
+                self.data_bits
+            ),
         }
     }
 
@@ -181,7 +187,10 @@ impl SerialConfig {
         match self.stop_bits {
             1 => StopBits::One,
             2 => StopBits::Two,
-            _ => panic!("Invalid stop_bits value: {}. Must be 1 or 2", self.stop_bits),
+            _ => panic!(
+                "Invalid stop_bits value: {}. Must be 1 or 2",
+                self.stop_bits
+            ),
         }
     }
 
@@ -194,7 +203,10 @@ impl SerialConfig {
             "none" => FlowControl::None,
             "software" => FlowControl::Software,
             "hardware" => FlowControl::Hardware,
-            _ => panic!("Invalid flow_control value: {}. Must be 'none', 'software', or 'hardware'", self.flow_control),
+            _ => panic!(
+                "Invalid flow_control value: {}. Must be 'none', 'software', or 'hardware'",
+                self.flow_control
+            ),
         }
     }
 }
@@ -223,7 +235,10 @@ mod tests {
         assert!(matches!(config.serial.get_parity(), Parity::Even));
         assert!(matches!(config.serial.get_data_bits(), DataBits::Eight));
         assert!(matches!(config.serial.get_stop_bits(), StopBits::One));
-        assert!(matches!(config.serial.get_flow_control(), FlowControl::Hardware));
+        assert!(matches!(
+            config.serial.get_flow_control(),
+            FlowControl::Hardware
+        ));
     }
 
     #[test]
@@ -231,25 +246,44 @@ mod tests {
         // Test that the config system works when only some values are specified
         // This simulates a user having a config.toml with only port = 8080
         let builder = ConfigBuilder::builder()
-            .set_default("server.host", "0.0.0.0").unwrap()
-            .set_default("server.port", 3000).unwrap()
-            .set_override("server.port", 8080).unwrap()
-            .set_default("serial.default_port", "/dev/ttyAMA4").unwrap()
-            .set_default("serial.baud_rate", 9600).unwrap()
-            .set_default("serial.data_bits", 8).unwrap()
-            .set_default("serial.parity", "even").unwrap()
-            .set_default("serial.stop_bits", 1).unwrap()
-            .set_default("serial.flow_control", "hardware").unwrap()
-            .set_default("serial.timeout_secs", 1).unwrap()
-            .set_default("modbus.slave_id", 1).unwrap()
-            .set_default("modbus.channel_buffer_size", 24).unwrap()
-            .set_default("modbus.request_timeout_secs", 5).unwrap()
-            .set_default("power_save.low_temp", 15.0).unwrap()
-            .set_default("power_save.high_temp", 21.5).unwrap()
-            .set_default("power_save.low_days", 2.0).unwrap()
-            .set_default("power_save.high_days", 0.0).unwrap()
-            .set_default("temperature_validation.min", 5.0).unwrap()
-            .set_default("temperature_validation.max", 30.0).unwrap();
+            .set_default("server.host", "0.0.0.0")
+            .unwrap()
+            .set_default("server.port", 3000)
+            .unwrap()
+            .set_override("server.port", 8080)
+            .unwrap()
+            .set_default("serial.default_port", "/dev/ttyAMA4")
+            .unwrap()
+            .set_default("serial.baud_rate", 9600)
+            .unwrap()
+            .set_default("serial.data_bits", 8)
+            .unwrap()
+            .set_default("serial.parity", "even")
+            .unwrap()
+            .set_default("serial.stop_bits", 1)
+            .unwrap()
+            .set_default("serial.flow_control", "hardware")
+            .unwrap()
+            .set_default("serial.timeout_secs", 1)
+            .unwrap()
+            .set_default("modbus.slave_id", 1)
+            .unwrap()
+            .set_default("modbus.channel_buffer_size", 24)
+            .unwrap()
+            .set_default("modbus.request_timeout_secs", 5)
+            .unwrap()
+            .set_default("power_save.low_temp", 15.0)
+            .unwrap()
+            .set_default("power_save.high_temp", 21.5)
+            .unwrap()
+            .set_default("power_save.low_days", 2.0)
+            .unwrap()
+            .set_default("power_save.high_days", 0.0)
+            .unwrap()
+            .set_default("temperature_validation.min", 5.0)
+            .unwrap()
+            .set_default("temperature_validation.max", 30.0)
+            .unwrap();
 
         let config: Config = builder.build().unwrap().try_deserialize().unwrap();
 

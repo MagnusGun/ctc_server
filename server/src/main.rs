@@ -1,15 +1,15 @@
-mod routes;
-mod modbus;
-mod helpers;
 mod config;
 mod error;
+mod helpers;
+mod modbus;
+mod routes;
 
-use std::{env, time::Duration};
-use axum::Router;
-use tracing::{debug, info};
 use crate::config::Config;
 use crate::error::ModbusError;
-use crate::routes::{ctc_actor::{CtcActorBuilder, ParameterOperation}};
+use crate::routes::ctc_actor::{CtcActorBuilder, ParameterOperation};
+use axum::Router;
+use std::{env, time::Duration};
+use tracing::{debug, info};
 // const SCALE_BASE: u16 = 10;
 
 #[tokio::main(flavor = "current_thread")]
@@ -19,15 +19,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
     let config = Config::load(None)?;
     info!("Configuration loaded successfully");
-    debug!("Server config: {}:{}", config.server.host, config.server.port);
+    debug!(
+        "Server config: {}:{}",
+        config.server.host, config.server.port
+    );
 
     // Get serial port from CLI args or use config default
     let mut args = env::args();
-    let tty_path = args.nth(1).unwrap_or_else(|| config.serial.default_port.clone());
+    let tty_path = args
+        .nth(1)
+        .unwrap_or_else(|| config.serial.default_port.clone());
     info!("Using serial port: {}", tty_path);
 
-    debug!("Available serial ports: {:?}", tokio_serial::available_ports()?);
-
+    debug!(
+        "Available serial ports: {:?}",
+        tokio_serial::available_ports()?
+    );
 
     // let port = tokio_serial::new(tty_path, 9600)
     //     .baud_rate(9600)
@@ -42,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let ctx = rtu::attach_slave(port, Slave(1));
     // let shared_ctx = Arc::new(Mutex::new(ctx));
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<(ParameterOperation, tokio::sync::oneshot::Sender<Result<f32, ModbusError>>)>(config.modbus.channel_buffer_size);
+    let (tx, rx) = tokio::sync::mpsc::channel::<(
+        ParameterOperation,
+        tokio::sync::oneshot::Sender<Result<f32, ModbusError>>,
+    )>(config.modbus.channel_buffer_size);
 
     let mut ctc_actor = CtcActorBuilder::new(tty_path)
         .baud_rate(config.serial.baud_rate)
@@ -56,11 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(async move {
         ctc_actor.run().await;
-    }); 
+    });
 
     let app = Router::new()
         // .route("/ctc", get(ctx_handler))
-        .merge(routes::temperatures::routes(tx.clone(), config.temperature_validation.clone()))
+        .merge(routes::temperatures::routes(
+            tx.clone(),
+            config.temperature_validation.clone(),
+        ))
         .merge(routes::ctc::routes(tx.clone(), config.power_save.clone()));
 
     // Set up the server to listen
@@ -68,7 +81,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting server on {}", bind_addr);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, app).await?;
-
 
     Ok(())
 }

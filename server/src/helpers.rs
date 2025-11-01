@@ -23,7 +23,7 @@ pub async fn read_parameter_value(
     // Send the operation and response channel to the actor
     tx.send((ParameterOperation::Read(param), response_tx))
         .await
-        .unwrap();
+        .map_err(|_| ApiError::ServiceUnavailable)?;
 
     // Wait for response on this request's channel
     match response_rx.await {
@@ -66,7 +66,7 @@ pub async fn read_parameter(
     // Send the operation and response channel to the actor
     tx.send((ParameterOperation::Read(param), response_tx))
         .await
-        .unwrap();
+        .map_err(|_| ApiError::ServiceUnavailable)?;
 
     // Wait for response on this request's channel
     match response_rx.await {
@@ -105,7 +105,10 @@ pub async fn write_parameter(
     json_key: &str,
     log_context: &str,
 ) -> Result<String, ApiError> {
-    debug!("{log_context}: write_parameter START - param={:?}, value={}", param, value);
+    debug!(
+        "{log_context}: write_parameter START - param={:?}, value={}",
+        param, value
+    );
 
     // Create a oneshot channel for this request
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -115,7 +118,7 @@ pub async fn write_parameter(
     // Send the operation and response channel to the actor
     tx.send((ParameterOperation::Write(param, value), response_tx))
         .await
-        .unwrap();
+        .map_err(|_| ApiError::ServiceUnavailable)?;
 
     debug!("{log_context}: write_parameter - Message sent, awaiting response");
 
