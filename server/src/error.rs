@@ -71,6 +71,9 @@ pub enum ModbusError {
         retries: u32,
         last_error: String,
     },
+
+    /// Invalid value for alarm/info text buffer (register 65100)
+    InvalidAlarmInfoValue(f32),
 }
 
 impl fmt::Display for ModbusError {
@@ -155,6 +158,12 @@ impl fmt::Display for ModbusError {
                     "Maximum retries ({retries}) exceeded for register {register}: {last_error}"
                 )
             }
+            Self::InvalidAlarmInfoValue(value) => {
+                write!(
+                    f,
+                    "Invalid alarm/info value: {value}. Must be 0-9999 (alarm) or 10000-19999 (info)"
+                )
+            }
         }
     }
 }
@@ -203,7 +212,8 @@ impl From<ModbusError> for ApiError {
             // Client errors (invalid input)
             ModbusError::ReadOnly { .. }
             | ModbusError::OutOfRange { .. }
-            | ModbusError::InvalidStep { .. } => Self::BadRequest,
+            | ModbusError::InvalidStep { .. }
+            | ModbusError::InvalidAlarmInfoValue(_) => Self::BadRequest,
 
             // Timeout errors
             ModbusError::Timeout { .. } => Self::Timeout,
@@ -580,5 +590,21 @@ mod tests {
         };
         // This compiles only if Error trait is implemented
         let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn test_modbus_error_display_invalid_alarm_info_value() {
+        let err = ModbusError::InvalidAlarmInfoValue(25000.0);
+        assert_eq!(
+            err.to_string(),
+            "Invalid alarm/info value: 25000. Must be 0-9999 (alarm) or 10000-19999 (info)"
+        );
+    }
+
+    #[test]
+    fn test_modbus_invalid_alarm_info_to_api_error_is_bad_request() {
+        let modbus_err = ModbusError::InvalidAlarmInfoValue(99999.0);
+        let api_err: ApiError = modbus_err.into();
+        assert_eq!(get_status_code(api_err), StatusCode::BAD_REQUEST);
     }
 }

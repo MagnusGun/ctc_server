@@ -1,14 +1,16 @@
 mod config;
 mod error;
+mod gpio;
 mod modbus;
 mod routes;
 
 use crate::config::Config;
 use crate::error::ModbusError;
+use crate::gpio::GpioController;
 use crate::modbus::{CtcActorBuilder, ParameterOperation, SmartGridKeepalive, SmartGridMode};
 use axum::Router;
 use std::{env, time::Duration};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 // const SCALE_BASE: u16 = 10;
 
 #[tokio::main(flavor = "current_thread")]
@@ -84,6 +86,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!("SmartGrid keepalive task spawned");
 
+    // Create GPIO controller if enabled
+    let gpio_controller = if config.gpio.enabled {
+        info!(
+            "GPIO control enabled: K24=GPIO{}, K25=GPIO{}, active_low={}",
+            config.gpio.gpio_k24, config.gpio.gpio_k25, config.gpio.active_low
+        );
+        let controller = GpioController::new(
+            config.gpio.gpio_k24,
+            config.gpio.gpio_k25,
+            config.gpio.active_low,
+        );
+        // Initialize to Normal mode on startup
+        if let Err(e) = controller.set_mode(SmartGridMode::Normal) {
+            error!("Failed to initialize GPIO to Normal mode: {}", e);
+        } else {
+            info!("GPIO initialized to Normal mode");
+        }
+        Some(controller)
+    } else {
+        debug!("GPIO control disabled, using Modbus register 1100 for SmartGrid");
+        None
+    };
+
     let app = Router::new()
         // .route("/ctc", get(ctx_handler))
         .merge(routes::temperatures::routes(
@@ -93,8 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .merge(routes::ctc::routes(
             tx.clone(),
-            config.power_save.clone(),
+            smartgrid_keepalive.clone(),
             config.modbus.request_timeout_secs,
+            gpio_controller,
         ))
         .merge(routes::smartgrid::routes(
             tx.clone(),

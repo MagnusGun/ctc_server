@@ -1,31 +1,40 @@
 use std::time::Duration;
 
-use crate::config::PowerSaveConfig;
 use crate::error::ApiError;
-use crate::modbus::bms_parameters::{
-    CTC_VACCATION_DAYS, HEATSYSTEM_ROOM_SETTEMP, get_ctc_parameter_by_id,
-    get_custom_ctc_parameter_by_addr,
+use crate::gpio::GpioController;
+use crate::modbus::bms_parameters::{get_ctc_parameter_by_id, get_custom_ctc_parameter_by_addr};
+use crate::modbus::{
+    ModbusSender, ParameterOperation, SmartGridKeepalive, SmartGridMode, read_parameter,
+    write_parameter,
 };
-use crate::modbus::{ModbusSender, read_parameter, read_parameter_value, write_parameter};
 use axum::{
     Router,
     extract::{Query, State},
     routing::{get, post},
 };
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, error};
+
+/// State type for CTC routes
+type CtcState = (
+    ModbusSender,
+    SmartGridKeepalive,
+    u64,
+    Option<GpioController>,
+);
 
 pub fn routes(
     sender: ModbusSender,
-    power_save_config: PowerSaveConfig,
+    keepalive: SmartGridKeepalive,
     request_timeout_secs: u64,
+    gpio_controller: Option<GpioController>,
 ) -> Router {
     Router::new()
         .route("/api/v1/ctc", get(get_ctc_data))
         .route("/api/v1/ctc", post(post_ctc_data))
         .route("/api/v1/ctc/powersave", post(set_power_save))
         .route("/api/v1/ctc/powersave", get(get_power_save))
-        .with_state((sender, power_save_config, request_timeout_secs))
+        .with_state((sender, keepalive, request_timeout_secs, gpio_controller))
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -44,7 +53,7 @@ struct CtcParams {
 // returns a JSON object with the parameter value
 // e.g. {"ctc_data": 23.5}
 async fn get_ctc_data(
-    State((tx, _, timeout_secs)): State<(ModbusSender, PowerSaveConfig, u64)>,
+    State((tx, _, timeout_secs, _)): State<CtcState>,
     Query(params): Query<CtcParams>,
 ) -> Result<String, ApiError> {
     debug!(
@@ -69,7 +78,7 @@ async fn get_ctc_data(
 }
 
 async fn post_ctc_data(
-    State((tx, _, timeout_secs)): State<(ModbusSender, PowerSaveConfig, u64)>,
+    State((tx, _, timeout_secs, _)): State<CtcState>,
     Query(params): Query<CtcParams>,
 ) -> Result<String, ApiError> {
     debug!(
@@ -98,102 +107,97 @@ struct PowerSave {
 }
 
 async fn set_power_save(
-    State((tx, config, timeout_secs)): State<(ModbusSender, PowerSaveConfig, u64)>,
+    State((tx, keepalive, timeout_secs, gpio)): State<CtcState>,
     Query(params): Query<PowerSave>,
 ) -> Result<String, ApiError> {
     debug!("set_power_save: START - {params:?}");
 
-    let (room_temp, vacation_days) = if params.active {
-        (config.low_temp, config.low_days)
+    // Use SmartGrid Blocking mode for powersave, Normal when inactive
+    let mode = if params.active {
+        SmartGridMode::Blocking
     } else {
-        (config.high_temp, config.high_days)
+        SmartGridMode::Normal
     };
 
-    let timeout = Duration::from_secs(timeout_secs);
+    debug!("set_power_save: Setting SmartGrid mode to {mode}");
 
-    debug!(
-        "set_power_save: Target values - room_temp={}, vacation_days={}",
-        room_temp, vacation_days
-    );
+    // Use GPIO if available, otherwise fall back to Modbus
+    if let Some(controller) = &gpio {
+        debug!("set_power_save: Using GPIO control");
+        controller.set_mode(mode).map_err(|e| {
+            error!("set_power_save: GPIO error - {e}");
+            ApiError::InternalError
+        })?;
 
-    // Update room temperature setpoint
-    debug!("set_power_save: Calling write_parameter for HEATSYSTEM_ROOM_SETTEMP");
-    match write_parameter(
-        &tx,
-        HEATSYSTEM_ROOM_SETTEMP,
-        room_temp,
-        "room_temperature_setpoint",
-        "set_power_save",
-        timeout,
-    )
-    .await
-    {
-        Ok(result) => {
-            debug!(
-                "set_power_save: HEATSYSTEM_ROOM_SETTEMP write succeeded: {}",
-                result
-            );
-        }
-        Err(e) => {
-            debug!(
-                "set_power_save: HEATSYSTEM_ROOM_SETTEMP write FAILED: {:?}",
-                e
-            );
-            return Err(e);
+        // Also update keepalive state for consistency
+        keepalive.set_mode(mode);
+
+        debug!("set_power_save: SUCCESS via GPIO");
+        Ok(format!(
+            "{{\"powersave\": {}, \"method\": \"gpio\"}}\n",
+            params.active
+        ))
+    } else {
+        debug!("set_power_save: Using Modbus control");
+
+        // Update keepalive state
+        keepalive.set_mode(mode);
+        debug!("set_power_save: Keepalive state updated");
+
+        // Send immediate write to actor
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        tx.send((ParameterOperation::WriteSmartGrid(mode), response_tx))
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)?;
+
+        debug!("set_power_save: Write request sent to actor");
+
+        // Wait for response with timeout
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), response_rx).await {
+            Ok(Ok(Ok(_))) => {
+                debug!("set_power_save: SUCCESS via Modbus");
+                Ok(format!(
+                    "{{\"powersave\": {}, \"method\": \"modbus\"}}\n",
+                    params.active
+                ))
+            }
+            Ok(Ok(Err(e))) => {
+                error!("set_power_save: Modbus error - {e}");
+                Err(ApiError::from(e))
+            }
+            Ok(Err(e)) => {
+                error!("set_power_save: Failed to receive response - {e}");
+                Err(ApiError::ServiceUnavailable)
+            }
+            Err(_) => {
+                error!("set_power_save: Timeout after {timeout_secs}s");
+                Err(ApiError::Timeout)
+            }
         }
     }
-
-    // Update vacation days
-    debug!("set_power_save: Calling write_parameter for CTC_VACCATION_DAYS");
-    match write_parameter(
-        &tx,
-        CTC_VACCATION_DAYS,
-        vacation_days,
-        "vacation_days",
-        "set_power_save",
-        timeout,
-    )
-    .await
-    {
-        Ok(result) => {
-            debug!(
-                "set_power_save: CTC_VACCATION_DAYS write succeeded: {}",
-                result
-            );
-        }
-        Err(e) => {
-            debug!("set_power_save: CTC_VACCATION_DAYS write FAILED: {:?}", e);
-            return Err(e);
-        }
-    }
-
-    debug!("set_power_save: SUCCESS - Both writes completed");
-    Ok(format!("{{\"powersave\": {}}}\n", params.active))
 }
 
 async fn get_power_save(
-    State((tx, _, timeout_secs)): State<(ModbusSender, PowerSaveConfig, u64)>,
+    State((_, keepalive, _, gpio)): State<CtcState>,
 ) -> Result<String, ApiError> {
-    debug!("get_power_save");
+    debug!("get_power_save: START");
 
-    let timeout = Duration::from_secs(timeout_secs);
+    // Use GPIO if available, otherwise use keepalive state
+    let mode = if let Some(controller) = &gpio {
+        controller.read_mode().unwrap_or_else(|e| {
+            error!("get_power_save: GPIO read error - {e}, falling back to keepalive state");
+            keepalive.get_mode()
+        })
+    } else {
+        keepalive.get_mode()
+    };
 
-    let room_setpoint = read_parameter_value(
-        &tx,
-        HEATSYSTEM_ROOM_SETTEMP,
-        "get_power_save:room_setpoint",
-        timeout,
-    )
-    .await?;
-    let vaccation_days = read_parameter_value(
-        &tx,
-        CTC_VACCATION_DAYS,
-        "get_power_save:vacation_days",
-        timeout,
-    )
-    .await?;
+    let active = matches!(mode, SmartGridMode::Blocking);
+
+    debug!("get_power_save: Current mode={mode}, powersave active={active}");
 
     Ok(format!(
-        "{{\"room_temp_setpoint\": {room_setpoint}, \"vaccation_days\": {vaccation_days}}}\n"
+        "{{\"powersave\": {active}, \"mode\": \"{mode}\"}}\n"
     ))
 }

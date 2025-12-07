@@ -5,7 +5,7 @@
 //! access to the serial port and processes operations sequentially.
 
 use crate::error::ModbusError;
-use crate::modbus::{CTCModbusParameter, SmartGridMode};
+use crate::modbus::{Access, CTCModbusParameter, SmartGridMode};
 use std::io;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -478,49 +478,73 @@ impl CtcActor {
             return Err(ModbusError::ReadOnly { register: param.id });
         }
 
+        // Special validation for alarm/info text buffer (register 65100)
+        // Must be 0-9999 (alarm) or 10000-19999 (info)
+        if param.id == 65100 {
+            // Check for negative values or values outside valid range
+            if !(0.0..=19999.0).contains(&value) {
+                error!(
+                    "ctc_actor::write_parameter: Invalid alarm/info value: {}",
+                    value
+                );
+                return Err(ModbusError::InvalidAlarmInfoValue(value));
+            }
+            debug!(
+                "ctc_actor::write_parameter: Alarm/info value {} validated",
+                value
+            );
+        }
+
         let raw_value = param.get_raw_value(value);
         debug!(
             "ctc_actor::write_parameter: Converted to raw_value={}",
             raw_value
         );
 
-        debug!("ctc_actor::write_parameter: Reading min/max/step for validation");
-        let (max, min, step) = self.read_min_max_step(param).await?;
-
-        debug!(
-            "ctc_actor::write_parameter: Validation bounds - min={}, max={}, step={}",
-            min, max, step
-        );
-
-        // Check if value is within range
-        if raw_value < min || raw_value > max {
-            error!(
-                "ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not in range [{}, {}]",
-                raw_value, min, max
+        // Skip min/max/step validation for write-only registers (they don't have these)
+        if param.access == Access::W {
+            debug!(
+                "ctc_actor::write_parameter: Write-only register, skipping min/max/step validation"
             );
-            return Err(ModbusError::OutOfRange {
-                value,
-                min: param.get_scaled_value(min),
-                max: param.get_scaled_value(max),
-                register: param.id,
-            });
-        }
+        } else {
+            debug!("ctc_actor::write_parameter: Reading min/max/step for validation");
+            let (max, min, step) = self.read_min_max_step(param).await?;
 
-        // Check if value is valid step from minimum
-        if !(raw_value - min).is_multiple_of(step) {
-            error!(
-                "ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not valid step from min",
-                raw_value
+            debug!(
+                "ctc_actor::write_parameter: Validation bounds - min={}, max={}, step={}",
+                min, max, step
             );
-            return Err(ModbusError::InvalidStep {
-                value,
-                min: param.get_scaled_value(min),
-                step: param.get_scaled_value(step),
-                register: param.id,
-            });
-        }
 
-        debug!("ctc_actor::write_parameter: Validation PASSED");
+            // Check if value is within range
+            if raw_value < min || raw_value > max {
+                error!(
+                    "ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not in range [{}, {}]",
+                    raw_value, min, max
+                );
+                return Err(ModbusError::OutOfRange {
+                    value,
+                    min: param.get_scaled_value(min),
+                    max: param.get_scaled_value(max),
+                    register: param.id,
+                });
+            }
+
+            // Check if value is valid step from minimum
+            if !(raw_value - min).is_multiple_of(step) {
+                error!(
+                    "ctc_actor::write_parameter: VALIDATION FAILED - raw_value={} not valid step from min",
+                    raw_value
+                );
+                return Err(ModbusError::InvalidStep {
+                    value,
+                    min: param.get_scaled_value(min),
+                    step: param.get_scaled_value(step),
+                    register: param.id,
+                });
+            }
+
+            debug!("ctc_actor::write_parameter: Validation PASSED");
+        }
 
         debug!(
             "ctc_actor::write_parameter: Calling Modbus write_single_register for register {}",
@@ -797,7 +821,7 @@ impl CtcActor {
         }
     }
 
-    /// Handle a write operation with verification
+    /// Handle a write operation with verification (unless write-only)
     async fn handle_write_operation(
         &mut self,
         param: &CTCModbusParameter,
@@ -810,6 +834,16 @@ impl CtcActor {
         );
         match self.write_parameter(param, value).await {
             Ok(()) => {
+                // Skip read-back verification for write-only registers
+                if param.access == Access::W {
+                    debug!("ctc_actor::run: Write-only register, skipping verification");
+                    respond_to.send(Ok(value)).unwrap_or_else(|e| {
+                        error!("ctc_actor::run: CRITICAL - Failed to send success response: {e:?}");
+                    });
+                    debug!("ctc_actor::run: Write operation COMPLETE (no verification)");
+                    return;
+                }
+
                 debug!("ctc_actor::run: Write SUCCESS, reading back to verify");
                 match self.read_parameter(param).await {
                     Ok(return_value) => {

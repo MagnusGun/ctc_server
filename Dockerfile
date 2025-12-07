@@ -6,8 +6,10 @@ FROM lukemathwalker/cargo-chef:latest-rust-latest AS planner
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY server/Cargo.toml ./server/
+COPY smartgrid_test/Cargo.toml ./smartgrid_test/
 # Create minimal source structure for cargo-chef to analyze workspace
 RUN mkdir -p server/src && echo "fn main() {}" > server/src/main.rs
+RUN mkdir -p smartgrid_test/src && echo "fn main() {}" > smartgrid_test/src/main.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2: Cacher - Build and cache dependencies
@@ -41,6 +43,9 @@ COPY --from=cacher /usr/local/cargo /usr/local/cargo
 # Copy source code
 COPY Cargo.toml Cargo.lock ./
 COPY server ./server
+# Create minimal smartgrid_test structure for workspace resolution (not built)
+COPY smartgrid_test/Cargo.toml ./smartgrid_test/
+RUN mkdir -p smartgrid_test/src && echo "fn main() {}" > smartgrid_test/src/main.rs
 
 # Build the release binary
 RUN cargo build --release -p server

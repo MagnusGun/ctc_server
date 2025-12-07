@@ -435,6 +435,22 @@ ctc_parameter!(
     15
 );
 
+/// Transfer alarm/info reference into text buffer (write-only)
+/// Values 0-9999: Alarm number (0 = Alarm number 0)
+/// Values 10000-19999: Info number (10000 = Info number 0)
+pub const CTC_ALARM_INFO_BUFFER: CTCModbusParameter = CTCModbusParameter {
+    id: 65100,
+    signed: false,
+    access: Access::W,
+    reg_max: None,
+    reg_min: None,
+    reg_step: None,
+    visible: 0, // Always visible (no visibility register)
+    bit: 0,
+    factor: 1.0,
+    description: "Transfer alarm/info reference to text buffer",
+};
+
 /// Returns all CTC Modbus parameters as a slice
 fn all_ctc_parameters() -> &'static [&'static CTCModbusParameter] {
     static PARAMETERS: OnceLock<Vec<&'static CTCModbusParameter>> = OnceLock::new();
@@ -488,6 +504,8 @@ fn all_ctc_parameters() -> &'static [&'static CTCModbusParameter] {
                 &HEATPUMP_COMPRESSOR_MODEL,
                 // Diagnostic parameters
                 &CTC_DAYS_FILTER_MAINTENANCE,
+                // Text buffer parameters
+                &CTC_ALARM_INFO_BUFFER,
             ]
         })
         .as_slice()

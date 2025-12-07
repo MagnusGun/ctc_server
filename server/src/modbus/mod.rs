@@ -11,6 +11,8 @@ pub use actor::{CtcActorBuilder, ModbusSender, ParameterOperation};
 pub use keepalive::SmartGridKeepalive;
 
 // Re-export operations for convenience
+// read_parameter_value is part of the public API but currently unused internally
+#[allow(unused_imports)]
 pub use operations::{read_parameter, read_parameter_value, write_parameter};
 
 // region: --- Modbus Parameter Struct
@@ -19,6 +21,7 @@ pub use operations::{read_parameter, read_parameter_value, write_parameter};
 pub enum Access {
     R,
     RW,
+    W,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -269,6 +272,34 @@ impl SmartGridMode {
             0b1000_0000 => Ok(Self::LowPrice),
             0b1100_0000 => Ok(Self::Overcapacity),
             _ => Err("Invalid SmartGrid mode bits"),
+        }
+    }
+
+    /// Create mode from K25/K26 terminal closed states
+    ///
+    /// # Arguments
+    /// * `k25_closed` - True if K25 (Smart A) terminal is closed
+    /// * `k26_closed` - True if K26 (Smart B) terminal is closed
+    #[must_use]
+    pub fn from_terminals(k25_closed: bool, k26_closed: bool) -> Self {
+        match (k25_closed, k26_closed) {
+            (false, false) => Self::Normal,
+            (true, false) => Self::Blocking,
+            (false, true) => Self::LowPrice,
+            (true, true) => Self::Overcapacity,
+        }
+    }
+
+    /// Get required K25/K26 terminal states for this mode
+    ///
+    /// Returns (`k25_closed`, `k26_closed`)
+    #[must_use]
+    pub fn terminal_states(self) -> (bool, bool) {
+        match self {
+            Self::Normal => (false, false),
+            Self::Blocking => (true, false),
+            Self::LowPrice => (false, true),
+            Self::Overcapacity => (true, true),
         }
     }
 }

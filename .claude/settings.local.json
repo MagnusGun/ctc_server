@@ -26,7 +26,9 @@
       "Skill(pdf)",
       "Bash(pip3 install:*)",
       "Bash(python3:*)",
-      "Bash(pdftotext:*)"
+      "Bash(pdftotext:*)",
+      "Bash(cargo zigbuild:*)",
+      "Bash(curl:*)"
     ],
     "deny": [],
     "ask": []

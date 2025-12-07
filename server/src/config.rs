@@ -18,8 +18,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub serial: SerialConfig,
     pub modbus: ModbusConfig,
-    pub power_save: PowerSaveConfig,
     pub temperature_validation: TemperatureValidationConfig,
+    pub gpio: GpioConfig,
 }
 
 /// HTTP server configuration
@@ -72,19 +72,6 @@ pub struct ModbusConfig {
     pub request_timeout_secs: u64,
 }
 
-/// Power save mode configuration
-#[derive(Debug, Clone, Deserialize)]
-pub struct PowerSaveConfig {
-    /// Room temperature setpoint when power save is active (°C)
-    pub low_temp: f32,
-    /// Room temperature setpoint when power save is inactive (°C)
-    pub high_temp: f32,
-    /// Vacation days when power save is active
-    pub low_days: f32,
-    /// Vacation days when power save is inactive
-    pub high_days: f32,
-}
-
 /// Temperature validation configuration for API endpoints
 #[derive(Debug, Clone, Deserialize)]
 pub struct TemperatureValidationConfig {
@@ -92,6 +79,19 @@ pub struct TemperatureValidationConfig {
     pub min: f32,
     /// Maximum allowed room temperature setpoint (°C)
     pub max: f32,
+}
+
+/// GPIO relay configuration for `SmartGrid` control
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpioConfig {
+    /// Enable GPIO-based `SmartGrid` control
+    pub enabled: bool,
+    /// GPIO pin for K24 (Smart A) terminal
+    pub gpio_k24: u32,
+    /// GPIO pin for K25 (Smart B) terminal
+    pub gpio_k25: u32,
+    /// True if relay board uses active-low logic (LOW = relay ON)
+    pub active_low: bool,
 }
 
 impl Config {
@@ -147,14 +147,14 @@ impl Config {
             .set_default("modbus.backoff_multiplier", 2.0)?
             .set_default("modbus.max_consecutive_failures", 5)?
             .set_default("modbus.request_timeout_secs", 10)?
-            // Power save defaults
-            .set_default("power_save.low_temp", 15.0)?
-            .set_default("power_save.high_temp", 21.5)?
-            .set_default("power_save.low_days", 2.0)?
-            .set_default("power_save.high_days", 0.0)?
             // Temperature validation defaults
             .set_default("temperature_validation.min", 5.0)?
-            .set_default("temperature_validation.max", 30.0)?;
+            .set_default("temperature_validation.max", 30.0)?
+            // GPIO defaults
+            .set_default("gpio.enabled", true)?
+            .set_default("gpio.gpio_k24", 20)?
+            .set_default("gpio.gpio_k25", 21)?
+            .set_default("gpio.active_low", false)?;
 
         builder.build()?.try_deserialize()
     }
@@ -239,8 +239,6 @@ mod tests {
         assert_eq!(config.serial.default_port, "/dev/ttyAMA4");
         assert_eq!(config.serial.baud_rate, 9600);
         assert_eq!(config.modbus.slave_id, 1);
-        assert!((config.power_save.low_temp - 15.0).abs() < f32::EPSILON);
-        assert!((config.power_save.high_temp - 21.5).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -297,17 +295,17 @@ mod tests {
             .unwrap()
             .set_default("modbus.max_consecutive_failures", 5)
             .unwrap()
-            .set_default("power_save.low_temp", 15.0)
-            .unwrap()
-            .set_default("power_save.high_temp", 21.5)
-            .unwrap()
-            .set_default("power_save.low_days", 2.0)
-            .unwrap()
-            .set_default("power_save.high_days", 0.0)
-            .unwrap()
             .set_default("temperature_validation.min", 5.0)
             .unwrap()
             .set_default("temperature_validation.max", 30.0)
+            .unwrap()
+            .set_default("gpio.enabled", true)
+            .unwrap()
+            .set_default("gpio.gpio_k24", 20)
+            .unwrap()
+            .set_default("gpio.gpio_k25", 21)
+            .unwrap()
+            .set_default("gpio.active_low", false)
             .unwrap();
 
         let config: Config = builder.build().unwrap().try_deserialize().unwrap();
