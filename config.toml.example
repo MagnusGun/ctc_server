@@ -1,113 +1,63 @@
-# CTC Server Configuration
-#
-# All settings are optional and use sensible defaults if not specified.
-# Uncomment and modify only the settings you want to change.
-#
-# Configuration priority (highest to lowest):
-# 1. CLI arguments
-# 2. Environment variables (CTC_SERVER_PORT, CTC_SERIAL_BAUD_RATE, etc.)
-# 3. This config file (config.toml)
-# 4. Built-in defaults (shown in comments below)
+# CTC Server Configuration Example
+# Copy to config.toml and modify as needed.
+# All values shown are defaults.
 
 [server]
-# HTTP server bind address (default: "0.0.0.0")
-# Set to "127.0.0.1" to only allow local connections
-# host = "0.0.0.0"
-
-# HTTP server port (default: 3000)
-# port = 3000
+# Host address to bind to
+host = "0.0.0.0"
+# Port number to listen on
+port = 3000
 
 [serial]
-# Default serial port path (default: "/dev/ttyAMA4")
-# Can be overridden via CLI argument: cargo run -- /dev/ttyUSB0
-# Common values: /dev/ttyAMA4, /dev/ttyUSB0, /dev/ttyS0
-# default_port = "/dev/ttyAMA4"
-
-# Serial port baud rate (default: 9600)
-# Must match CTC device settings
-# baud_rate = 9600
-
-# Data bits (default: 8)
-# Options: 5, 6, 7, or 8
-# data_bits = 8
-
-# Parity (default: "even")
-# Options: "none", "even", or "odd"
-# parity = "even"
-
-# Stop bits (default: 1)
-# Options: 1 or 2
-# stop_bits = 1
-
-# Flow control (default: "hardware")
-# Options: "none", "software", or "hardware"
-# flow_control = "hardware"
-
-# Serial port operation timeout in seconds (default: 1)
-# timeout_secs = 1
+# Default serial port path (can be overridden via CLI argument)
+default_port = "/dev/ttyAMA4"
+# Baud rate (typically 9600 for CTC systems)
+baud_rate = 9600
+# Data bits (5, 6, 7, or 8)
+data_bits = 8
+# Parity: "none", "even", or "odd"
+parity = "even"
+# Stop bits (1 or 2)
+stop_bits = 1
+# Flow control: "none", "software", or "hardware"
+flow_control = "hardware"
+# Serial operation timeout in seconds
+timeout_secs = 1
 
 [modbus]
-# Modbus RTU slave ID (default: 1)
-# Typically 1 for CTC systems
-# slave_id = 1
-
-# Message queue buffer size (default: 24)
-# Number of pending requests the server can queue
-# channel_buffer_size = 24
-
-# Operation timeout in seconds (default: 5)
-# Timeout for individual Modbus read/write operations
-# Prevents indefinite hangs if heating system stops responding
-# operation_timeout_secs = 5
-
-# Request timeout in seconds (default: 10)
-# Timeout for HTTP handlers waiting for actor response
+# Modbus slave ID (typically 1 for CTC systems)
+slave_id = 1
+# Channel buffer size for actor message queue
+channel_buffer_size = 24
+# Timeout for individual Modbus read/write operations (seconds)
+operation_timeout_secs = 5
+# Maximum retry attempts for failed operations
+max_retries = 2
+# Initial delay before first retry (milliseconds)
+initial_retry_delay_ms = 100
+# Exponential backoff multiplier for retry delays
+backoff_multiplier = 2.0
+# Consecutive failures before logging critical warning
+max_consecutive_failures = 5
+# HTTP request timeout waiting for actor response (seconds)
 # Should be higher than operation_timeout_secs to allow for retries
-# Prevents HTTP requests from hanging indefinitely if actor is unresponsive
-# request_timeout_secs = 10
-
-# Maximum retry attempts (default: 2)
-# Total attempts = initial + max_retries (e.g., 2 retries = 3 total attempts)
-# Set to 0 to disable retries
-# max_retries = 2
-
-# Initial retry delay in milliseconds (default: 100)
-# Delay before first retry attempt
-# Subsequent retries use exponential backoff
-# initial_retry_delay_ms = 100
-
-# Exponential backoff multiplier (default: 2.0)
-# Each retry delay = previous_delay × backoff_multiplier
-# Example with default settings:
-#   - Attempt 1: immediate
-#   - Attempt 2: 100ms delay
-#   - Attempt 3: 200ms delay (100ms × 2.0)
-# backoff_multiplier = 2.0
-
-# Maximum consecutive failures before critical warning (default: 5)
-# Logs a warning when this threshold is reached
-# Helps detect persistent communication issues
-# max_consecutive_failures = 5
-
-[power_save]
-# Room temperature setpoint when power save mode is ACTIVE (default: 15.0°C)
-# low_temp = 15.0
-
-# Room temperature setpoint when power save mode is INACTIVE (default: 21.5°C)
-# high_temp = 21.5
-
-# Vacation days when power save mode is ACTIVE (default: 2.0)
-# low_days = 2.0
-
-# Vacation days when power save mode is INACTIVE (default: 0.0)
-# high_days = 0.0
+request_timeout_secs = 10
 
 [temperature_validation]
-# Minimum allowed room temperature setpoint for API (default: 5.0°C)
-# Prevents accidentally setting extremely low temperatures
-# This is an API-level safety check; the CTC device has its own validation
-# min = 5.0
+# Minimum allowed room temperature setpoint (C)
+min = 5.0
+# Maximum allowed room temperature setpoint (C)
+max = 30.0
 
-# Maximum allowed room temperature setpoint for API (default: 30.0°C)
-# Prevents accidentally setting extremely high temperatures
-# max = 30.0
+[gpio]
+# Enable GPIO-based SmartGrid control via relay board
+# When enabled, uses GPIO pins to control K24/K25 terminals directly
+# When disabled, SmartGrid endpoints return 503 Service Unavailable
+enabled = true
+# GPIO pin number for K24 (Smart A) terminal
+gpio_k24 = 20
+# GPIO pin number for K25 (Smart B) terminal
+gpio_k25 = 21
+# True if relay board uses active-low logic (LOW = relay ON)
+# Set to false for active-high relay modules (HIGH = relay ON)
+active_low = false

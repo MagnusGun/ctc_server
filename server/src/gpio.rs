@@ -1,7 +1,10 @@
 //! GPIO-based `SmartGrid` relay control
 //!
 //! Controls K24/K25 terminals via GPIO pins connected to relay board.
-//! Supports both reading current state and setting new states.
+//! Tracks current mode in memory to avoid reading GPIO state (which would
+//! change pin direction from output to input).
+
+use std::sync::{Arc, Mutex};
 
 use gpiocdev::line::Value;
 use gpiocdev::request::Request;
@@ -15,6 +18,8 @@ pub struct GpioController {
     gpio_k24: u32,
     gpio_k25: u32,
     active_low: bool,
+    /// Current mode stored in memory (avoids reading GPIO which changes pin direction)
+    current_mode: Arc<Mutex<SmartGridMode>>,
 }
 
 impl GpioController {
@@ -34,32 +39,31 @@ impl GpioController {
             gpio_k24,
             gpio_k25,
             active_low,
+            current_mode: Arc::new(Mutex::new(SmartGridMode::Normal)),
         }
     }
 
-    /// Read current `SmartGrid` mode from GPIO state
+    /// Read current `SmartGrid` mode from memory
+    ///
+    /// Returns the last mode set via `set_mode()`. We track mode in memory
+    /// rather than reading GPIO because reading would require changing pin
+    /// direction from output to input, which loses the output state.
     ///
     /// # Errors
-    /// Returns error if GPIO cannot be read
+    /// Returns error if the mutex is poisoned
     pub fn read_mode(&self) -> Result<SmartGridMode, String> {
-        let k24_closed = self.is_terminal_closed(self.gpio_k24)?;
-        let k25_closed = self.is_terminal_closed(self.gpio_k25)?;
-
-        let mode = SmartGridMode::from_terminals(k24_closed, k25_closed);
-        debug!(
-            "GPIO read: K24={}, K25={} -> {}",
-            if k24_closed { "closed" } else { "open" },
-            if k25_closed { "closed" } else { "open" },
-            mode
-        );
-
+        let mode = *self
+            .current_mode
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {e}"))?;
+        debug!("GPIO read_mode: {} (from memory)", mode);
         Ok(mode)
     }
 
     /// Set `SmartGrid` mode by controlling GPIO relays
     ///
     /// # Errors
-    /// Returns error if GPIO cannot be set
+    /// Returns error if GPIO cannot be set or mutex is poisoned
     pub fn set_mode(&self, mode: SmartGridMode) -> Result<(), String> {
         let (k24_closed, k25_closed) = mode.terminal_states();
 
@@ -73,35 +77,13 @@ impl GpioController {
         self.set_terminal(self.gpio_k24, k24_closed)?;
         self.set_terminal(self.gpio_k25, k25_closed)?;
 
+        // Store the mode in memory for read_mode()
+        *self
+            .current_mode
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {e}"))? = mode;
+
         Ok(())
-    }
-
-    /// Check if a terminal is closed by reading GPIO state
-    fn is_terminal_closed(&self, gpio: u32) -> Result<bool, String> {
-        let req = Request::builder()
-            .on_chip("/dev/gpiochip0")
-            .with_line(gpio)
-            .as_input()
-            .request()
-            .map_err(|e| {
-                error!("Failed to request GPIO {} for reading: {}", gpio, e);
-                format!("Failed to request GPIO {gpio}: {e}")
-            })?;
-
-        let value = req.value(gpio).map_err(|e| {
-            error!("Failed to read GPIO {}: {}", gpio, e);
-            format!("Failed to read GPIO {gpio}: {e}")
-        })?;
-
-        let gpio_high = value == Value::Active;
-
-        // Active-low: LOW = relay ON = terminal closed
-        // Active-high: HIGH = relay ON = terminal closed
-        Ok(if self.active_low {
-            !gpio_high
-        } else {
-            gpio_high
-        })
     }
 
     /// Set a terminal state by controlling GPIO
@@ -152,5 +134,23 @@ mod tests {
         assert_eq!(cloned.gpio_k24, controller.gpio_k24);
         assert_eq!(cloned.gpio_k25, controller.gpio_k25);
         assert_eq!(cloned.active_low, controller.active_low);
+    }
+
+    #[test]
+    fn test_gpio_controller_initial_mode_is_normal() {
+        let controller = GpioController::new(20, 21, false);
+        // read_mode() returns from memory, initialized to Normal
+        let mode = controller.read_mode().unwrap();
+        assert!(matches!(mode, SmartGridMode::Normal));
+    }
+
+    #[test]
+    fn test_gpio_controller_clone_shares_mode() {
+        let controller = GpioController::new(20, 21, false);
+        let cloned = controller.clone();
+        // Clones share the same Arc<Mutex<SmartGridMode>>
+        // Initial mode should be Normal for both
+        assert!(matches!(controller.read_mode().unwrap(), SmartGridMode::Normal));
+        assert!(matches!(cloned.read_mode().unwrap(), SmartGridMode::Normal));
     }
 }

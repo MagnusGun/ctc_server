@@ -12,6 +12,12 @@ Use this skill when you need information about:
 
 **IMPORTANT**: This skill contains specifications from official documentation. Do NOT reference the Rust implementation in this project - it may contain mistakes. Always trust the documentation as the source of truth.
 
+## Compatibility Note
+
+Not all CTC models support all features documented here. In particular:
+- **Register 1100 (Virtual Digital Inputs)**: Not supported on some EcoHeat 400 firmware versions
+- For SmartGrid control on unsupported models, use physical GPIO terminals K24/K25 instead
+
 ## Modbus Protocol Specifications
 
 ### Supported Interfaces

@@ -3,10 +3,7 @@ use std::time::Duration;
 use crate::error::ApiError;
 use crate::gpio::GpioController;
 use crate::modbus::bms_parameters::{get_ctc_parameter_by_id, get_custom_ctc_parameter_by_addr};
-use crate::modbus::{
-    ModbusSender, ParameterOperation, SmartGridKeepalive, SmartGridMode, read_parameter,
-    write_parameter,
-};
+use crate::modbus::{ModbusSender, SmartGridMode, read_parameter, write_parameter};
 use axum::{
     Router,
     extract::{Query, State},
@@ -16,16 +13,10 @@ use serde::Deserialize;
 use tracing::{debug, error};
 
 /// State type for CTC routes
-type CtcState = (
-    ModbusSender,
-    SmartGridKeepalive,
-    u64,
-    Option<GpioController>,
-);
+type CtcState = (ModbusSender, u64, Option<GpioController>);
 
 pub fn routes(
     sender: ModbusSender,
-    keepalive: SmartGridKeepalive,
     request_timeout_secs: u64,
     gpio_controller: Option<GpioController>,
 ) -> Router {
@@ -34,7 +25,7 @@ pub fn routes(
         .route("/api/v1/ctc", post(post_ctc_data))
         .route("/api/v1/ctc/powersave", post(set_power_save))
         .route("/api/v1/ctc/powersave", get(get_power_save))
-        .with_state((sender, keepalive, request_timeout_secs, gpio_controller))
+        .with_state((sender, request_timeout_secs, gpio_controller))
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -53,7 +44,7 @@ struct CtcParams {
 // returns a JSON object with the parameter value
 // e.g. {"ctc_data": 23.5}
 async fn get_ctc_data(
-    State((tx, _, timeout_secs, _)): State<CtcState>,
+    State((tx, timeout_secs, _)): State<CtcState>,
     Query(params): Query<CtcParams>,
 ) -> Result<String, ApiError> {
     debug!(
@@ -78,7 +69,7 @@ async fn get_ctc_data(
 }
 
 async fn post_ctc_data(
-    State((tx, _, timeout_secs, _)): State<CtcState>,
+    State((tx, timeout_secs, _)): State<CtcState>,
     Query(params): Query<CtcParams>,
 ) -> Result<String, ApiError> {
     debug!(
@@ -106,11 +97,20 @@ struct PowerSave {
     active: bool,
 }
 
+/// Set power save mode via GPIO
+///
+/// Requires GPIO to be enabled in configuration.
 async fn set_power_save(
-    State((tx, keepalive, timeout_secs, gpio)): State<CtcState>,
+    State((_, _, gpio)): State<CtcState>,
     Query(params): Query<PowerSave>,
 ) -> Result<String, ApiError> {
     debug!("set_power_save: START - {params:?}");
+
+    // Check if GPIO is available
+    let controller = gpio.as_ref().ok_or_else(|| {
+        error!("set_power_save: GPIO not available - powersave control requires GPIO");
+        ApiError::ServiceUnavailable
+    })?;
 
     // Use SmartGrid Blocking mode for powersave, Normal when inactive
     let mode = if params.active {
@@ -119,79 +119,37 @@ async fn set_power_save(
         SmartGridMode::Normal
     };
 
-    debug!("set_power_save: Setting SmartGrid mode to {mode}");
+    debug!("set_power_save: Setting SmartGrid mode to {mode} via GPIO");
 
-    // Use GPIO if available, otherwise fall back to Modbus
-    if let Some(controller) = &gpio {
-        debug!("set_power_save: Using GPIO control");
-        controller.set_mode(mode).map_err(|e| {
-            error!("set_power_save: GPIO error - {e}");
-            ApiError::InternalError
-        })?;
+    controller.set_mode(mode).map_err(|e| {
+        error!("set_power_save: GPIO error - {e}");
+        ApiError::InternalError
+    })?;
 
-        // Also update keepalive state for consistency
-        keepalive.set_mode(mode);
-
-        debug!("set_power_save: SUCCESS via GPIO");
-        Ok(format!(
-            "{{\"powersave\": {}, \"method\": \"gpio\"}}\n",
-            params.active
-        ))
-    } else {
-        debug!("set_power_save: Using Modbus control");
-
-        // Update keepalive state
-        keepalive.set_mode(mode);
-        debug!("set_power_save: Keepalive state updated");
-
-        // Send immediate write to actor
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-        tx.send((ParameterOperation::WriteSmartGrid(mode), response_tx))
-            .await
-            .map_err(|_| ApiError::ServiceUnavailable)?;
-
-        debug!("set_power_save: Write request sent to actor");
-
-        // Wait for response with timeout
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), response_rx).await {
-            Ok(Ok(Ok(_))) => {
-                debug!("set_power_save: SUCCESS via Modbus");
-                Ok(format!(
-                    "{{\"powersave\": {}, \"method\": \"modbus\"}}\n",
-                    params.active
-                ))
-            }
-            Ok(Ok(Err(e))) => {
-                error!("set_power_save: Modbus error - {e}");
-                Err(ApiError::from(e))
-            }
-            Ok(Err(e)) => {
-                error!("set_power_save: Failed to receive response - {e}");
-                Err(ApiError::ServiceUnavailable)
-            }
-            Err(_) => {
-                error!("set_power_save: Timeout after {timeout_secs}s");
-                Err(ApiError::Timeout)
-            }
-        }
-    }
+    debug!("set_power_save: SUCCESS via GPIO");
+    Ok(format!(
+        "{{\"powersave\": {}, \"mode\": \"{mode}\"}}\n",
+        params.active
+    ))
 }
 
-async fn get_power_save(
-    State((_, keepalive, _, gpio)): State<CtcState>,
-) -> Result<String, ApiError> {
+/// Get power save status from GPIO
+///
+/// Requires GPIO to be enabled in configuration.
+async fn get_power_save(State((_, _, gpio)): State<CtcState>) -> Result<String, ApiError> {
     debug!("get_power_save: START");
 
-    // Use GPIO if available, otherwise use keepalive state
-    let mode = if let Some(controller) = &gpio {
-        controller.read_mode().unwrap_or_else(|e| {
-            error!("get_power_save: GPIO read error - {e}, falling back to keepalive state");
-            keepalive.get_mode()
-        })
-    } else {
-        keepalive.get_mode()
-    };
+    // Check if GPIO is available
+    let controller = gpio.as_ref().ok_or_else(|| {
+        error!("get_power_save: GPIO not available - powersave control requires GPIO");
+        ApiError::ServiceUnavailable
+    })?;
+
+    // Read mode from GPIO
+    let mode = controller.read_mode().map_err(|e| {
+        error!("get_power_save: GPIO read error - {e}");
+        ApiError::InternalError
+    })?;
 
     let active = matches!(mode, SmartGridMode::Blocking);
 

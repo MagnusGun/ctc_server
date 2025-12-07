@@ -1,14 +1,10 @@
 #![allow(dead_code)]
 pub mod actor;
 pub mod bms_parameters;
-pub mod keepalive;
 pub mod operations;
 
 // Re-export actor types for easier access
 pub use actor::{CtcActorBuilder, ModbusSender, ParameterOperation};
-
-// Re-export keepalive for convenience
-pub use keepalive::SmartGridKeepalive;
 
 // Re-export operations for convenience
 // read_parameter_value is part of the public API but currently unused internally
@@ -328,14 +324,6 @@ impl std::str::FromStr for SmartGridMode {
         }
     }
 }
-
-/// `SmartGrid` control register address (Control Parameters)
-/// BMS Manual page 5: Control Parameters (1000-1999) for frequent writes with keepalive
-pub const SMARTGRID_CONTROL_REGISTER: u16 = 1100;
-
-/// `SmartGrid` keepalive requirement: must refresh every 5 minutes
-/// We use 4 minutes (240 seconds) to provide a safety margin
-pub const SMARTGRID_KEEPALIVE_INTERVAL_SECS: u64 = 240;
 
 // endregion: --- SmartGrid Control
 

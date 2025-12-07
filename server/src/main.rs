@@ -7,7 +7,7 @@ mod routes;
 use crate::config::Config;
 use crate::error::ModbusError;
 use crate::gpio::GpioController;
-use crate::modbus::{CtcActorBuilder, ParameterOperation, SmartGridKeepalive, SmartGridMode};
+use crate::modbus::{CtcActorBuilder, ParameterOperation, SmartGridMode};
 use axum::Router;
 use std::{env, time::Duration};
 use tracing::{debug, error, info};
@@ -74,19 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ctc_actor.run().await;
     });
 
-    // Create SmartGrid keepalive manager and spawn keepalive task
-    let smartgrid_keepalive = SmartGridKeepalive::new(
-        tx.clone(),
-        SmartGridMode::Normal, // Initial mode
-        None,                  // Use default interval (240 seconds)
-    );
-    let keepalive_handle = smartgrid_keepalive.clone();
-    tokio::spawn(async move {
-        keepalive_handle.run().await;
-    });
-    info!("SmartGrid keepalive task spawned");
-
-    // Create GPIO controller if enabled
+    // Create GPIO controller if enabled (required for SmartGrid control)
     let gpio_controller = if config.gpio.enabled {
         info!(
             "GPIO control enabled: K24=GPIO{}, K25=GPIO{}, active_low={}",
@@ -105,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(controller)
     } else {
-        debug!("GPIO control disabled, using Modbus register 1100 for SmartGrid");
+        debug!("GPIO control disabled - SmartGrid endpoints will return ServiceUnavailable");
         None
     };
 
@@ -118,13 +106,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .merge(routes::ctc::routes(
             tx.clone(),
-            smartgrid_keepalive.clone(),
             config.modbus.request_timeout_secs,
-            gpio_controller,
+            gpio_controller.clone(),
         ))
         .merge(routes::smartgrid::routes(
-            tx.clone(),
-            smartgrid_keepalive,
+            gpio_controller,
+            config.modbus.request_timeout_secs,
+        ))
+        .merge(routes::visibility::routes(
+            tx,
             config.modbus.request_timeout_secs,
         ));
 

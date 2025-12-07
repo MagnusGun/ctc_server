@@ -65,15 +65,17 @@ pub enum ModbusError {
     /// Operation timed out
     Timeout { register: u16, operation: String },
 
-    /// Maximum retry attempts exceeded
-    MaxRetriesExceeded {
-        register: u16,
-        retries: u32,
-        last_error: String,
-    },
-
     /// Invalid value for alarm/info text buffer (register 65100)
     InvalidAlarmInfoValue(f32),
+
+    /// Parameter not visible on this hardware (hardware doesn't support it)
+    ParameterNotVisible { register: u16 },
+
+    /// Visibility cache not yet initialized (internal error, shouldn't reach API)
+    VisibilityNotScanned,
+
+    /// Visibility register address outside known range (62500-62548)
+    InvalidVisibilityRegister(u16),
 }
 
 impl fmt::Display for ModbusError {
@@ -148,20 +150,25 @@ impl fmt::Display for ModbusError {
                     "Operation timed out for register {register}: {operation}"
                 )
             }
-            Self::MaxRetriesExceeded {
-                register,
-                retries,
-                last_error,
-            } => {
-                write!(
-                    f,
-                    "Maximum retries ({retries}) exceeded for register {register}: {last_error}"
-                )
-            }
             Self::InvalidAlarmInfoValue(value) => {
                 write!(
                     f,
                     "Invalid alarm/info value: {value}. Must be 0-9999 (alarm) or 10000-19999 (info)"
+                )
+            }
+            Self::ParameterNotVisible { register } => {
+                write!(
+                    f,
+                    "Parameter at register {register} is not available on this hardware"
+                )
+            }
+            Self::VisibilityNotScanned => {
+                write!(f, "Visibility cache not initialized")
+            }
+            Self::InvalidVisibilityRegister(reg) => {
+                write!(
+                    f,
+                    "Invalid visibility register address: {reg} (expected 62500-62548)"
                 )
             }
         }
@@ -179,6 +186,9 @@ pub enum ApiError {
     /// Invalid request parameters (400 Bad Request)
     BadRequest,
 
+    /// Resource not found (404 Not Found)
+    NotFound,
+
     /// Internal server error (500 Internal Server Error)
     InternalError,
 
@@ -193,6 +203,7 @@ impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadRequest => write!(f, "Bad Request"),
+            Self::NotFound => write!(f, "Not Found"),
             Self::InternalError => write!(f, "Internal Server Error"),
             Self::ServiceUnavailable => write!(f, "Service Unavailable"),
             Self::Timeout => write!(f, "Request Timeout"),
@@ -215,6 +226,9 @@ impl From<ModbusError> for ApiError {
             | ModbusError::InvalidStep { .. }
             | ModbusError::InvalidAlarmInfoValue(_) => Self::BadRequest,
 
+            // Parameter not available on this hardware
+            ModbusError::ParameterNotVisible { .. } => Self::NotFound,
+
             // Timeout errors
             ModbusError::Timeout { .. } => Self::Timeout,
 
@@ -225,7 +239,8 @@ impl From<ModbusError> for ApiError {
             | ModbusError::SerialError { .. }
             | ModbusError::ProtocolError { .. }
             | ModbusError::VerificationError { .. }
-            | ModbusError::MaxRetriesExceeded { .. } => Self::InternalError,
+            | ModbusError::VisibilityNotScanned
+            | ModbusError::InvalidVisibilityRegister(_) => Self::InternalError,
         }
     }
 }
@@ -238,6 +253,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self {
             Self::BadRequest => StatusCode::BAD_REQUEST,
+            Self::NotFound => StatusCode::NOT_FOUND,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Timeout => StatusCode::REQUEST_TIMEOUT,
@@ -484,7 +500,7 @@ mod tests {
         let _: &dyn std::error::Error = &err;
     }
 
-    // Tests for new Timeout and MaxRetriesExceeded variants
+    // Tests for Timeout variant
 
     #[test]
     fn test_modbus_error_display_timeout() {
@@ -499,18 +515,6 @@ mod tests {
     }
 
     #[test]
-    fn test_modbus_error_display_max_retries_exceeded() {
-        let err = ModbusError::MaxRetriesExceeded {
-            register: 61509,
-            retries: 3,
-            last_error: "Connection refused".to_string(),
-        };
-        assert!(err.to_string().contains("Maximum retries (3) exceeded"));
-        assert!(err.to_string().contains("61509"));
-        assert!(err.to_string().contains("Connection refused"));
-    }
-
-    #[test]
     fn test_modbus_timeout_to_api_error() {
         let modbus_err = ModbusError::Timeout {
             register: 61509,
@@ -518,17 +522,6 @@ mod tests {
         };
         let api_err: ApiError = modbus_err.into();
         assert_eq!(get_status_code(api_err), StatusCode::REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn test_modbus_max_retries_to_api_error_is_internal_error() {
-        let modbus_err = ModbusError::MaxRetriesExceeded {
-            register: 61509,
-            retries: 3,
-            last_error: "timeout".to_string(),
-        };
-        let api_err: ApiError = modbus_err.into();
-        assert_eq!(get_status_code(api_err), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -540,17 +533,6 @@ mod tests {
         let err_string = err.to_string();
         assert!(err_string.contains("12345"));
         assert!(err_string.contains("test_op"));
-    }
-
-    #[test]
-    fn test_max_retries_error_contains_retry_count() {
-        let err = ModbusError::MaxRetriesExceeded {
-            register: 100,
-            retries: 5,
-            last_error: "fail".to_string(),
-        };
-        let err_string = err.to_string();
-        assert!(err_string.contains('5'));
     }
 
     #[test]
@@ -567,19 +549,6 @@ mod tests {
         };
         assert!(err.to_string().contains("timed out"));
         assert!(err.to_string().contains("999"));
-    }
-
-    #[test]
-    fn test_max_retries_display_includes_last_error() {
-        let err = ModbusError::MaxRetriesExceeded {
-            register: 777,
-            retries: 2,
-            last_error: "Hardware failure detected".to_string(),
-        };
-        let err_string = err.to_string();
-        assert!(err_string.contains("Hardware failure detected"));
-        assert!(err_string.contains("777"));
-        assert!(err_string.contains('2'));
     }
 
     #[test]
@@ -606,5 +575,64 @@ mod tests {
         let modbus_err = ModbusError::InvalidAlarmInfoValue(99999.0);
         let api_err: ApiError = modbus_err.into();
         assert_eq!(get_status_code(api_err), StatusCode::BAD_REQUEST);
+    }
+
+    // Tests for visibility-related error variants
+
+    #[test]
+    fn test_modbus_error_display_parameter_not_visible() {
+        let err = ModbusError::ParameterNotVisible { register: 61509 };
+        assert_eq!(
+            err.to_string(),
+            "Parameter at register 61509 is not available on this hardware"
+        );
+    }
+
+    #[test]
+    fn test_modbus_error_display_visibility_not_scanned() {
+        let err = ModbusError::VisibilityNotScanned;
+        assert_eq!(err.to_string(), "Visibility cache not initialized");
+    }
+
+    #[test]
+    fn test_modbus_error_display_invalid_visibility_register() {
+        let err = ModbusError::InvalidVisibilityRegister(65000);
+        assert_eq!(
+            err.to_string(),
+            "Invalid visibility register address: 65000 (expected 62500-62548)"
+        );
+    }
+
+    #[test]
+    fn test_modbus_to_api_error_parameter_not_visible_is_not_found() {
+        let modbus_err = ModbusError::ParameterNotVisible { register: 61509 };
+        let api_err: ApiError = modbus_err.into();
+        assert_eq!(get_status_code(api_err), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_modbus_to_api_error_visibility_not_scanned_is_internal() {
+        let modbus_err = ModbusError::VisibilityNotScanned;
+        let api_err: ApiError = modbus_err.into();
+        assert_eq!(get_status_code(api_err), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_modbus_to_api_error_invalid_visibility_register_is_internal() {
+        let modbus_err = ModbusError::InvalidVisibilityRegister(65000);
+        let api_err: ApiError = modbus_err.into();
+        assert_eq!(get_status_code(api_err), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_api_error_display_not_found() {
+        let err = ApiError::NotFound;
+        assert_eq!(err.to_string(), "Not Found");
+    }
+
+    #[test]
+    fn test_api_error_not_found_status_code() {
+        let err = ApiError::NotFound;
+        assert_eq!(get_status_code(err), StatusCode::NOT_FOUND);
     }
 }

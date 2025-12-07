@@ -67,7 +67,7 @@ cargo clippy --all-targets -- -W clippy::pedantic
 
 The system uses an **actor pattern** for handling Modbus communication to ensure exclusive access to the serial port and sequential processing of requests:
 
-- **CtcActor** (server/src/routes/ctc_actor.rs:22): Main actor that owns the Modbus RTU context and processes parameter operations sequentially
+- **CtcActor** (server/src/modbus/actor.rs:40): Main actor that owns the Modbus RTU context and processes parameter operations sequentially
 - **Message Channel**: HTTP handlers send `(ParameterOperation, ResponseChannel)` tuples via an mpsc channel
 - **Response Channel**: Each request includes a oneshot channel for receiving the result
 
@@ -84,7 +84,7 @@ The codebase defines a comprehensive parameter system for CTC heating systems:
 
 ### HTTP API Routes
 
-The Axum-based web server provides two route modules:
+The Axum-based web server provides four route modules:
 
 1. **temperatures.rs** (server/src/routes/temperatures.rs): Temperature monitoring and control endpoints
    - Read room/outdoor/flow temperatures
@@ -92,9 +92,16 @@ The Axum-based web server provides two route modules:
 
 2. **ctc.rs** (server/src/routes/ctc.rs): Generic parameter access and convenience functions
    - Generic parameter read/write by address
-   - Power-save mode (sets vacation days + room temp)
+   - Power-save mode (GPIO-based SmartGrid blocking)
 
-Both modules use the same pattern: create a oneshot channel, send operation to actor via mpsc, await response.
+3. **smartgrid.rs** (server/src/routes/smartgrid.rs): SmartGrid control via GPIO
+   - Get/set SmartGrid mode (normal, blocking, lowprice, overcapacity)
+   - Requires GPIO to be enabled in configuration
+
+4. **visibility.rs** (server/src/routes/visibility.rs): Parameter visibility checking
+   - Read visibility register bitmasks
+
+Both Modbus-based modules use the same pattern: create a oneshot channel, send operation to actor via mpsc, await response.
 
 ## Key Implementation Patterns
 
@@ -135,7 +142,7 @@ ctc_parameter!(PARAM_NAME, register_id, "Description", scaling_factor, visible_r
 
 ### Actor Write Operations
 
-Write operations (server/src/routes/ctc_actor.rs:149-170) automatically:
+Write operations (server/src/modbus/actor.rs:498) automatically:
 1. Validate the parameter is writable
 2. Read min/max/step constraints from the device
 3. Validate the value fits within constraints
@@ -163,7 +170,7 @@ This is a Cargo workspace using Rust edition 2024:
 
 ## Important Notes
 
-- The actor loop (server/src/routes/ctc_actor.rs:174-242) runs indefinitely until the receiver channel closes
+- The actor loop (server/src/modbus/actor.rs:838) runs indefinitely until the receiver channel closes
 - All Modbus parameters use signed 16-bit values internally, even for unsigned physical values
 - Temperature values typically use 0.1 scaling (raw value 221 = 22.1°C)
 - The server uses single-threaded Tokio runtime (`current_thread` flavor) since Modbus is inherently sequential

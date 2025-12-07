@@ -4,6 +4,10 @@
 
 `smartgrid_test` is a command-line tool for testing GPIO relay control of CTC SmartGrid terminals K25/K26. It can:
 
+> **Note**: This is a standalone hardware testing tool that reads CTC Modbus registers
+> directly for verification. The `ctc_server` uses GPIO-only for SmartGrid control
+> and does not use register 1100.
+
 - Query and display the current SmartGrid mode from the CTC heating system
 - Discover relay board configuration (active-high/low, GPIO-to-terminal mapping)
 - Cycle through all SmartGrid modes and measure CTC response times
@@ -41,12 +45,15 @@ Use the relay's Normally Open (NO) contacts. The exact GPIO-to-terminal mapping 
 
 ### SmartGrid Mode Reference
 
-| Mode         | K25 (Smart A) | K26 (Smart B) | Register 1100 | Effect                              |
-|--------------|---------------|---------------|---------------|-------------------------------------|
-| Normal       | Open          | Open          | 0b00 (0x00)   | Standard operation                  |
-| Blocking     | Closed        | Open          | 0b01 (0x40)   | Minimize heating (peak prices)      |
-| LowPrice     | Open          | Closed        | 0b10 (0x80)   | +1C setpoints (cheap electricity)   |
-| Overcapacity | Closed        | Closed        | 0b11 (0xC0)   | +2C setpoints (very cheap/negative) |
+| Mode         | K25 (Smart A) | K26 (Smart B) | Effect                              |
+|--------------|---------------|---------------|-------------------------------------|
+| Normal       | Open          | Open          | Standard operation                  |
+| Blocking     | Closed        | Open          | Minimize heating (peak prices)      |
+| LowPrice     | Open          | Closed        | +1C setpoints (cheap electricity)   |
+| Overcapacity | Closed        | Closed        | +2C setpoints (very cheap/negative) |
+
+> The `ctc_server` controls SmartGrid via GPIO pins connected to K25/K26 terminals.
+> Register 1100 (virtual digital inputs) is not used as it's not supported on all CTC models.
 
 ## Building
 
@@ -227,13 +234,14 @@ smartgrid_test --server http://192.168.1.100:3000 status
 
 ### API Endpoint
 
-The tool queries the CTC server's generic Modbus API:
+This tool queries the CTC server's generic Modbus API to read registers for verification:
 
-```
-GET /api/v1/ctc/?address=1100
-```
+- **Register 62301 (SGMode)**: Primary status register showing current SmartGrid mode
+- **Register 1100**: Control register (for reference, not supported on all models)
+- **Register 62017**: Heat pump status
 
-Response contains register 1100 value. SmartGrid mode is encoded in bits 6-7.
+> **Note**: The `ctc_server` itself uses GPIO-only for SmartGrid control.
+> This tool reads the raw Modbus registers to verify hardware behavior.
 
 ### GPIO Control
 

@@ -5,7 +5,7 @@
 //! access to the serial port and processes operations sequentially.
 
 use crate::error::ModbusError;
-use crate::modbus::{Access, CTCModbusParameter, SmartGridMode};
+use crate::modbus::{Access, CTCModbusParameter};
 use std::io;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -21,13 +21,20 @@ pub type ResponseChannel = oneshot::Sender<ModbusResponse>;
 pub type ModbusRequest = (ParameterOperation, ResponseChannel);
 pub type ModbusSender = mpsc::Sender<ModbusRequest>;
 
+/// First visibility register address (inclusive)
+const VISIBILITY_REG_START: u16 = 62500;
+/// Last visibility register address (inclusive)
+const VISIBILITY_REG_END: u16 = 62548;
+/// Number of visibility registers to read
+const VISIBILITY_REG_COUNT: usize = (VISIBILITY_REG_END - VISIBILITY_REG_START + 1) as usize; // 49
+
 pub enum ParameterOperation {
     Read(CTCModbusParameter),
     // ReadVector(&Vec<'static CTCModbusParameter>),
     Write(CTCModbusParameter, f32),
-    /// Write `SmartGrid` mode to register 1100
-    /// This uses Control Parameters that support unlimited writes with keepalive
-    WriteSmartGrid(crate::modbus::SmartGridMode),
+    /// Read a specific visibility register (62500-62548)
+    /// Returns the raw bitmask value as f32
+    ReadVisibility(u16),
 }
 
 pub struct CtcActor {
@@ -47,6 +54,8 @@ pub struct CtcActor {
     last_success: Option<Instant>,
     total_operations: u64,
     total_failures: u64,
+    // Visibility cache: registers 62500-62548, lazy-loaded on first access
+    visibility_cache: Option<[u16; VISIBILITY_REG_COUNT]>,
 }
 
 #[allow(dead_code)]
@@ -182,8 +191,108 @@ impl CtcActorBuilder {
             last_success: None,
             total_operations: 0,
             total_failures: 0,
+            visibility_cache: None,
         })
     }
+}
+
+/// Retry macro for Modbus operations with exponential backoff.
+///
+/// # Type constraints
+/// - `$operation` must be an async expression yielding `Result<T, ModbusError>`
+/// - Returns `Result<T, ModbusError>`
+///
+/// # Important
+/// - The `$operation` expression is evaluated INSIDE the loop, creating a fresh future
+///   each iteration. Never poll the same future twice.
+/// - On final failure, returns the stored `ModbusError` (not stringified), allowing
+///   structured logging before conversion to `ApiError`.
+macro_rules! with_retry {
+    ($self:expr, $op_name:expr, $register:expr, $operation:expr) => {{
+        let mut last_error: Option<ModbusError> = None;
+
+        let result: Result<_, ModbusError> = 'retry: {
+            for attempt in 0..=$self.max_retries {
+                if attempt > 0 {
+                    let delay = $self.calculate_retry_delay(attempt);
+                    debug!(
+                        "Retry attempt {}/{} for {} (register {}), delay: {}ms",
+                        attempt,
+                        $self.max_retries,
+                        $op_name,
+                        $register,
+                        delay.as_millis()
+                    );
+                    sleep(delay).await;
+                }
+
+                // IMPORTANT: $operation is evaluated here, inside the loop,
+                // creating a fresh future each iteration
+                let future = $operation;
+
+                match timeout($self.operation_timeout, future).await {
+                    Ok(Ok(value)) => {
+                        $self.record_success();
+                        debug!(
+                            "{} succeeded on attempt {} (register {})",
+                            $op_name,
+                            attempt + 1,
+                            $register
+                        );
+                        break 'retry Ok(value);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "{} failed on attempt {}/{}: {} (register {})",
+                            $op_name,
+                            attempt + 1,
+                            $self.max_retries + 1,
+                            e,
+                            $register
+                        );
+                        last_error = Some(e);
+                    }
+                    Err(_elapsed) => {
+                        let timeout_err = ModbusError::Timeout {
+                            register: $register,
+                            operation: format!(
+                                "{} timed out after {:?}",
+                                $op_name, $self.operation_timeout
+                            ),
+                        };
+                        warn!(
+                            "{} timeout on attempt {}/{} (register {})",
+                            $op_name,
+                            attempt + 1,
+                            $self.max_retries + 1,
+                            $register
+                        );
+                        last_error = Some(timeout_err);
+                    }
+                }
+            }
+
+            // All retries exhausted - call record_failure() exactly once
+            $self.record_failure();
+
+            let final_error = last_error.unwrap_or_else(|| ModbusError::ProtocolError {
+                reason: format!("{}: no error captured during retries", $op_name),
+            });
+
+            error!(
+                "{} failed after {} attempts (register {}): {}",
+                $op_name,
+                $self.max_retries + 1,
+                $register,
+                final_error
+            );
+
+            // Return the structured error (not stringified) for logging
+            Err(final_error)
+        };
+
+        result
+    }};
 }
 
 impl CtcActor {
@@ -229,116 +338,118 @@ impl CtcActor {
         }
     }
 
-    async fn read_parameter(&mut self, param: &CTCModbusParameter) -> Result<f32, ModbusError> {
-        let param_id = param.id;
-        let mut last_error = None;
-
-        for attempt in 0..=self.max_retries {
-            // Add delay with exponential backoff (except first attempt)
-            if attempt > 0 {
-                let delay = self.calculate_retry_delay(attempt);
-                debug!(
-                    "Retry attempt {}/{} for read_holding_registers (register {}), delay: {}ms",
-                    attempt,
-                    self.max_retries,
-                    param_id,
-                    delay.as_millis()
-                );
-                sleep(delay).await;
-            }
-
-            // Execute with timeout
-            let operation = async {
-                self.context
-                    .read_holding_registers(param.id, 1)
-                    .await
-                    .map_err(|e| ModbusError::ProtocolError {
-                        reason: format!("Error reading register {}: {e}", param.id),
-                    })
-                    .and_then(|raw_values| {
-                        raw_values
-                            .map_err(|e| ModbusError::ReadError {
-                                register: param.id,
-                                reason: format!("{e}"),
-                            })
-                            .and_then(|raw_values| {
-                                debug!(
-                                    "ctc_actor::read_parameter: Raw values for parameter {:?}: {:?}",
-                                    param, raw_values
-                                );
-                                let scaled_values = param.get_scaled_value_vector(&raw_values);
-                                scaled_values
-                                    .first()
-                                    .copied()
-                                    .ok_or_else(|| ModbusError::ReadError {
-                                        register: param.id,
-                                        reason: "No value returned".to_string(),
-                                    })
-                            })
-                    })
-            };
-
-            match timeout(self.operation_timeout, operation).await {
-                Ok(Ok(result)) => {
-                    self.record_success();
-                    debug!(
-                        "read_holding_registers succeeded on attempt {} (register {})",
-                        attempt + 1,
-                        param_id
-                    );
-                    return Ok(result);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "read_holding_registers failed on attempt {}/{}: {} (register {})",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        e,
-                        param_id
-                    );
-                    last_error = Some(e);
-                }
-                Err(_elapsed) => {
-                    let timeout_err = ModbusError::Timeout {
-                        register: param_id,
-                        operation: format!(
-                            "read_holding_registers timed out after {:?}",
-                            self.operation_timeout
-                        ),
-                    };
-                    warn!(
-                        "read_holding_registers timeout on attempt {}/{} (register {})",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        param_id
-                    );
-                    last_error = Some(timeout_err);
-                }
-            }
-        }
-
-        // All retries exhausted
-        self.record_failure();
-
-        let final_error = last_error.unwrap_or_else(|| ModbusError::ProtocolError {
-            reason: "No error captured during retries".to_string(),
-        });
-
-        error!(
-            "read_holding_registers failed after {} attempts (register {}): {}",
-            self.max_retries + 1,
-            param_id,
-            final_error
+    /// Batch read all visibility registers in one Modbus call
+    ///
+    /// Reads registers 62500-62548 (49 registers) containing visibility bitmasks
+    /// for hardware capability detection. The cache is populated lazily on first
+    /// parameter access.
+    async fn scan_visibility(&mut self) -> Result<(), ModbusError> {
+        info!(
+            "Scanning visibility registers ({} registers starting at {})",
+            VISIBILITY_REG_COUNT, VISIBILITY_REG_START
         );
 
-        Err(ModbusError::MaxRetriesExceeded {
-            register: param_id,
-            retries: self.max_retries,
-            last_error: final_error.to_string(),
+        #[allow(clippy::cast_possible_truncation)]
+        let values: Vec<u16> = with_retry!(self, "scan_visibility", VISIBILITY_REG_START, async {
+            self.context
+                .read_holding_registers(VISIBILITY_REG_START, VISIBILITY_REG_COUNT as u16)
+                .await
+                .map_err(|e| ModbusError::ReadError {
+                    register: VISIBILITY_REG_START,
+                    reason: e.to_string(),
+                })
+                .and_then(|result| {
+                    result.map_err(|e| ModbusError::ReadError {
+                        register: VISIBILITY_REG_START,
+                        reason: format!("Modbus exception: {e}"),
+                    })
+                })
+        })?;
+
+        // EXPLICIT length check before try_into() for clear error path
+        if values.len() != VISIBILITY_REG_COUNT {
+            return Err(ModbusError::ReadError {
+                register: VISIBILITY_REG_START,
+                reason: format!(
+                    "Expected {} visibility registers, got {}",
+                    VISIBILITY_REG_COUNT,
+                    values.len()
+                ),
+            });
+        }
+
+        // Now try_into() is guaranteed to succeed
+        let cache: [u16; VISIBILITY_REG_COUNT] =
+            values.try_into().expect("length already validated");
+
+        self.visibility_cache = Some(cache);
+        info!(
+            "Visibility cache populated with {} registers",
+            VISIBILITY_REG_COUNT
+        );
+        Ok(())
+    }
+
+    /// Check if parameter is visible on this hardware
+    ///
+    /// # Important
+    /// `visible == 0` returns true WITHOUT touching the cache, ensuring registers
+    /// like `CTC_ALARM_INFO_BUFFER` remain accessible even if visibility scan fails.
+    fn check_visibility(&self, param: &CTCModbusParameter) -> Result<bool, ModbusError> {
+        // FIRST: visible == 0 means always visible - check BEFORE touching cache
+        // This ensures CTC_ALARM_INFO_BUFFER etc. work even if scan failed
+        if param.visible == 0 {
+            return Ok(true);
+        }
+
+        // NOW we need the cache - fail if not scanned
+        let cache = self
+            .visibility_cache
+            .as_ref()
+            .ok_or(ModbusError::VisibilityNotScanned)?;
+
+        // Bounds check for future-proofing: reject registers outside known range
+        if param.visible < VISIBILITY_REG_START || param.visible > VISIBILITY_REG_END {
+            return Err(ModbusError::InvalidVisibilityRegister(param.visible));
+        }
+
+        // Calculate index: register 62500 = index 0
+        let index = (param.visible - VISIBILITY_REG_START) as usize;
+        Ok(param.is_visible(cache[index]))
+    }
+
+    async fn read_parameter(&mut self, param: &CTCModbusParameter) -> Result<f32, ModbusError> {
+        with_retry!(self, "read_holding_registers", param.id, async {
+            self.context
+                .read_holding_registers(param.id, 1)
+                .await
+                .map_err(|e| ModbusError::ProtocolError {
+                    reason: format!("Error reading register {}: {e}", param.id),
+                })
+                .and_then(|raw_values| {
+                    raw_values
+                        .map_err(|e| ModbusError::ReadError {
+                            register: param.id,
+                            reason: format!("{e}"),
+                        })
+                        .and_then(|raw_values| {
+                            debug!(
+                                "ctc_actor::read_parameter: Raw values for parameter {:?}: {:?}",
+                                param, raw_values
+                            );
+                            let scaled_values = param.get_scaled_value_vector(&raw_values);
+                            scaled_values
+                                .first()
+                                .copied()
+                                .ok_or_else(|| ModbusError::ReadError {
+                                    register: param.id,
+                                    reason: "No value returned".to_string(),
+                                })
+                        })
+                })
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn read_min_max_step(
         &mut self,
         param: &CTCModbusParameter,
@@ -351,115 +462,39 @@ impl CtcActor {
         };
 
         let param_id = param.id;
-        let mut last_error = None;
 
-        for attempt in 0..=self.max_retries {
-            // Add delay with exponential backoff (except first attempt)
-            if attempt > 0 {
-                let delay = self.calculate_retry_delay(attempt);
-                debug!(
-                    "Retry attempt {}/{} for read_validation_parameters (register {}), delay: {}ms",
-                    attempt,
-                    self.max_retries,
-                    reg_max,
-                    delay.as_millis()
-                );
-                sleep(delay).await;
-            }
-
-            // Execute with timeout
-            let operation = async {
-                self.context
-                    .read_holding_registers(reg_max, 3)
-                    .await
-                    .map_err(|e| ModbusError::ProtocolError {
-                        reason: format!(
-                            "Error reading validation parameters at register {reg_max}: {e}"
-                        ),
-                    })
-                    .and_then(|raw_values| {
-                        raw_values
-                            .map_err(|e| ModbusError::ValidationReadError {
-                                register: param_id,
-                                reason: format!("{e}"),
-                            })
-                            .and_then(|raw_values| {
-                                if raw_values.len() < 2 {
-                                    return Err(ModbusError::ValidationReadError {
-                                        register: param_id,
-                                        reason: "Not enough values returned".to_string(),
-                                    });
-                                }
-                                debug!(
-                                    "ctc_actor::read_min_max: Raw values max/min {:?}",
-                                    raw_values
-                                );
-                                Ok((raw_values[0], raw_values[1], raw_values[2]))
-                            })
-                    })
-            };
-
-            match timeout(self.operation_timeout, operation).await {
-                Ok(Ok(result)) => {
-                    self.record_success();
-                    debug!(
-                        "read_validation_parameters succeeded on attempt {} (register {})",
-                        attempt + 1,
-                        reg_max
-                    );
-                    return Ok(result);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "read_validation_parameters failed on attempt {}/{}: {} (register {})",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        e,
-                        reg_max
-                    );
-                    last_error = Some(e);
-                }
-                Err(_elapsed) => {
-                    let timeout_err = ModbusError::Timeout {
-                        register: reg_max,
-                        operation: format!(
-                            "read_validation_parameters timed out after {:?}",
-                            self.operation_timeout
-                        ),
-                    };
-                    warn!(
-                        "read_validation_parameters timeout on attempt {}/{} (register {})",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        reg_max
-                    );
-                    last_error = Some(timeout_err);
-                }
-            }
-        }
-
-        // All retries exhausted
-        self.record_failure();
-
-        let final_error = last_error.unwrap_or_else(|| ModbusError::ProtocolError {
-            reason: "No error captured during retries".to_string(),
-        });
-
-        error!(
-            "read_validation_parameters failed after {} attempts (register {}): {}",
-            self.max_retries + 1,
-            reg_max,
-            final_error
-        );
-
-        Err(ModbusError::MaxRetriesExceeded {
-            register: reg_max,
-            retries: self.max_retries,
-            last_error: final_error.to_string(),
+        with_retry!(self, "read_validation_parameters", reg_max, async {
+            self.context
+                .read_holding_registers(reg_max, 3)
+                .await
+                .map_err(|e| ModbusError::ProtocolError {
+                    reason: format!(
+                        "Error reading validation parameters at register {reg_max}: {e}"
+                    ),
+                })
+                .and_then(|raw_values| {
+                    raw_values
+                        .map_err(|e| ModbusError::ValidationReadError {
+                            register: param_id,
+                            reason: format!("{e}"),
+                        })
+                        .and_then(|raw_values| {
+                            if raw_values.len() < 2 {
+                                return Err(ModbusError::ValidationReadError {
+                                    register: param_id,
+                                    reason: "Not enough values returned".to_string(),
+                                });
+                            }
+                            debug!(
+                                "ctc_actor::read_min_max: Raw values max/min {:?}",
+                                raw_values
+                            );
+                            Ok((raw_values[0], raw_values[1], raw_values[2]))
+                        })
+                })
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn write_parameter(
         &mut self,
         param: &CTCModbusParameter,
@@ -551,219 +586,25 @@ impl CtcActor {
             param.id
         );
 
-        // Write with retry and timeout
-        let mut last_error = None;
-
-        for attempt in 0..=self.max_retries {
-            // Add delay with exponential backoff (except first attempt)
-            if attempt > 0 {
-                let delay = self.calculate_retry_delay(attempt);
-                debug!(
-                    "Retry attempt {}/{} for write_single_register (register {}), delay: {}ms",
-                    attempt,
-                    self.max_retries,
-                    param.id,
-                    delay.as_millis()
-                );
-                sleep(delay).await;
-            }
-
-            // Execute with timeout
-            let operation = async {
-                self.context
-                    .write_single_register(param.id, raw_value)
-                    .await
-                    .map_err(|e| {
-                        error!("ctc_actor::write_parameter: Modbus write FAILED: {}", e);
-                        ModbusError::WriteError {
-                            register: param.id,
-                            value,
-                            reason: format!("{e}"),
-                        }
-                    })
-                    .and_then(|result| {
-                        result.map_err(|e| ModbusError::WriteError {
-                            register: param.id,
-                            value,
-                            reason: format!("Modbus exception: {e}"),
-                        })
-                    })
-            };
-
-            match timeout(self.operation_timeout, operation).await {
-                Ok(Ok(())) => {
-                    self.record_success();
-                    debug!(
-                        "write_single_register succeeded on attempt {} (register {})",
-                        attempt + 1,
-                        param.id
-                    );
-                    debug!("ctc_actor::write_parameter: Modbus write SUCCESS");
-                    return Ok(());
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "write_single_register failed on attempt {}/{}: {} (register {})",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        e,
-                        param.id
-                    );
-                    last_error = Some(e);
-                }
-                Err(_elapsed) => {
-                    let timeout_err = ModbusError::Timeout {
+        with_retry!(self, "write_single_register", param.id, async {
+            self.context
+                .write_single_register(param.id, raw_value)
+                .await
+                .map_err(|e| {
+                    error!("ctc_actor::write_parameter: Modbus write FAILED: {}", e);
+                    ModbusError::WriteError {
                         register: param.id,
-                        operation: format!(
-                            "write_single_register timed out after {:?}",
-                            self.operation_timeout
-                        ),
-                    };
-                    warn!(
-                        "write_single_register timeout on attempt {}/{} (register {})",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        param.id
-                    );
-                    last_error = Some(timeout_err);
-                }
-            }
-        }
-
-        // All retries exhausted
-        self.record_failure();
-
-        let final_error = last_error.unwrap_or_else(|| ModbusError::ProtocolError {
-            reason: "No error captured during retries".to_string(),
-        });
-
-        error!(
-            "write_single_register failed after {} attempts (register {}): {}",
-            self.max_retries + 1,
-            param.id,
-            final_error
-        );
-
-        Err(ModbusError::MaxRetriesExceeded {
-            register: param.id,
-            retries: self.max_retries,
-            last_error: final_error.to_string(),
-        })
-    }
-
-    /// Write `SmartGrid` mode to register 1100
-    /// This is a simplified write without validation since `SmartGrid` control
-    /// uses Control Parameters (1000-1999) that support unlimited writes
-    async fn write_smartgrid(
-        &mut self,
-        mode: crate::modbus::SmartGridMode,
-    ) -> Result<(), ModbusError> {
-        use crate::modbus::SMARTGRID_CONTROL_REGISTER;
-
-        let register = SMARTGRID_CONTROL_REGISTER;
-        let raw_value = mode.to_register_value();
-
-        debug!(
-            "ctc_actor::write_smartgrid: Writing mode={} (0x{:04X}) to register {}",
-            mode, raw_value, register
-        );
-
-        // Write with retry and timeout
-        let mut last_error = None;
-
-        for attempt in 0..=self.max_retries {
-            // Add delay with exponential backoff (except first attempt)
-            if attempt > 0 {
-                let delay = self.calculate_retry_delay(attempt);
-                debug!(
-                    "Retry attempt {}/{} for write_smartgrid (register {}), delay: {}ms",
-                    attempt,
-                    self.max_retries,
-                    register,
-                    delay.as_millis()
-                );
-                sleep(delay).await;
-            }
-
-            // Execute with timeout
-            let operation = async {
-                self.context
-                    .write_single_register(register, raw_value)
-                    .await
-                    .map_err(|e| {
-                        error!("ctc_actor::write_smartgrid: Modbus write FAILED: {}", e);
-                        ModbusError::WriteError {
-                            register,
-                            value: f32::from(raw_value),
-                            reason: format!("{e}"),
-                        }
+                        value,
+                        reason: format!("{e}"),
+                    }
+                })
+                .and_then(|result| {
+                    result.map_err(|e| ModbusError::WriteError {
+                        register: param.id,
+                        value,
+                        reason: format!("Modbus exception: {e}"),
                     })
-                    .and_then(|result| {
-                        result.map_err(|e| ModbusError::WriteError {
-                            register,
-                            value: f32::from(raw_value),
-                            reason: format!("Modbus exception: {e}"),
-                        })
-                    })
-            };
-
-            match timeout(self.operation_timeout, operation).await {
-                Ok(Ok(())) => {
-                    self.record_success();
-                    debug!(
-                        "write_smartgrid succeeded on attempt {} (register {})",
-                        attempt + 1,
-                        register
-                    );
-                    return Ok(());
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "write_smartgrid failed on attempt {}/{}: {} (register {})",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        e,
-                        register
-                    );
-                    last_error = Some(e);
-                }
-                Err(_elapsed) => {
-                    let timeout_err = ModbusError::Timeout {
-                        register,
-                        operation: format!(
-                            "write_smartgrid timed out after {:?}",
-                            self.operation_timeout
-                        ),
-                    };
-                    warn!(
-                        "write_smartgrid timeout on attempt {}/{} (register {})",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        register
-                    );
-                    last_error = Some(timeout_err);
-                }
-            }
-        }
-
-        // All retries exhausted
-        self.record_failure();
-
-        let final_error = last_error.unwrap_or_else(|| ModbusError::ProtocolError {
-            reason: "No error captured during retries".to_string(),
-        });
-
-        error!(
-            "write_smartgrid failed after {} attempts (register {}): {}",
-            self.max_retries + 1,
-            register,
-            final_error
-        );
-
-        Err(ModbusError::MaxRetriesExceeded {
-            register,
-            retries: self.max_retries,
-            last_error: final_error.to_string(),
+                })
         })
     }
 
@@ -774,6 +615,40 @@ impl CtcActor {
         respond_to: ResponseChannel,
     ) {
         debug!("ctc_actor::run: Operation=READ, parameter={:?}", param);
+
+        // Lazy init: scan visibility on first access
+        // Note: scan_visibility() calls with_retry!, which handles record_success/record_failure
+        if self.visibility_cache.is_none()
+            && let Err(e) = self.scan_visibility().await
+        {
+            // scan_visibility already called record_failure() via with_retry!
+            error!("ctc_actor::run: Visibility scan FAILED: {}", e);
+            respond_to.send(Err(e)).ok();
+            return;
+        }
+
+        // Check visibility - NO record_failure() here, this is a client error not I/O failure
+        match self.check_visibility(param) {
+            Ok(false) => {
+                // Parameter not available on this hardware - client error, not I/O failure
+                debug!(
+                    "ctc_actor::run: Parameter {} not visible on this hardware",
+                    param.id
+                );
+                respond_to
+                    .send(Err(ModbusError::ParameterNotVisible { register: param.id }))
+                    .ok();
+                return;
+            }
+            Err(e) => {
+                // Invalid visibility register config - also not an I/O failure
+                error!("ctc_actor::run: Visibility check error: {}", e);
+                respond_to.send(Err(e)).ok();
+                return;
+            }
+            Ok(true) => {} // Continue with read
+        }
+
         match self.read_parameter(param).await {
             Ok(value) => {
                 debug!(
@@ -797,27 +672,51 @@ impl CtcActor {
         }
     }
 
-    /// Handle a `SmartGrid` write operation
-    async fn handle_smartgrid_operation(
-        &mut self,
-        mode: SmartGridMode,
-        respond_to: ResponseChannel,
-    ) {
-        debug!("ctc_actor::run: Operation=WRITE_SMARTGRID, mode={}", mode);
-        match self.write_smartgrid(mode).await {
-            Ok(()) => {
-                debug!("ctc_actor::run: WriteSmartGrid SUCCESS");
-                // Return 0.0 as dummy value since WriteSmartGrid doesn't return a value
-                respond_to.send(Ok(0.0)).unwrap_or_else(|e| {
-                    error!("ctc_actor::run: CRITICAL - Failed to send success response: {e:?}");
-                });
-            }
-            Err(e) => {
-                error!("ctc_actor::run: WriteSmartGrid FAILED: {}", e);
-                respond_to.send(Err(e)).unwrap_or_else(|e| {
-                    error!("ctc_actor::run: CRITICAL - Failed to send error response: {e:?}");
-                });
-            }
+    /// Handle a visibility register read operation
+    ///
+    /// Reads a specific visibility register (62500-62548) and returns the raw bitmask.
+    /// Lazy-initializes the visibility cache on first access.
+    async fn handle_visibility_operation(&mut self, register: u16, respond_to: ResponseChannel) {
+        debug!(
+            "ctc_actor::run: Operation=READ_VISIBILITY, register={}",
+            register
+        );
+
+        // Validate register is in range
+        if !(VISIBILITY_REG_START..=VISIBILITY_REG_END).contains(&register) {
+            error!(
+                "ctc_actor::run: Invalid visibility register {register} (valid range: {VISIBILITY_REG_START}-{VISIBILITY_REG_END})"
+            );
+            respond_to
+                .send(Err(ModbusError::InvalidVisibilityRegister(register)))
+                .ok();
+            return;
+        }
+
+        // Lazy init: scan visibility on first access
+        if self.visibility_cache.is_none()
+            && let Err(e) = self.scan_visibility().await
+        {
+            error!("ctc_actor::run: Visibility scan FAILED: {}", e);
+            respond_to.send(Err(e)).ok();
+            return;
+        }
+
+        // Get cached value
+        if let Some(cache) = &self.visibility_cache {
+            let index = (register - VISIBILITY_REG_START) as usize;
+            let value = f32::from(cache[index]);
+            debug!(
+                "ctc_actor::run: Visibility register {} = {} (0x{:04X})",
+                register, cache[index], cache[index]
+            );
+            respond_to.send(Ok(value)).unwrap_or_else(|e| {
+                error!("ctc_actor::run: CRITICAL - Failed to send visibility response: {e:?}");
+            });
+        } else {
+            // Should never happen since we just scanned
+            error!("ctc_actor::run: Visibility cache unexpectedly empty");
+            respond_to.send(Err(ModbusError::VisibilityNotScanned)).ok();
         }
     }
 
@@ -832,6 +731,40 @@ impl CtcActor {
             "ctc_actor::run: Operation=WRITE, parameter={:?}, value={}",
             param, value
         );
+
+        // Lazy init: scan visibility on first access
+        // Note: scan_visibility() calls with_retry!, which handles record_success/record_failure
+        if self.visibility_cache.is_none()
+            && let Err(e) = self.scan_visibility().await
+        {
+            // scan_visibility already called record_failure() via with_retry!
+            error!("ctc_actor::run: Visibility scan FAILED: {}", e);
+            respond_to.send(Err(e)).ok();
+            return;
+        }
+
+        // Check visibility - NO record_failure() here, this is a client error not I/O failure
+        match self.check_visibility(param) {
+            Ok(false) => {
+                // Parameter not available on this hardware - client error, not I/O failure
+                debug!(
+                    "ctc_actor::run: Parameter {} not visible on this hardware",
+                    param.id
+                );
+                respond_to
+                    .send(Err(ModbusError::ParameterNotVisible { register: param.id }))
+                    .ok();
+                return;
+            }
+            Err(e) => {
+                // Invalid visibility register config - also not an I/O failure
+                error!("ctc_actor::run: Visibility check error: {}", e);
+                respond_to.send(Err(e)).ok();
+                return;
+            }
+            Ok(true) => {} // Continue with write
+        }
+
         match self.write_parameter(param, value).await {
             Ok(()) => {
                 // Skip read-back verification for write-only registers
@@ -913,11 +846,11 @@ impl CtcActor {
                         ParameterOperation::Read(param) => {
                             self.handle_read_operation(&param, respond_to).await;
                         },
-                        ParameterOperation::WriteSmartGrid(mode) => {
-                            self.handle_smartgrid_operation(mode, respond_to).await;
-                        },
                         ParameterOperation::Write(param, value) => {
                             self.handle_write_operation(&param, value, respond_to).await;
+                        },
+                        ParameterOperation::ReadVisibility(register) => {
+                            self.handle_visibility_operation(register, respond_to).await;
                         }
                     }
                     debug!("ctc_actor::run: Message processing complete, looping back");
