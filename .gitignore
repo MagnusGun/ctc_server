@@ -30,4 +30,4 @@ docker-compose.override.yml
 *.tar
 
 # python
-.venv/
+.venv/CLAUDE.md
