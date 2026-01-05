@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "server",
-    "smartgrid_test",
+    # "smartgrid_test",
     # "portal",
     # "db",
 ]
