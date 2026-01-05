@@ -20,6 +20,8 @@ pub struct Config {
     pub modbus: ModbusConfig,
     pub temperature_validation: TemperatureValidationConfig,
     pub gpio: GpioConfig,
+    pub tibber: TibberConfig,
+    pub price: PriceConfig,
 }
 
 /// HTTP server configuration
@@ -94,6 +96,34 @@ pub struct GpioConfig {
     pub active_low: bool,
 }
 
+/// Tibber API configuration for energy consumption data
+#[derive(Debug, Clone, Deserialize)]
+pub struct TibberConfig {
+    /// Enable Tibber API integration
+    pub enabled: bool,
+    /// API settings (token)
+    pub api: TibberApi,
+}
+
+/// Tibber API credentials
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TibberApi {
+    /// Tibber API token (get from <https://developer.tibber.com>)
+    /// Set via `CTC_TIBBER_API_TOKEN` environment variable
+    pub token: Option<String>,
+}
+
+/// Electricity price configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct PriceConfig {
+    /// Enable price tracking
+    pub enabled: bool,
+    /// Price zone: SE1 (Luleå), SE2 (Sundsvall), SE3 (Stockholm), SE4 (Malmö)
+    pub zone: String,
+    /// Price fetch interval in minutes (align with 15-min price periods)
+    pub fetch_interval_mins: u64,
+}
+
 impl Config {
     /// Load configuration from file, environment variables, and defaults
     ///
@@ -154,7 +184,14 @@ impl Config {
             .set_default("gpio.enabled", true)?
             .set_default("gpio.gpio_k24", 20)?
             .set_default("gpio.gpio_k25", 21)?
-            .set_default("gpio.active_low", false)?;
+            .set_default("gpio.active_low", false)?
+            // Tibber defaults
+            .set_default("tibber.enabled", false)?
+            .set_default("tibber.api.token", None::<String>)?
+            // Price defaults
+            .set_default("price.enabled", true)?
+            .set_default("price.zone", "SE3")?
+            .set_default("price.fetch_interval_mins", 15)?;
 
         builder.build()?.try_deserialize()
     }
@@ -306,6 +343,16 @@ mod tests {
             .set_default("gpio.gpio_k25", 21)
             .unwrap()
             .set_default("gpio.active_low", false)
+            .unwrap()
+            .set_default("tibber.enabled", false)
+            .unwrap()
+            .set_default("tibber.api.token", None::<String>)
+            .unwrap()
+            .set_default("price.enabled", true)
+            .unwrap()
+            .set_default("price.zone", "SE3")
+            .unwrap()
+            .set_default("price.fetch_interval_mins", 15)
             .unwrap();
 
         let config: Config = builder.build().unwrap().try_deserialize().unwrap();

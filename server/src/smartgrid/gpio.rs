@@ -5,12 +5,13 @@
 //! change pin direction from output to input).
 
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use gpiocdev::line::Value;
 use gpiocdev::request::Request;
 use tracing::{debug, error};
 
-use crate::modbus::SmartGridMode;
+use super::mode::SmartGridMode;
 
 /// GPIO controller for `SmartGrid` relays
 #[derive(Clone)]
@@ -20,6 +21,8 @@ pub struct GpioController {
     active_low: bool,
     /// Current mode stored in memory (avoids reading GPIO which changes pin direction)
     current_mode: Arc<Mutex<SmartGridMode>>,
+    /// Timestamp when mode was last changed (None if never changed since startup)
+    mode_changed_at: Arc<Mutex<Option<SystemTime>>>,
 }
 
 impl GpioController {
@@ -40,6 +43,7 @@ impl GpioController {
             gpio_k25,
             active_low,
             current_mode: Arc::new(Mutex::new(SmartGridMode::Normal)),
+            mode_changed_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -60,6 +64,20 @@ impl GpioController {
         Ok(mode)
     }
 
+    /// Get timestamp when mode was last changed
+    ///
+    /// Returns `None` if mode has never been changed since server startup.
+    ///
+    /// # Errors
+    /// Returns error if the mutex is poisoned
+    pub fn mode_changed_at(&self) -> Result<Option<SystemTime>, String> {
+        let timestamp = *self
+            .mode_changed_at
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {e}"))?;
+        Ok(timestamp)
+    }
+
     /// Set `SmartGrid` mode by controlling GPIO relays
     ///
     /// # Errors
@@ -76,6 +94,19 @@ impl GpioController {
 
         self.set_terminal(self.gpio_k24, k24_closed)?;
         self.set_terminal(self.gpio_k25, k25_closed)?;
+
+        // Check if mode actually changed before updating timestamp
+        let current = *self
+            .current_mode
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {e}"))?;
+
+        if current != mode {
+            *self
+                .mode_changed_at
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {e}"))? = Some(SystemTime::now());
+        }
 
         // Store the mode in memory for read_mode()
         *self
@@ -150,7 +181,10 @@ mod tests {
         let cloned = controller.clone();
         // Clones share the same Arc<Mutex<SmartGridMode>>
         // Initial mode should be Normal for both
-        assert!(matches!(controller.read_mode().unwrap(), SmartGridMode::Normal));
+        assert!(matches!(
+            controller.read_mode().unwrap(),
+            SmartGridMode::Normal
+        ));
         assert!(matches!(cloned.read_mode().unwrap(), SmartGridMode::Normal));
     }
 }

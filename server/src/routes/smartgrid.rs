@@ -11,12 +11,13 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
+use chrono::{DateTime, SecondsFormat, Utc};
+
 use crate::error::ApiError;
-use crate::gpio::GpioController;
-use crate::modbus::SmartGridMode;
+use crate::smartgrid::{GpioController, SmartGridMode};
 
 /// State for `SmartGrid` routes
 #[derive(Clone)]
@@ -36,6 +37,13 @@ pub fn routes(gpio: Option<GpioController>, _request_timeout_secs: u64) -> Route
 #[derive(Debug, Deserialize)]
 struct SmartGridQuery {
     mode: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SmartGridResponse {
+    smartgrid_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed_at: Option<String>,
 }
 
 /// Set `SmartGrid` mode via GPIO
@@ -78,6 +86,7 @@ async fn set_smartgrid(
 /// GET /api/v1/smartgrid
 ///
 /// Requires GPIO to be enabled in configuration.
+/// Returns mode and timestamp of last mode change (if any).
 async fn get_smartgrid(State(state): State<SmartGridState>) -> Result<String, ApiError> {
     debug!("get_smartgrid: START");
 
@@ -93,8 +102,28 @@ async fn get_smartgrid(State(state): State<SmartGridState>) -> Result<String, Ap
         ApiError::InternalError
     })?;
 
-    debug!("get_smartgrid: Current mode={}", mode);
-    Ok(format!("{{\"smartgrid_mode\": \"{mode}\"}}\n"))
+    // Read timestamp of last mode change
+    let changed_at = gpio.mode_changed_at().map_err(|e| {
+        error!("get_smartgrid: Failed to read mode timestamp - {}", e);
+        ApiError::InternalError
+    })?;
+
+    let response = SmartGridResponse {
+        smartgrid_mode: mode.to_string(),
+        changed_at: changed_at
+            .map(|t| DateTime::<Utc>::from(t).to_rfc3339_opts(SecondsFormat::Secs, true)),
+    };
+
+    debug!(
+        "get_smartgrid: Current mode={}, changed_at={:?}",
+        mode, response.changed_at
+    );
+    serde_json::to_string(&response)
+        .map(|s| format!("{s}\n"))
+        .map_err(|e| {
+            error!("get_smartgrid: JSON serialization error - {}", e);
+            ApiError::InternalError
+        })
 }
 
 #[cfg(test)]

@@ -9,9 +9,10 @@ services:
     container_name: ctc_server
     platform: linux/arm64
 
-    # Map serial device from host (adjust for your device)
+    # Map serial device and GPIO from host (adjust for your device)
     devices:
       - /dev/ttyAMA4:/dev/ttyAMA4
+      - /dev/gpiochip0:/dev/gpiochip0
 
     # Expose HTTP API port
     ports:
@@ -19,10 +20,14 @@ services:
 
     # Environment variables for configuration
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
       - CTC_SERVER_HOST=0.0.0.0
       - CTC_SERVER_PORT=3000
       - CTC_SERIAL_DEFAULT_PORT=/dev/ttyAMA4
+      - CTC_POWERSAVE=${CTC_POWERSAVE:-false}
+      # Tibber integration for real-time consumption tracking
+      - CTC_TIBBER_ENABLED=${TIBBER_ENABLED:-false}
+      - CTC_TIBBER_API_TOKEN=${TIBBER_API_TOKEN:-}
       # Uncomment to override other settings
       # - CTC_SERIAL_BAUD_RATE=9600
       # - CTC_SERIAL_PARITY=even
@@ -40,7 +45,7 @@ services:
 
     # Health check configuration
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/v1/temperature/outdoor"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/v1/temperature/outdoor"]
       interval: 30s
       timeout: 10s
       retries: 3

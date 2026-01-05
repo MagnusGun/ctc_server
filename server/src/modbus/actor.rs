@@ -14,10 +14,19 @@ use tokio_modbus::client::Writer;
 use tokio_modbus::prelude::{Reader, Slave, rtu};
 use tokio_serial::SerialPortBuilderExt;
 use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, trace, warn};
 
-pub type ModbusResponse = Result<f32, ModbusError>;
-pub type ResponseChannel = oneshot::Sender<ModbusResponse>;
+/// Response types for Modbus operations
+#[derive(Debug, Clone)]
+pub enum ModbusResponse {
+    /// Scaled parameter value (for Read/Write operations)
+    Value(f32),
+    /// Raw register data (for `ReadRawRegisters`)
+    RawRegisters { start: u16, values: Vec<u16> },
+}
+
+pub type ModbusResult = Result<ModbusResponse, ModbusError>;
+pub type ResponseChannel = oneshot::Sender<ModbusResult>;
 pub type ModbusRequest = (ParameterOperation, ResponseChannel);
 pub type ModbusSender = mpsc::Sender<ModbusRequest>;
 
@@ -35,13 +44,25 @@ pub enum ParameterOperation {
     /// Read a specific visibility register (62500-62548)
     /// Returns the raw bitmask value as f32
     ReadVisibility(u16),
+    /// Read all 49 visibility registers (62500-62548)
+    /// Returns `ModbusResponse::RawRegisters` with all cached visibility values
+    ReadAllVisibility,
+    /// Read raw registers without scaling (Modbus function 0x03)
+    /// Returns `ModbusResponse::RawRegisters`
+    ReadRawRegisters {
+        start: u16,
+        count: u16,
+    },
+    /// Write a single raw register without scaling (Modbus function 0x06)
+    /// Returns `ModbusResponse::Value` with the written value
+    WriteRawRegister {
+        register: u16,
+        value: u16,
+    },
 }
 
 pub struct CtcActor {
-    pub receiver: mpsc::Receiver<(
-        ParameterOperation,
-        oneshot::Sender<Result<f32, ModbusError>>,
-    )>,
+    pub receiver: mpsc::Receiver<ModbusRequest>,
     context: tokio_modbus::client::Context,
     // Timeout and retry configuration
     operation_timeout: Duration,
@@ -158,13 +179,7 @@ impl CtcActorBuilder {
         self
     }
 
-    pub fn build(
-        self,
-        receiver: mpsc::Receiver<(
-            ParameterOperation,
-            oneshot::Sender<Result<f32, ModbusError>>,
-        )>,
-    ) -> io::Result<CtcActor> {
+    pub fn build(self, receiver: mpsc::Receiver<ModbusRequest>) -> io::Result<CtcActor> {
         // Set up the serial port
         let port = tokio_serial::new(&self.tty_path, self.baud_rate)
             .baud_rate(self.baud_rate)
@@ -215,7 +230,7 @@ macro_rules! with_retry {
             for attempt in 0..=$self.max_retries {
                 if attempt > 0 {
                     let delay = $self.calculate_retry_delay(attempt);
-                    debug!(
+                    trace!(
                         "Retry attempt {}/{} for {} (register {}), delay: {}ms",
                         attempt,
                         $self.max_retries,
@@ -233,7 +248,7 @@ macro_rules! with_retry {
                 match timeout($self.operation_timeout, future).await {
                     Ok(Ok(value)) => {
                         $self.record_success();
-                        debug!(
+                        trace!(
                             "{} succeeded on attempt {} (register {})",
                             $op_name,
                             attempt + 1,
@@ -433,7 +448,7 @@ impl CtcActor {
                             reason: format!("{e}"),
                         })
                         .and_then(|raw_values| {
-                            debug!(
+                            trace!(
                                 "ctc_actor::read_parameter: Raw values for parameter {:?}: {:?}",
                                 param, raw_values
                             );
@@ -485,7 +500,7 @@ impl CtcActor {
                                     reason: "Not enough values returned".to_string(),
                                 });
                             }
-                            debug!(
+                            trace!(
                                 "ctc_actor::read_min_max: Raw values max/min {:?}",
                                 raw_values
                             );
@@ -500,7 +515,7 @@ impl CtcActor {
         param: &CTCModbusParameter,
         value: f32,
     ) -> Result<(), ModbusError> {
-        debug!(
+        trace!(
             "ctc_actor::write_parameter: START - param={:?}, value={}",
             param, value
         );
@@ -524,28 +539,28 @@ impl CtcActor {
                 );
                 return Err(ModbusError::InvalidAlarmInfoValue(value));
             }
-            debug!(
+            trace!(
                 "ctc_actor::write_parameter: Alarm/info value {} validated",
                 value
             );
         }
 
         let raw_value = param.get_raw_value(value);
-        debug!(
+        trace!(
             "ctc_actor::write_parameter: Converted to raw_value={}",
             raw_value
         );
 
         // Skip min/max/step validation for write-only registers (they don't have these)
         if param.access == Access::W {
-            debug!(
+            trace!(
                 "ctc_actor::write_parameter: Write-only register, skipping min/max/step validation"
             );
         } else {
-            debug!("ctc_actor::write_parameter: Reading min/max/step for validation");
+            trace!("ctc_actor::write_parameter: Reading min/max/step for validation");
             let (max, min, step) = self.read_min_max_step(param).await?;
 
-            debug!(
+            trace!(
                 "ctc_actor::write_parameter: Validation bounds - min={}, max={}, step={}",
                 min, max, step
             );
@@ -578,10 +593,10 @@ impl CtcActor {
                 });
             }
 
-            debug!("ctc_actor::write_parameter: Validation PASSED");
+            trace!("ctc_actor::write_parameter: Validation PASSED");
         }
 
-        debug!(
+        trace!(
             "ctc_actor::write_parameter: Calling Modbus write_single_register for register {}",
             param.id
         );
@@ -614,7 +629,7 @@ impl CtcActor {
         param: &CTCModbusParameter,
         respond_to: ResponseChannel,
     ) {
-        debug!("ctc_actor::run: Operation=READ, parameter={:?}", param);
+        trace!("ctc_actor::run: Operation=READ, parameter={:?}", param);
 
         // Lazy init: scan visibility on first access
         // Note: scan_visibility() calls with_retry!, which handles record_success/record_failure
@@ -631,7 +646,7 @@ impl CtcActor {
         match self.check_visibility(param) {
             Ok(false) => {
                 // Parameter not available on this hardware - client error, not I/O failure
-                debug!(
+                trace!(
                     "ctc_actor::run: Parameter {} not visible on this hardware",
                     param.id
                 );
@@ -651,23 +666,25 @@ impl CtcActor {
 
         match self.read_parameter(param).await {
             Ok(value) => {
-                debug!(
+                trace!(
                     "ctc_actor::run: Read SUCCESS, value={}, sending response",
                     value
                 );
-                respond_to.send(Ok(value)).unwrap_or_else(|e| {
-                    error!(
+                respond_to
+                    .send(Ok(ModbusResponse::Value(value)))
+                    .unwrap_or_else(|e| {
+                        error!(
                         "ctc_actor::run: CRITICAL - Failed to send read response on oneshot channel: {e:?}"
                     );
-                });
-                debug!("ctc_actor::run: Read response sent");
+                    });
+                trace!("ctc_actor::run: Read response sent");
             }
             Err(e) => {
                 error!("ctc_actor::run: Read FAILED: {}", e);
                 respond_to.send(Err(e)).unwrap_or_else(|e| {
                     error!("ctc_actor::run: CRITICAL - Failed to send read error response: {e:?}");
                 });
-                debug!("ctc_actor::run: Read error response sent");
+                trace!("ctc_actor::run: Read error response sent");
             }
         }
     }
@@ -677,7 +694,7 @@ impl CtcActor {
     /// Reads a specific visibility register (62500-62548) and returns the raw bitmask.
     /// Lazy-initializes the visibility cache on first access.
     async fn handle_visibility_operation(&mut self, register: u16, respond_to: ResponseChannel) {
-        debug!(
+        trace!(
             "ctc_actor::run: Operation=READ_VISIBILITY, register={}",
             register
         );
@@ -706,13 +723,54 @@ impl CtcActor {
         if let Some(cache) = &self.visibility_cache {
             let index = (register - VISIBILITY_REG_START) as usize;
             let value = f32::from(cache[index]);
-            debug!(
+            trace!(
                 "ctc_actor::run: Visibility register {} = {} (0x{:04X})",
                 register, cache[index], cache[index]
             );
-            respond_to.send(Ok(value)).unwrap_or_else(|e| {
-                error!("ctc_actor::run: CRITICAL - Failed to send visibility response: {e:?}");
-            });
+            respond_to
+                .send(Ok(ModbusResponse::Value(value)))
+                .unwrap_or_else(|e| {
+                    error!("ctc_actor::run: CRITICAL - Failed to send visibility response: {e:?}");
+                });
+        } else {
+            // Should never happen since we just scanned
+            error!("ctc_actor::run: Visibility cache unexpectedly empty");
+            respond_to.send(Err(ModbusError::VisibilityNotScanned)).ok();
+        }
+    }
+
+    /// Handle reading all visibility registers
+    ///
+    /// Returns all 49 visibility registers (62500-62548) as `RawRegisters`.
+    /// Lazy-initializes the visibility cache on first access.
+    async fn handle_all_visibility_operation(&mut self, respond_to: ResponseChannel) {
+        trace!("ctc_actor::run: Operation=READ_ALL_VISIBILITY");
+
+        // Lazy init: scan visibility on first access
+        if self.visibility_cache.is_none()
+            && let Err(e) = self.scan_visibility().await
+        {
+            error!("ctc_actor::run: Visibility scan FAILED: {}", e);
+            respond_to.send(Err(e)).ok();
+            return;
+        }
+
+        // Get all cached values
+        if let Some(cache) = &self.visibility_cache {
+            trace!(
+                "ctc_actor::run: Returning all {} visibility registers",
+                cache.len()
+            );
+            respond_to
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: VISIBILITY_REG_START,
+                    values: cache.to_vec(),
+                }))
+                .unwrap_or_else(|e| {
+                    error!(
+                        "ctc_actor::run: CRITICAL - Failed to send all visibility response: {e:?}"
+                    );
+                });
         } else {
             // Should never happen since we just scanned
             error!("ctc_actor::run: Visibility cache unexpectedly empty");
@@ -727,7 +785,7 @@ impl CtcActor {
         value: f32,
         respond_to: ResponseChannel,
     ) {
-        debug!(
+        trace!(
             "ctc_actor::run: Operation=WRITE, parameter={:?}, value={}",
             param, value
         );
@@ -747,7 +805,7 @@ impl CtcActor {
         match self.check_visibility(param) {
             Ok(false) => {
                 // Parameter not available on this hardware - client error, not I/O failure
-                debug!(
+                trace!(
                     "ctc_actor::run: Parameter {} not visible on this hardware",
                     param.id
                 );
@@ -769,30 +827,36 @@ impl CtcActor {
             Ok(()) => {
                 // Skip read-back verification for write-only registers
                 if param.access == Access::W {
-                    debug!("ctc_actor::run: Write-only register, skipping verification");
-                    respond_to.send(Ok(value)).unwrap_or_else(|e| {
-                        error!("ctc_actor::run: CRITICAL - Failed to send success response: {e:?}");
-                    });
-                    debug!("ctc_actor::run: Write operation COMPLETE (no verification)");
+                    trace!("ctc_actor::run: Write-only register, skipping verification");
+                    respond_to
+                        .send(Ok(ModbusResponse::Value(value)))
+                        .unwrap_or_else(|e| {
+                            error!(
+                                "ctc_actor::run: CRITICAL - Failed to send success response: {e:?}"
+                            );
+                        });
+                    trace!("ctc_actor::run: Write operation COMPLETE (no verification)");
                     return;
                 }
 
-                debug!("ctc_actor::run: Write SUCCESS, reading back to verify");
+                trace!("ctc_actor::run: Write SUCCESS, reading back to verify");
                 match self.read_parameter(param).await {
                     Ok(return_value) => {
-                        debug!(
+                        trace!(
                             "ctc_actor::run: Read-back value={}, comparing with written value={}",
                             return_value, value
                         );
 
                         if (return_value - value).abs() < f32::EPSILON {
-                            debug!("ctc_actor::run: Read-back MATCHES, sending success response");
-                            respond_to.send(Ok(value)).unwrap_or_else(|e| {
-                                error!(
+                            trace!("ctc_actor::run: Read-back MATCHES, sending success response");
+                            respond_to
+                                .send(Ok(ModbusResponse::Value(value)))
+                                .unwrap_or_else(|e| {
+                                    error!(
                                     "ctc_actor::run: CRITICAL - Failed to send success response: {e:?}"
                                 );
-                            });
-                            debug!("ctc_actor::run: Write operation COMPLETE");
+                                });
+                            trace!("ctc_actor::run: Write operation COMPLETE");
                         } else {
                             error!(
                                 "ctc_actor::run: Read-back MISMATCH: wrote {} but read {}",
@@ -809,7 +873,7 @@ impl CtcActor {
                                         "ctc_actor::run: CRITICAL - Failed to send mismatch error: {e:?}"
                                     );
                                 });
-                            debug!("ctc_actor::run: Write operation FAILED (mismatch)");
+                            trace!("ctc_actor::run: Write operation FAILED (mismatch)");
                         }
                     }
                     Err(e) => {
@@ -819,7 +883,7 @@ impl CtcActor {
                                 "ctc_actor::run: CRITICAL - Failed to send read-back error: {e:?}"
                             );
                         });
-                        debug!("ctc_actor::run: Write operation FAILED (read-back error)");
+                        trace!("ctc_actor::run: Write operation FAILED (read-back error)");
                     }
                 }
             }
@@ -828,7 +892,118 @@ impl CtcActor {
                 respond_to.send(Err(e)).unwrap_or_else(|e| {
                     error!("ctc_actor::run: CRITICAL - Failed to send write error response: {e:?}");
                 });
-                debug!("ctc_actor::run: Write error response sent");
+                trace!("ctc_actor::run: Write error response sent");
+            }
+        }
+    }
+
+    /// Handle a bulk raw register read operation (Modbus function 0x03)
+    ///
+    /// Reads `count` consecutive registers starting at `start` without applying
+    /// any scaling. Returns `ModbusResponse::RawRegisters`.
+    async fn handle_read_raw_registers(
+        &mut self,
+        start: u16,
+        count: u16,
+        respond_to: ResponseChannel,
+    ) {
+        trace!(
+            "ctc_actor::run: Operation=READ_RAW_REGISTERS, start={}, count={}",
+            start, count
+        );
+
+        let result = with_retry!(self, "read_raw_registers", start, async {
+            self.context
+                .read_holding_registers(start, count)
+                .await
+                .map_err(|e| ModbusError::ReadError {
+                    register: start,
+                    reason: e.to_string(),
+                })
+                .and_then(|r| {
+                    r.map_err(|e| ModbusError::ReadError {
+                        register: start,
+                        reason: format!("Modbus exception: {e}"),
+                    })
+                })
+        });
+
+        match result {
+            Ok(values) => {
+                trace!(
+                    "ctc_actor::run: Read raw registers SUCCESS, {} values starting at {}",
+                    values.len(),
+                    start
+                );
+                respond_to
+                    .send(Ok(ModbusResponse::RawRegisters { start, values }))
+                    .unwrap_or_else(|e| {
+                        error!(
+                            "ctc_actor::run: CRITICAL - Failed to send raw registers response: {e:?}"
+                        );
+                    });
+            }
+            Err(e) => {
+                error!("ctc_actor::run: Read raw registers FAILED: {}", e);
+                respond_to.send(Err(e)).unwrap_or_else(|e| {
+                    error!("ctc_actor::run: CRITICAL - Failed to send raw registers error: {e:?}");
+                });
+            }
+        }
+    }
+
+    /// Handle a single raw register write operation (Modbus function 0x06)
+    ///
+    /// Writes `value` to `register` without applying any scaling.
+    /// Returns `ModbusResponse::Value` with the written value.
+    async fn handle_write_raw_register(
+        &mut self,
+        register: u16,
+        value: u16,
+        respond_to: ResponseChannel,
+    ) {
+        trace!(
+            "ctc_actor::run: Operation=WRITE_RAW_REGISTER, register={}, value={}",
+            register, value
+        );
+
+        let result = with_retry!(self, "write_raw_register", register, async {
+            self.context
+                .write_single_register(register, value)
+                .await
+                .map_err(|e| ModbusError::WriteError {
+                    register,
+                    value: f32::from(value),
+                    reason: e.to_string(),
+                })
+                .and_then(|r| {
+                    r.map_err(|e| ModbusError::WriteError {
+                        register,
+                        value: f32::from(value),
+                        reason: format!("Modbus exception: {e}"),
+                    })
+                })
+        });
+
+        match result {
+            Ok(()) => {
+                trace!(
+                    "ctc_actor::run: Write raw register SUCCESS, register={}, value={}",
+                    register, value
+                );
+                respond_to
+                    .send(Ok(ModbusResponse::Value(f32::from(value))))
+                    .unwrap_or_else(|e| {
+                        error!(
+                            "ctc_actor::run: CRITICAL - Failed to send raw write response: {e:?}"
+                        );
+                    });
+            }
+            Err(e) => {
+                error!("ctc_actor::run: Write raw register FAILED: {}", e);
+                respond_to.send(Err(e)).unwrap_or_else(|e| {
+                    error!("ctc_actor::run: CRITICAL - Failed to send raw write error: {e:?}");
+                });
             }
         }
     }
@@ -838,10 +1013,8 @@ impl CtcActor {
     pub async fn run(&mut self) {
         info!("ctc_actor::run: Actor loop starting");
         loop {
-            debug!("ctc_actor::run: Waiting for next message");
             tokio::select! {
                 Some((operation, respond_to)) = self.receiver.recv() => {
-                    debug!("ctc_actor::run: Message received from channel");
                     match operation {
                         ParameterOperation::Read(param) => {
                             self.handle_read_operation(&param, respond_to).await;
@@ -851,9 +1024,17 @@ impl CtcActor {
                         },
                         ParameterOperation::ReadVisibility(register) => {
                             self.handle_visibility_operation(register, respond_to).await;
-                        }
+                        },
+                        ParameterOperation::ReadAllVisibility => {
+                            self.handle_all_visibility_operation(respond_to).await;
+                        },
+                        ParameterOperation::ReadRawRegisters { start, count } => {
+                            self.handle_read_raw_registers(start, count, respond_to).await;
+                        },
+                        ParameterOperation::WriteRawRegister { register, value } => {
+                            self.handle_write_raw_register(register, value, respond_to).await;
+                        },
                     }
-                    debug!("ctc_actor::run: Message processing complete, looping back");
                 }
                 else => {
                     error!("ctc_actor::run: Channel closed or error, actor loop TERMINATING");

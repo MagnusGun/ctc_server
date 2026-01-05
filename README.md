@@ -4,9 +4,14 @@
 `ctc_server` is a Rust-based server application designed to interact with a CTC heating system via Modbus RTU. It provides a RESTful API for monitoring and controlling various parameters of the heating system, such as room temperature, outdoor temperature, and power-saving modes.
 
 ## Features
+- **Web Dashboard**: Real-time status page with temperatures, heat pump data, power consumption, and alarms.
+- **Tibber Integration**: Real-time energy consumption tracking via WebSocket with monthly peak averaging.
 - Retrieve and set room temperature setpoints.
 - Monitor outdoor, flow, and return temperatures.
-- Enable or disable power-saving modes.
+- Enable or disable power-saving modes (with clickable toggle on dashboard).
+- SmartGrid control via GPIO relays.
+- Alarm and info message monitoring with English/Swedish translations.
+- Parameter visibility checking.
 - Generic Modbus parameter querying.
 - Modular and extensible design.
 
@@ -17,15 +22,40 @@ ctc_server/
 ├── server/                   # Main server implementation
 │   ├── src/
 │   │   ├── main.rs           # Application entry point
-│   │   ├── lib.rs            # Library module
+│   │   ├── config.rs         # Configuration management
+│   │   ├── error.rs          # Error types
+│   │   ├── energy/           # Energy management modules
+│   │   │   ├── mod.rs        # Module exports
+│   │   │   ├── elpris.rs     # Nord Pool spot prices via elprisetjustnu.se
+│   │   │   ├── grid.rs       # Grid state for peak tracking
+│   │   │   ├── price.rs      # Price state with dual-source comparison
+│   │   │   ├── tariff.rs     # Swedish electricity tariff schedule
+│   │   │   ├── tibber.rs     # Tibber WebSocket client for real-time data
+│   │   ├── messages/         # Alarm and info message handling
+│   │   │   ├── mod.rs        # Module exports
+│   │   │   ├── translations.rs # Swedish/English alarm translations
+│   │   │   ├── types.rs      # Alarm types and bitmask parsing
 │   │   ├── modbus/           # Modbus parameter definitions and utilities
 │   │   │   ├── mod.rs        # Core Modbus logic
-│   │   │   ├── bms_parameters.rs # Predefined Modbus parameters for the heating system
+│   │   │   ├── actor.rs      # Actor-based Modbus request handling
+│   │   │   ├── bms_parameters.rs # Predefined Modbus parameters
+│   │   │   ├── operations.rs # Modbus operation types
 │   │   ├── routes/           # API route handlers
 │   │   │   ├── mod.rs        # Route module definitions
-│   │   │   ├── temperatures.rs # Temperature-related endpoints
-│   │   │   ├── ctc.rs        # CTC-specific endpoints
-│   │   │   ├── ctc_actor.rs  # Actor-based Modbus request handling
+│   │   │   ├── alarms.rs     # Alarm and info message endpoints
+│   │   │   ├── ctc.rs        # Generic CTC and powersave endpoints
+│   │   │   ├── grid.rs       # Grid status and Tibber integration endpoints
+│   │   │   ├── smartgrid.rs  # SmartGrid GPIO control endpoints
+│   │   │   ├── temperatures.rs # Temperature endpoints
+│   │   │   ├── visibility.rs # Parameter visibility endpoints
+│   │   ├── smartgrid/        # SmartGrid control modules
+│   │   │   ├── mod.rs        # Module exports
+│   │   │   ├── gpio.rs       # GPIO relay control for K25/K26
+│   │   │   ├── mode.rs       # SmartGrid mode enum
+│   │   ├── static/           # Web dashboard files
+│   │   │   ├── index.html    # Dashboard HTML
+│   │   │   ├── app.js        # Dashboard JavaScript
+│   │   │   ├── style.css     # Dashboard styling
 │   ├── Cargo.toml            # Server crate dependencies
 ├── smartgrid_test/           # SmartGrid relay test tool
 │   ├── README.md             # Tool documentation
@@ -53,6 +83,27 @@ ctc_server/
 ### SmartGrid Routes
 - `GET /api/v1/smartgrid`: Get the current SmartGrid mode.
 - `POST /api/v1/smartgrid?mode=<mode>`: Set SmartGrid mode. Valid modes: `normal`, `blocking`, `lowprice`, `overcapacity`.
+
+### Alarm Routes
+- `GET /api/v1/alarms/status`: Quick status check returning alarm/info counts.
+- `GET /api/v1/alarms`: Full alarm details with codes, messages, and translations.
+
+### Visibility Routes
+- `GET /api/v1/visibility`: Read all 49 visibility registers (62500-62548) in one request.
+- `GET /api/v1/visibility/{register}`: Read visibility bitmask for a specific register.
+- `GET /api/v1/visibility/parameter/{addr}`: Check if a parameter is visible on the connected hardware.
+
+### Grid Routes (Tibber Integration)
+- `GET /api/v1/grid`: Get grid status including tariff, current hour consumption, and monthly peak data.
+- `GET /api/v1/grid/tariff`: Get current tariff mode only (lightweight polling).
+
+### Price Routes (Spot Prices)
+- `GET /api/v1/prices`: Get all electricity prices (today + tomorrow if available after ~13:00 CET).
+- `GET /api/v1/prices/current`: Get current hour's price with statistics.
+- `GET /api/v1/prices/optimal`: Get optimal hours for scheduling based on lowest prices.
+
+### Web Dashboard
+- `GET /`: Serves the real-time status dashboard (static files).
 
 ## Getting Started
 ### Prerequisites
@@ -165,6 +216,36 @@ cargo run --release -p server -- /dev/ttyUSB0
 
 The server will start on `http://0.0.0.0:3000`.
 
+### Docker Deployment
+
+Build and run using Docker Compose:
+
+```sh
+# Build the image
+docker compose build
+
+# Run in background
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
+For Tibber integration, set environment variables before starting:
+
+```sh
+export TIBBER_ENABLED=true
+export TIBBER_API_TOKEN=your-token-here
+docker compose up -d
+```
+
+For SmartGrid GPIO control, ensure the container has access to `/dev/gpiochip0` (configured in `docker-compose.yml`).
+
+See `docker-compose.override.yml.example` for local customization options.
+
 ## Testing with cURL
 ### Example Requests
 #### Get Room Temperature
@@ -196,6 +277,36 @@ curl -X GET http://localhost:3000/api/v1/smartgrid
 curl -X POST "http://localhost:3000/api/v1/smartgrid?mode=lowprice"
 ```
 
+#### Get Alarm Status
+```sh
+curl -X GET http://localhost:3000/api/v1/alarms/status
+```
+
+#### Get Full Alarm Details
+```sh
+curl -X GET http://localhost:3000/api/v1/alarms
+```
+
+## Web Dashboard
+
+The server includes a real-time web dashboard accessible at `http://localhost:3000/`. The dashboard provides:
+
+### Features
+- **Temperature Monitoring**: Room, outdoor, DHW, and radiator water temperatures
+- **Heat Pump Status**: Compressor state, HP in/out temps, pressures, brine circuit
+- **Pump Status**: Charge pump and brine pump percentages with progress bars
+- **Power Consumption**: Total power and per-phase current readings
+- **System Status**: SmartGrid mode and powersave status in header
+- **Alarms & Infos**: Active alarms and info messages with timestamps
+
+### Interactive Controls
+- **Powersave Toggle**: Click the powersave badge in the header to enable/disable power saving mode (with confirmation dialog)
+- Auto-refreshes every 5 seconds
+- Responsive design for desktop and mobile
+
+### Dashboard Screenshot
+The dashboard displays a dark-themed interface with cards for each system component, real-time updates, and color-coded status indicators.
+
 ## Configuration
 
 The server supports configuration via file, environment variables, and CLI arguments (in order of increasing priority).
@@ -218,6 +329,43 @@ All settings can be overridden with environment variables using the `CTC_` prefi
 | `CTC_MODBUS_SLAVE_ID` | Modbus slave ID | `1` |
 | `CTC_MODBUS_MAX_RETRIES` | Max retry attempts | `2` |
 | `CTC_MODBUS_OPERATION_TIMEOUT_SECS` | Operation timeout | `5` |
+| `CTC_POWERSAVE` | Initial powersave mode on startup | `false` |
+| `CTC_TIBBER_ENABLED` | Enable Tibber integration | `false` |
+| `CTC_TIBBER_API_TOKEN` | Tibber API token (from developer.tibber.com) | - |
+| `CTC_PRICE_ENABLED` | Enable spot price tracking | `true` |
+| `CTC_PRICE_FETCH_INTERVAL_MINS` | Price fetch interval in minutes | `15` |
+
+### Energy Integration
+
+The server supports energy tracking and pricing from multiple sources:
+
+#### Tibber (WebSocket)
+Real-time consumption and pricing when enabled:
+1. **Real-time consumption**: Current hour's accumulated kWh from Tibber Pulse
+2. **Monthly peak tracking**: Tracks top 3 highest consumption hours during high-tariff periods
+3. **Historical sync**: Fetches and processes historical data hourly to catch any missed updates
+4. **Price data**: Total price including markup, tax, and price level classification
+
+```bash
+# Enable Tibber integration
+export CTC_TIBBER_ENABLED=true
+export CTC_TIBBER_API_TOKEN=your-token-here
+```
+
+Get your API token from [Tibber Developer Portal](https://developer.tibber.com/).
+
+#### elprisetjustnu.se (Spot Prices)
+Raw Nord Pool spot prices without authentication:
+- **15-minute resolution**: Up to 96 price points per day
+- **Next-day prices**: Available after ~13:00 CET
+- **Price zones**: SE1 (Luleå), SE2 (Sundsvall), SE3 (Stockholm), SE4 (Malmö)
+
+```bash
+# Set price zone (default: SE3)
+export CTC_PRICE_ZONE=SE3
+```
+
+When both sources are enabled, the server calculates markup comparison between spot and Tibber total prices.
 
 ## License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -13,7 +13,13 @@ use axum::{
 use tracing::{debug, error};
 
 use crate::error::ApiError;
-use crate::modbus::{ModbusSender, ParameterOperation};
+use crate::modbus::bms_parameters::get_ctc_parameter_by_id;
+use crate::modbus::{ModbusResponse, ModbusSender, ParameterOperation};
+
+/// First visibility register address (inclusive)
+const VISIBILITY_REG_START: u16 = 62500;
+/// Last visibility register address (inclusive)
+const VISIBILITY_REG_END: u16 = 62548;
 
 /// State for visibility routes
 #[derive(Clone)]
@@ -29,7 +35,12 @@ pub fn routes(sender: ModbusSender, request_timeout_secs: u64) -> Router {
     };
 
     Router::new()
+        .route("/api/v1/visibility", get(get_all_visibility))
         .route("/api/v1/visibility/{register}", get(get_visibility))
+        .route(
+            "/api/v1/visibility/parameter/{addr}",
+            get(get_parameter_visibility),
+        )
         .with_state(state)
 }
 
@@ -67,7 +78,7 @@ async fn get_visibility(
 
     // Wait for response with timeout
     match tokio::time::timeout(Duration::from_secs(state.request_timeout_secs), response_rx).await {
-        Ok(Ok(Ok(value))) => {
+        Ok(Ok(Ok(ModbusResponse::Value(value)))) => {
             #[allow(clippy::cast_possible_truncation)]
             #[allow(clippy::cast_sign_loss)]
             let raw_value = value as u16;
@@ -77,6 +88,10 @@ async fn get_visibility(
             Ok(format!(
                 "{{\"register\": {register}, \"value\": {raw_value}, \"hex\": \"0x{raw_value:04X}\", \"bits\": \"{raw_value:016b}\"}}\n"
             ))
+        }
+        Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
+            error!("get_visibility: Unexpected RawRegisters response");
+            Err(ApiError::InternalError)
         }
         Ok(Ok(Err(e))) => {
             error!("get_visibility: Modbus error - {}", e);
@@ -96,15 +111,215 @@ async fn get_visibility(
     }
 }
 
+/// Get all visibility registers
+/// GET /api/v1/visibility
+///
+/// Returns all 49 visibility registers (62500-62548) with their bitmask values.
+///
+/// Response format:
+/// ```json
+/// {
+///   "registers": [
+///     {"register": 62500, "value": 65535, "hex": "0xFFFF"},
+///     ...
+///   ],
+///   "count": 49
+/// }
+/// ```
+async fn get_all_visibility(State(state): State<VisibilityState>) -> Result<String, ApiError> {
+    debug!("get_all_visibility: START");
+
+    // Send read all visibility request to actor
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    state
+        .sender
+        .send((ParameterOperation::ReadAllVisibility, response_tx))
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable)?;
+
+    debug!("get_all_visibility: Read request sent to actor");
+
+    // Wait for response with timeout
+    match tokio::time::timeout(Duration::from_secs(state.request_timeout_secs), response_rx).await {
+        Ok(Ok(Ok(ModbusResponse::RawRegisters { start, values }))) => {
+            debug!(
+                "get_all_visibility: SUCCESS - {} registers starting at {}",
+                values.len(),
+                start
+            );
+
+            // Build JSON array of register objects
+            let registers_json: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(i, &value)| {
+                    let register = start + u16::try_from(i).unwrap_or(0);
+                    format!(
+                        "{{\"register\": {register}, \"value\": {value}, \"hex\": \"0x{value:04X}\"}}"
+                    )
+                })
+                .collect();
+
+            Ok(format!(
+                "{{\"registers\": [{}], \"count\": {}}}\n",
+                registers_json.join(", "),
+                values.len()
+            ))
+        }
+        Ok(Ok(Ok(ModbusResponse::Value(_)))) => {
+            error!("get_all_visibility: Unexpected Value response");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Err(e))) => {
+            error!("get_all_visibility: Modbus error - {}", e);
+            Err(ApiError::from(e))
+        }
+        Ok(Err(e)) => {
+            error!("get_all_visibility: Failed to receive response - {}", e);
+            Err(ApiError::ServiceUnavailable)
+        }
+        Err(_) => {
+            error!(
+                "get_all_visibility: Timeout after {}s",
+                state.request_timeout_secs
+            );
+            Err(ApiError::Timeout)
+        }
+    }
+}
+
+/// Check if a specific BMS parameter is visible
+/// GET /api/v1/visibility/parameter/{addr}
+///
+/// Returns visibility status for a BMS parameter by its address.
+/// If the parameter is known, also returns its description and visibility register info.
+///
+/// Response format for known parameter:
+/// ```json
+/// {
+///   "address": 61509,
+///   "visible": true,
+///   "description": "Heating system 1: Set room temperature",
+///   "visibility_register": 62500,
+///   "bit": 9
+/// }
+/// ```
+///
+/// Response format for unknown parameter (custom address):
+/// ```json
+/// {
+///   "address": 65001,
+///   "visible": null,
+///   "description": null,
+///   "visibility_register": null,
+///   "bit": null,
+///   "note": "Parameter not in BMS catalog - visibility unknown"
+/// }
+/// ```
+async fn get_parameter_visibility(
+    State(state): State<VisibilityState>,
+    Path(addr): Path<u16>,
+) -> Result<String, ApiError> {
+    debug!("get_parameter_visibility: START - addr={}", addr);
+
+    // Look up the parameter in BMS catalog
+    let Some(p) = get_ctc_parameter_by_id(addr) else {
+        // Parameter not in catalog
+        debug!(
+            "get_parameter_visibility: Parameter {} not in BMS catalog",
+            addr
+        );
+        return Ok(format!(
+            "{{\"address\": {addr}, \"visible\": null, \"description\": null, \"visibility_register\": null, \"bit\": null, \"note\": \"Parameter not in BMS catalog - visibility unknown\"}}\n"
+        ));
+    };
+
+    // Parameter found - check its visibility
+    let vis_register = p.visible;
+
+    // Validate visibility register is in range
+    if !(VISIBILITY_REG_START..=VISIBILITY_REG_END).contains(&vis_register) {
+        // Parameter has visibility register 0 (always visible)
+        if vis_register == 0 {
+            debug!(
+                "get_parameter_visibility: Parameter {} is always visible",
+                addr
+            );
+            return Ok(format!(
+                "{{\"address\": {addr}, \"visible\": true, \"description\": \"{}\", \"visibility_register\": null, \"bit\": null, \"note\": \"Always visible (no visibility check required)\"}}\n",
+                p.description
+            ));
+        }
+        error!(
+            "get_parameter_visibility: Invalid visibility register {} for parameter {}",
+            vis_register, addr
+        );
+        return Err(ApiError::InternalError);
+    }
+
+    // Read the visibility register
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    state
+        .sender
+        .send((
+            ParameterOperation::ReadVisibility(vis_register),
+            response_tx,
+        ))
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable)?;
+
+    match tokio::time::timeout(Duration::from_secs(state.request_timeout_secs), response_rx).await {
+        Ok(Ok(Ok(ModbusResponse::Value(value)))) => {
+            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_sign_loss)]
+            let raw_value = value as u16;
+            let is_visible = p.is_visible(raw_value);
+            debug!(
+                "get_parameter_visibility: SUCCESS - addr={}, visible={}, vis_reg={}, bit={}",
+                addr, is_visible, vis_register, p.bit
+            );
+            Ok(format!(
+                "{{\"address\": {addr}, \"visible\": {is_visible}, \"description\": \"{}\", \"visibility_register\": {vis_register}, \"bit\": {}}}\n",
+                p.description, p.bit
+            ))
+        }
+        Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
+            error!("get_parameter_visibility: Unexpected RawRegisters response");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Err(e))) => {
+            error!("get_parameter_visibility: Modbus error - {}", e);
+            Err(ApiError::from(e))
+        }
+        Ok(Err(e)) => {
+            error!(
+                "get_parameter_visibility: Failed to receive response - {}",
+                e
+            );
+            Err(ApiError::ServiceUnavailable)
+        }
+        Err(_) => {
+            error!(
+                "get_parameter_visibility: Timeout after {}s",
+                state.request_timeout_secs
+            );
+            Err(ApiError::Timeout)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::ModbusError;
+    use crate::modbus::actor::ModbusResult;
     use tokio::sync::mpsc;
 
     type MockReceiver = mpsc::Receiver<(
         ParameterOperation,
-        tokio::sync::oneshot::Sender<Result<f32, ModbusError>>,
+        tokio::sync::oneshot::Sender<ModbusResult>,
     )>;
 
     fn create_mock_state() -> (VisibilityState, MockReceiver) {
@@ -125,7 +340,9 @@ mod tests {
         // Receive the read request
         if let Some((ParameterOperation::ReadVisibility(reg), response_tx)) = rx.recv().await {
             assert_eq!(reg, 62500);
-            response_tx.send(Ok(65535.0)).unwrap();
+            response_tx
+                .send(Ok(ModbusResponse::Value(65535.0)))
+                .unwrap();
         }
 
         let result = handle.await.unwrap();
@@ -199,7 +416,7 @@ mod tests {
         if let Some((ParameterOperation::ReadVisibility(reg), response_tx)) = rx.recv().await {
             assert_eq!(reg, 62510);
             // Binary: 0000000000000101 (bits 0 and 2 set)
-            response_tx.send(Ok(5.0)).unwrap();
+            response_tx.send(Ok(ModbusResponse::Value(5.0))).unwrap();
         }
 
         let result = handle.await.unwrap();
@@ -209,5 +426,157 @@ mod tests {
         assert!(json.contains("\"value\": 5"));
         assert!(json.contains("\"hex\": \"0x0005\""));
         assert!(json.contains("\"bits\": \"0000000000000101\""));
+    }
+
+    // Tests for get_all_visibility
+    #[tokio::test]
+    async fn test_get_all_visibility_success() {
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_all_visibility(State(state)).await });
+
+        // Receive the read all visibility request
+        if let Some((ParameterOperation::ReadAllVisibility, response_tx)) = rx.recv().await {
+            // Return 3 sample registers for testing
+            response_tx
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: 62500,
+                    values: vec![65535, 0, 5],
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+        let json = result.unwrap();
+        assert!(json.contains("\"registers\":"));
+        assert!(json.contains("\"count\": 3"));
+        assert!(json.contains("\"register\": 62500"));
+        assert!(json.contains("\"value\": 65535"));
+        assert!(json.contains("\"hex\": \"0xFFFF\""));
+        assert!(json.contains("\"register\": 62501"));
+        assert!(json.contains("\"value\": 0"));
+        assert!(json.contains("\"register\": 62502"));
+        assert!(json.contains("\"value\": 5"));
+    }
+
+    #[tokio::test]
+    async fn test_get_all_visibility_channel_closed() {
+        let (state, rx) = create_mock_state();
+
+        // Drop receiver to simulate actor shutdown
+        drop(rx);
+
+        let result = get_all_visibility(State(state)).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
+    }
+
+    #[tokio::test]
+    async fn test_get_all_visibility_modbus_error() {
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_all_visibility(State(state)).await });
+
+        // Respond with error
+        if let Some((ParameterOperation::ReadAllVisibility, response_tx)) = rx.recv().await {
+            response_tx
+                .send(Err(ModbusError::VisibilityNotScanned))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    // Tests for get_parameter_visibility
+    #[tokio::test]
+    async fn test_get_parameter_visibility_known_visible() {
+        let (state, mut rx) = create_mock_state();
+
+        // Use HEATSYSTEM_ROOM_SETTEMP (61509) which has visibility register 62500, bit 9
+        let handle =
+            tokio::spawn(async move { get_parameter_visibility(State(state), Path(61509)).await });
+
+        // Receive the visibility register read request
+        if let Some((ParameterOperation::ReadVisibility(reg), response_tx)) = rx.recv().await {
+            assert_eq!(reg, 62500); // HEATSYSTEM_ROOM_SETTEMP.visible
+            // Return value with bit 9 set (0x200 = 512)
+            response_tx.send(Ok(ModbusResponse::Value(512.0))).unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+        let json = result.unwrap();
+        assert!(json.contains("\"address\": 61509"));
+        assert!(json.contains("\"visible\": true"));
+        assert!(json.contains("\"visibility_register\": 62500"));
+        assert!(json.contains("\"bit\": 9"));
+        assert!(json.contains("\"description\":"));
+    }
+
+    #[tokio::test]
+    async fn test_get_parameter_visibility_known_not_visible() {
+        let (state, mut rx) = create_mock_state();
+
+        // Use HEATSYSTEM_ROOM_SETTEMP (61509) which has visibility register 62500, bit 9
+        let handle =
+            tokio::spawn(async move { get_parameter_visibility(State(state), Path(61509)).await });
+
+        // Receive the visibility register read request
+        if let Some((ParameterOperation::ReadVisibility(reg), response_tx)) = rx.recv().await {
+            assert_eq!(reg, 62500);
+            // Return value with bit 9 NOT set (bit 8 set instead = 256)
+            response_tx.send(Ok(ModbusResponse::Value(256.0))).unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+        let json = result.unwrap();
+        assert!(json.contains("\"address\": 61509"));
+        assert!(json.contains("\"visible\": false"));
+    }
+
+    #[tokio::test]
+    async fn test_get_parameter_visibility_unknown_parameter() {
+        let (state, _rx) = create_mock_state();
+
+        // Use an address that doesn't exist in the BMS catalog (valid u16)
+        let result = get_parameter_visibility(State(state), Path(64000)).await;
+
+        assert!(result.is_ok());
+        let json = result.unwrap();
+        assert!(json.contains("\"address\": 64000"));
+        assert!(json.contains("\"visible\": null"));
+        assert!(json.contains("\"description\": null"));
+        assert!(json.contains("\"note\": \"Parameter not in BMS catalog"));
+    }
+
+    #[tokio::test]
+    async fn test_get_parameter_visibility_always_visible() {
+        let (state, _rx) = create_mock_state();
+
+        // CTC_ALARM_INFO_COUNT (65001) has visibility register 0 (always visible)
+        let result = get_parameter_visibility(State(state), Path(65001)).await;
+
+        assert!(result.is_ok());
+        let json = result.unwrap();
+        assert!(json.contains("\"address\": 65001"));
+        assert!(json.contains("\"visible\": true"));
+        assert!(json.contains("\"note\": \"Always visible"));
+    }
+
+    #[tokio::test]
+    async fn test_get_parameter_visibility_channel_closed() {
+        let (state, rx) = create_mock_state();
+
+        // Drop receiver to simulate actor shutdown
+        drop(rx);
+
+        // Use a parameter that requires visibility check
+        let result = get_parameter_visibility(State(state), Path(61509)).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
     }
 }

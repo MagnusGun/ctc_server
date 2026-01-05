@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{debug, error};
+use tracing::{error, trace};
 
 use crate::error::ApiError;
-use crate::modbus::{CTCModbusParameter, ModbusSender, ParameterOperation};
+use crate::modbus::{CTCModbusParameter, ModbusResponse, ModbusSender, ParameterOperation};
 
 /// Helper function to read a parameter and return just the value (not JSON)
 ///
@@ -29,9 +29,13 @@ pub async fn read_parameter_value(
 
     // Wait for response on this request's channel with timeout
     match timeout(request_timeout, response_rx).await {
-        Ok(Ok(Ok(value))) => {
-            debug!("{log_context}: {value}");
+        Ok(Ok(Ok(ModbusResponse::Value(value)))) => {
+            trace!("{log_context}: {value}");
             Ok(value)
+        }
+        Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
+            error!("Unexpected RawRegisters response in {log_context}");
+            Err(ApiError::InternalError)
         }
         Ok(Ok(Err(e))) => {
             // Log full error details internally
@@ -81,9 +85,13 @@ pub async fn read_parameter(
 
     // Wait for response on this request's channel with timeout
     match timeout(request_timeout, response_rx).await {
-        Ok(Ok(Ok(value))) => {
-            debug!("{log_context}: {value}");
+        Ok(Ok(Ok(ModbusResponse::Value(value)))) => {
+            trace!("{log_context}: {value}");
             Ok(format!("{{\"{json_key}\": {value}}}\n"))
+        }
+        Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
+            error!("Unexpected RawRegisters response in {log_context}");
+            Err(ApiError::InternalError)
         }
         Ok(Ok(Err(e))) => {
             // Log full error details internally
@@ -125,7 +133,7 @@ pub async fn write_parameter(
     log_context: &str,
     request_timeout: Duration,
 ) -> Result<String, ApiError> {
-    debug!(
+    trace!(
         "{log_context}: write_parameter START - param={:?}, value={}",
         param, value
     );
@@ -133,19 +141,19 @@ pub async fn write_parameter(
     // Create a oneshot channel for this request
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
-    debug!("{log_context}: write_parameter - Sending to actor channel");
+    trace!("{log_context}: write_parameter - Sending to actor channel");
 
     // Send the operation and response channel to the actor
     tx.send((ParameterOperation::Write(param, value), response_tx))
         .await
         .map_err(|_| ApiError::ServiceUnavailable)?;
 
-    debug!("{log_context}: write_parameter - Message sent, awaiting response");
+    trace!("{log_context}: write_parameter - Message sent, awaiting response");
 
     // Wait for response on this request's channel with timeout
     match timeout(request_timeout, response_rx).await {
         Ok(Ok(Ok(_))) => {
-            debug!("{log_context}: write_parameter - Response received: SUCCESS");
+            trace!("{log_context}: write_parameter - Response received: SUCCESS");
             Ok(format!("{{\"{json_key}\": {value}}}\n"))
         }
         Ok(Ok(Err(e))) => {
@@ -172,12 +180,13 @@ pub async fn write_parameter(
 mod tests {
     use super::*;
     use crate::error::ModbusError;
+    use crate::modbus::actor::ModbusResult;
     use crate::modbus::bms_parameters::CTC_ROOM_TEMP;
     use tokio::sync::mpsc;
 
     type MockReceiver = mpsc::Receiver<(
         ParameterOperation,
-        tokio::sync::oneshot::Sender<Result<f32, ModbusError>>,
+        tokio::sync::oneshot::Sender<ModbusResult>,
     )>;
 
     /// Helper to create a mock sender channel for testing
@@ -197,7 +206,7 @@ mod tests {
 
         // Receive the request and respond
         if let Some((ParameterOperation::Read(_), response_tx)) = rx.recv().await {
-            response_tx.send(Ok(22.5)).unwrap();
+            response_tx.send(Ok(ModbusResponse::Value(22.5))).unwrap();
         }
 
         let result = handle.await.unwrap();
@@ -267,7 +276,7 @@ mod tests {
 
         // Receive the request and respond
         if let Some((ParameterOperation::Read(_), response_tx)) = rx.recv().await {
-            response_tx.send(Ok(22.5)).unwrap();
+            response_tx.send(Ok(ModbusResponse::Value(22.5))).unwrap();
         }
 
         let result = handle.await.unwrap();
@@ -345,7 +354,7 @@ mod tests {
         // Receive the request and respond
         if let Some((ParameterOperation::Write(_, value), response_tx)) = rx.recv().await {
             assert!((value - 23.0).abs() < f32::EPSILON);
-            response_tx.send(Ok(value)).unwrap();
+            response_tx.send(Ok(ModbusResponse::Value(value))).unwrap();
         }
 
         let result = handle.await.unwrap();

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use crate::error::ApiError;
-use crate::gpio::GpioController;
 use crate::modbus::bms_parameters::{get_ctc_parameter_by_id, get_custom_ctc_parameter_by_addr};
-use crate::modbus::{ModbusSender, SmartGridMode, read_parameter, write_parameter};
+use crate::modbus::{ModbusSender, read_parameter, write_parameter};
+use crate::smartgrid::{GpioController, SmartGridMode};
 use axum::{
     Router,
     extract::{Query, State},

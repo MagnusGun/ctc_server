@@ -151,16 +151,6 @@ ctc_parameter!(
     6
 );
 ctc_parameter!(
-    HEATSYSTEM_FLOW_NIGHT_REDUCTION,
-    61558,
-    "Heating system 1: Primary flow Night reduction",
-    0.1,
-    Access::RW,
-    60174,
-    62503,
-    10
-);
-ctc_parameter!(
     HEATSYSTEM_OUTDOOR_NIGHT_REDUCTION,
     61562,
     "Heating system 1: Outdoor temp night reduction",
@@ -179,26 +169,6 @@ ctc_parameter!(
     60198,
     62504,
     2
-);
-ctc_parameter!(
-    HEATSYSTEM_HOLIDAY_REDUCTION,
-    61602,
-    "Heating system 1: Holiday reduction",
-    0.1,
-    Access::RW,
-    60306,
-    62506,
-    6
-);
-ctc_parameter!(
-    HEATSYSTEM_FLOW_HOLIDAY_REDUCTION,
-    61606,
-    "Heating system 1: Primary flow Holiday reduction",
-    0.1,
-    Access::RW,
-    60318,
-    62506,
-    10
 );
 ctc_parameter!(
     HEATSYSTEM_FLOW_SETPOINT,
@@ -259,8 +229,119 @@ ctc_parameter!(
     62500,
     8
 );
+ctc_parameter!(
+    CTC_STOP_TEMP_DHW,
+    62001,
+    "Stop temperature DHW",
+    0.1,
+    62531,
+    5
+);
+ctc_parameter!(
+    CTC_DELAY_MIXING_VALVE,
+    62004,
+    "Delay mixing valve",
+    1.0,
+    62531,
+    8
+);
+ctc_parameter!(CTC_SYSTEM_STATUS, 62005, "System status", 1.0, 62531, 9);
+// Radiator water temperature (also measures lower tank temperature)
+ctc_parameter!(CTC_RADIATOR_WATER, 62006, "Radiator water", 0.1, 62531, 10);
+ctc_parameter!(CTC_PRODUCT_TYPE, 62253, "Product type", 1.0, 62547, 1);
 
 // endregion: --- CTC Common Modbus Parameters
+
+// region: --- CTC Hot Water Modbus Parameters
+
+ctc_parameter!(
+    CTC_HOT_WATER_STOP_TEMP,
+    61501,
+    "Manual stop temperature hot water",
+    0.1,
+    Access::RW,
+    60003,
+    62500,
+    1
+);
+ctc_parameter!(
+    CTC_EXTRA_HOT_WATER_TIMER,
+    61503,
+    "Extra hot water timer",
+    0.5,
+    Access::RW,
+    60009,
+    62500,
+    3
+);
+ctc_parameter!(
+    CTC_MAX_TIME_HEATING_HP,
+    61504,
+    "Maximum time heating heat pump",
+    1.0,
+    Access::RW,
+    60012,
+    62500,
+    4
+);
+ctc_parameter!(
+    CTC_MAX_TIME_HOT_WATER,
+    61505,
+    "Maximum time hot water",
+    1.0,
+    Access::RW,
+    60015,
+    62500,
+    5
+);
+ctc_parameter!(
+    CTC_SETPOINT_LOWER_TANK,
+    62274,
+    "Setpoint lower tank",
+    0.1,
+    62548,
+    6
+);
+ctc_parameter!(
+    CTC_ACTUAL_TEMP_DHW,
+    62276,
+    "Actual temperature DHW",
+    0.1,
+    62548,
+    8
+);
+
+// endregion: --- CTC Hot Water Modbus Parameters
+
+// region: --- CTC Immersion Heater Modbus Parameters
+
+ctc_parameter!(
+    CTC_MAX_IMMERSION_HEATER_DHW,
+    61591,
+    "Max immersion heater DHW kW",
+    0.1,
+    Access::RW,
+    60273,
+    62505,
+    11
+);
+
+// endregion: --- CTC Immersion Heater Modbus Parameters
+
+// region: --- CTC Mixing Valve Modbus Parameters
+
+ctc_parameter!(
+    CTC_DELAY_MIXING_VALVE_SETTING,
+    61629,
+    "Delay mixing valve setting",
+    1.0,
+    Access::RW,
+    60387,
+    62508,
+    1
+);
+
+// endregion: --- CTC Mixing Valve Modbus Parameters
 
 // region: --- CTC HeatPump 1 Modbus Parameters
 
@@ -273,16 +354,6 @@ ctc_parameter!(
     60063,
     62501,
     5
-);
-ctc_parameter!(
-    HEATPUMP_MAX_RMP,
-    61572,
-    "Heat pump 1 (A1): Max RPS",
-    0.1,
-    Access::RW,
-    60216,
-    62504,
-    8
 );
 ctc_parameter!(
     HEATPUMP_STATUS,
@@ -373,44 +444,12 @@ ctc_parameter!(
     9
 );
 ctc_parameter!(
-    HEATPUMP_FAN_SPEED,
-    62127,
-    "Heat pump 1 (A1): Fan",
-    0.1,
-    62539,
-    3
-);
-ctc_parameter!(
-    HEATPUMP_DEFROST_TIMER,
-    62137,
-    "Heat pump 1 (A1): Defrost timer",
-    1.0,
-    62539,
-    13
-);
-ctc_parameter!(
-    HEATPUMP_OUTDOOR_TEMP,
-    62147,
-    "Heat pump 1 (A1): Outdoor temp",
-    0.1,
-    62540,
-    7
-);
-ctc_parameter!(
     HEATPUMP_SOFTWARE_VERSION,
     62157,
     "Heat pump 1 (A1): Software version",
     1.0,
     62541,
     1
-);
-ctc_parameter!(
-    HEATPUMP_CURRENT_RPS,
-    62193,
-    "Heat pump 1 (A1): Current RPS",
-    0.1,
-    62543,
-    5
 );
 ctc_parameter!(HEATPUMP_TYPE, 62254, "Heat pump 1 (A1) Type", 1.0, 62547, 2);
 ctc_parameter!(
@@ -424,16 +463,95 @@ ctc_parameter!(
 
 // endregion: --- CTC HeatPump 1 Modbus Parameters
 
-// region: --- CTC Diagnostic Modbus Parameters
+// region: --- CTC Power & Current Modbus Parameters
 
 ctc_parameter!(
-    CTC_DAYS_FILTER_MAINTENANCE,
-    62283,
-    "Days until next filter maintenance",
-    1.0,
-    62548,
-    15
+    CTC_POWER_IMMERSION_HEATER,
+    62168,
+    "Power kW immersion heater",
+    0.1,
+    62541,
+    12
 );
+ctc_parameter!(CTC_CURRENT_L1, 62171, "Current L1", 0.1, 62541, 15);
+ctc_parameter!(CTC_CURRENT_L2, 62172, "Current L2", 0.1, 62542, 0);
+ctc_parameter!(CTC_CURRENT_L3, 62173, "Current L3", 0.1, 62542, 1);
+
+// endregion: --- CTC Power & Current Modbus Parameters
+
+// region: --- CTC Statistics Modbus Parameters
+
+ctc_parameter!(
+    CTC_STAT_TOTAL_OPERATION_LSB,
+    62186,
+    "Total operation hours LSB",
+    1.0,
+    62542,
+    14
+);
+ctc_parameter!(
+    CTC_STAT_IMMERSION_HEATER_KWH,
+    62191,
+    "Immersion heater kWh",
+    1.0,
+    62543,
+    3
+);
+ctc_parameter!(CTC_FUNCTION_TEST, 62192, "Function test", 1.0, 62543, 4);
+ctc_parameter!(
+    CTC_COMPRESSOR_OPERATION_TIME_LSB,
+    62214,
+    "Compressor 1 operating time LSB",
+    1.0,
+    62544,
+    10
+);
+ctc_parameter!(
+    CTC_COMPRESSOR_LAST_24H,
+    62234,
+    "Compressor 1 last 24h",
+    1.0,
+    62545,
+    14
+);
+
+// endregion: --- CTC Statistics Modbus Parameters
+
+// region: --- CTC System Info Modbus Parameters
+
+ctc_parameter!(
+    CTC_SOFTWARE_VERSION_MONTH_DAY,
+    62244,
+    "Software version display month day",
+    1.0,
+    62546,
+    8
+);
+ctc_parameter!(
+    CTC_SOFTWARE_VERSION_YEAR,
+    62245,
+    "Software version display year",
+    1.0,
+    62546,
+    9
+);
+
+// endregion: --- CTC System Info Modbus Parameters
+
+/// Alarm/info count register (always visible)
+/// Lower byte = alarm count, Upper byte = info count
+pub const CTC_ALARM_INFO_COUNT: CTCModbusParameter = CTCModbusParameter {
+    id: 65001,
+    signed: false,
+    access: Access::R,
+    reg_max: None,
+    reg_min: None,
+    reg_step: None,
+    visible: 0, // Always visible (no visibility register)
+    bit: 0,
+    factor: 1.0,
+    description: "Active alarm and info count",
+};
 
 /// Transfer alarm/info reference into text buffer (write-only)
 /// Values 0-9999: Alarm number (0 = Alarm number 0)
@@ -467,11 +585,8 @@ fn all_ctc_parameters() -> &'static [&'static CTCModbusParameter] {
                 &HEATSYSTEM_HEAT_OFF_TEMP,
                 &HEATSYSTEM_HEAT_OFF_TIME,
                 &HEATSYSTEM_ROOM_TEMP_NIGHT_REDUCTION,
-                &HEATSYSTEM_FLOW_NIGHT_REDUCTION,
                 &HEATSYSTEM_OUTDOOR_NIGHT_REDUCTION,
                 &HEATSYSTEM_ALARM_LOW_ROOM_TEMP,
-                &HEATSYSTEM_HOLIDAY_REDUCTION,
-                &HEATSYSTEM_FLOW_HOLIDAY_REDUCTION,
                 &HEATSYSTEM_FLOW_SETPOINT,
                 &HEATSYSTEM_FLOW_TEMP,
                 &HEATSYSTEM_STATUS,
@@ -481,9 +596,24 @@ fn all_ctc_parameters() -> &'static [&'static CTCModbusParameter] {
                 &CTC_ROOM_TEMP,
                 &CTC_OUTDOOR_TEMP,
                 &CTC_VACCATION_DAYS,
+                &CTC_STOP_TEMP_DHW,
+                &CTC_DELAY_MIXING_VALVE,
+                &CTC_SYSTEM_STATUS,
+                &CTC_RADIATOR_WATER,
+                &CTC_PRODUCT_TYPE,
+                // Hot water parameters
+                &CTC_HOT_WATER_STOP_TEMP,
+                &CTC_EXTRA_HOT_WATER_TIMER,
+                &CTC_MAX_TIME_HEATING_HP,
+                &CTC_MAX_TIME_HOT_WATER,
+                &CTC_SETPOINT_LOWER_TANK,
+                &CTC_ACTUAL_TEMP_DHW,
+                // Immersion heater parameters
+                &CTC_MAX_IMMERSION_HEATER_DHW,
+                // Mixing valve parameters
+                &CTC_DELAY_MIXING_VALVE_SETTING,
                 // Heat Pump parameters
                 &HEATPUMP_BLOCKED,
-                &HEATPUMP_MAX_RMP,
                 &HEATPUMP_STATUS,
                 &HEATPUMP_INLET_TEMP,
                 &HEATPUMP_OUTLET_TEMP,
@@ -495,16 +625,25 @@ fn all_ctc_parameters() -> &'static [&'static CTCModbusParameter] {
                 &HEATPUMP_BRINE_OUTLET_TEMP,
                 &HEATPUMP_CHARGE_PUMP,
                 &HEATPUMP_BRINE_PUMP,
-                &HEATPUMP_FAN_SPEED,
-                &HEATPUMP_DEFROST_TIMER,
-                &HEATPUMP_OUTDOOR_TEMP,
                 &HEATPUMP_SOFTWARE_VERSION,
-                &HEATPUMP_CURRENT_RPS,
                 &HEATPUMP_TYPE,
                 &HEATPUMP_COMPRESSOR_MODEL,
-                // Diagnostic parameters
-                &CTC_DAYS_FILTER_MAINTENANCE,
-                // Text buffer parameters
+                // Power & current parameters
+                &CTC_POWER_IMMERSION_HEATER,
+                &CTC_CURRENT_L1,
+                &CTC_CURRENT_L2,
+                &CTC_CURRENT_L3,
+                // Statistics parameters
+                &CTC_STAT_TOTAL_OPERATION_LSB,
+                &CTC_STAT_IMMERSION_HEATER_KWH,
+                &CTC_FUNCTION_TEST,
+                &CTC_COMPRESSOR_OPERATION_TIME_LSB,
+                &CTC_COMPRESSOR_LAST_24H,
+                // System info parameters
+                &CTC_SOFTWARE_VERSION_MONTH_DAY,
+                &CTC_SOFTWARE_VERSION_YEAR,
+                // Alarm/info parameters
+                &CTC_ALARM_INFO_COUNT,
                 &CTC_ALARM_INFO_BUFFER,
             ]
         })
