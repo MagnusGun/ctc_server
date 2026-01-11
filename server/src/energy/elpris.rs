@@ -61,10 +61,7 @@ impl ElprisClient {
     }
 
     /// Get prices for a specific date
-    pub async fn get_prices(
-        &self,
-        date: DateTime<Utc>,
-    ) -> Result<Vec<ElprisEntry>, ElprisError> {
+    pub async fn get_prices(&self, date: DateTime<Utc>) -> Result<Vec<ElprisEntry>, ElprisError> {
         let url = format!(
             "{}/{}/{:02}-{:02}_{}.json",
             self.base_url,
@@ -88,10 +85,7 @@ impl ElprisClient {
             let status = response.status();
             if status.as_u16() == 404 {
                 // Prices not available yet (common for tomorrow before 13:00)
-                trace!(
-                    "Prices not available for {} (404)",
-                    date.format("%Y-%m-%d")
-                );
+                trace!("Prices not available for {} (404)", date.format("%Y-%m-%d"));
                 return Err(ElprisError::NotAvailable);
             }
             error!("HTTP error {} fetching prices", status);

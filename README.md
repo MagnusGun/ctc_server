@@ -5,6 +5,7 @@
 
 ## Features
 - **Web Dashboard**: Real-time status page with temperatures, heat pump data, power consumption, and alarms.
+- **Heat Pump Statistics**: Compressor cycle tracking with min/max/avg times, starts per window, operating hours, and temperature correlation charts.
 - **Tibber Integration**: Real-time energy consumption tracking via WebSocket with monthly peak averaging.
 - Retrieve and set room temperature setpoints.
 - Monitor outdoor, flow, and return temperatures.
@@ -31,6 +32,10 @@ ctc_server/
 │   │   │   ├── price.rs      # Price state with dual-source comparison
 │   │   │   ├── tariff.rs     # Swedish electricity tariff schedule
 │   │   │   ├── tibber.rs     # Tibber WebSocket client for real-time data
+│   │   ├── heatpump/         # Heat pump statistics tracking
+│   │   │   ├── mod.rs        # Module exports
+│   │   │   ├── poller.rs     # Background polling for compressor status
+│   │   │   ├── stats.rs      # Cycle statistics and history tracking
 │   │   ├── messages/         # Alarm and info message handling
 │   │   │   ├── mod.rs        # Module exports
 │   │   │   ├── translations.rs # Swedish/English alarm translations
@@ -45,6 +50,7 @@ ctc_server/
 │   │   │   ├── alarms.rs     # Alarm and info message endpoints
 │   │   │   ├── ctc.rs        # Generic CTC and powersave endpoints
 │   │   │   ├── grid.rs       # Grid status and Tibber integration endpoints
+│   │   │   ├── heatpump_stats.rs # Heat pump statistics endpoints
 │   │   │   ├── smartgrid.rs  # SmartGrid GPIO control endpoints
 │   │   │   ├── temperatures.rs # Temperature endpoints
 │   │   │   ├── visibility.rs # Parameter visibility endpoints
@@ -96,6 +102,10 @@ ctc_server/
 ### Grid Routes (Tibber Integration)
 - `GET /api/v1/grid`: Get grid status including tariff, current hour consumption, and monthly peak data.
 - `GET /api/v1/grid/tariff`: Get current tariff mode only (lightweight polling).
+
+### Heat Pump Statistics Routes
+- `GET /api/v1/heatpump/stats`: Get current compressor statistics (cycle times, starts per window, operating hours).
+- `GET /api/v1/heatpump/stats/history?days=N`: Get historical data for charts (default: 30 days, max: 365).
 
 ### Price Routes (Spot Prices)
 - `GET /api/v1/prices`: Get all electricity prices (today + tomorrow if available after ~13:00 CET).
@@ -294,6 +304,7 @@ The server includes a real-time web dashboard accessible at `http://localhost:30
 ### Features
 - **Temperature Monitoring**: Room, outdoor, DHW, and radiator water temperatures
 - **Heat Pump Status**: Compressor state, HP in/out temps, pressures, brine circuit
+- **Heat Pump Statistics**: Cycle times (min/max/avg), compressor starts per window, operating hours per window
 - **Pump Status**: Charge pump and brine pump percentages with progress bars
 - **Power Consumption**: Total power and per-phase current readings
 - **System Status**: SmartGrid mode and powersave status in header
@@ -301,6 +312,7 @@ The server includes a real-time web dashboard accessible at `http://localhost:30
 
 ### Interactive Controls
 - **Powersave Toggle**: Click the powersave badge in the header to enable/disable power saving mode (with confirmation dialog)
+- **Statistics Charts**: Click the Heat Pump Statistics panel to view charts (cycles, hours/day, starts/day, temperature correlations)
 - Auto-refreshes every 5 seconds
 - Responsive design for desktop and mobile
 
@@ -334,6 +346,8 @@ All settings can be overridden with environment variables using the `CTC_` prefi
 | `CTC_TIBBER_API_TOKEN` | Tibber API token (from developer.tibber.com) | - |
 | `CTC_PRICE_ENABLED` | Enable spot price tracking | `true` |
 | `CTC_PRICE_FETCH_INTERVAL_MINS` | Price fetch interval in minutes | `15` |
+| `CTC_HEATPUMP_STATS_ENABLED` | Enable heat pump statistics tracking | `true` |
+| `CTC_HEATPUMP_STATS_POLL_INTERVAL_SECS` | Compressor status polling interval in seconds | `10` |
 
 ### Energy Integration
 

@@ -14,7 +14,7 @@ use tokio_modbus::client::Writer;
 use tokio_modbus::prelude::{Reader, Slave, rtu};
 use tokio_serial::SerialPortBuilderExt;
 use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Response types for Modbus operations
 #[derive(Debug, Clone)]
@@ -37,6 +37,7 @@ const VISIBILITY_REG_END: u16 = 62548;
 /// Number of visibility registers to read
 const VISIBILITY_REG_COUNT: usize = (VISIBILITY_REG_END - VISIBILITY_REG_START + 1) as usize; // 49
 
+#[derive(Debug)]
 pub enum ParameterOperation {
     Read(CTCModbusParameter),
     // ReadVector(&Vec<'static CTCModbusParameter>),
@@ -672,17 +673,15 @@ impl CtcActor {
                 );
                 respond_to
                     .send(Ok(ModbusResponse::Value(value)))
-                    .unwrap_or_else(|e| {
-                        error!(
-                        "ctc_actor::run: CRITICAL - Failed to send read response on oneshot channel: {e:?}"
-                    );
+                    .unwrap_or_else(|_| {
+                        debug!("ctc_actor::run: Client disconnected before response sent");
                     });
                 trace!("ctc_actor::run: Read response sent");
             }
             Err(e) => {
                 error!("ctc_actor::run: Read FAILED: {}", e);
-                respond_to.send(Err(e)).unwrap_or_else(|e| {
-                    error!("ctc_actor::run: CRITICAL - Failed to send read error response: {e:?}");
+                respond_to.send(Err(e)).unwrap_or_else(|_| {
+                    debug!("ctc_actor::run: Client disconnected before error response sent");
                 });
                 trace!("ctc_actor::run: Read error response sent");
             }
@@ -729,8 +728,8 @@ impl CtcActor {
             );
             respond_to
                 .send(Ok(ModbusResponse::Value(value)))
-                .unwrap_or_else(|e| {
-                    error!("ctc_actor::run: CRITICAL - Failed to send visibility response: {e:?}");
+                .unwrap_or_else(|_| {
+                    debug!("ctc_actor::run: Client disconnected before visibility response sent");
                 });
         } else {
             // Should never happen since we just scanned
@@ -766,9 +765,9 @@ impl CtcActor {
                     start: VISIBILITY_REG_START,
                     values: cache.to_vec(),
                 }))
-                .unwrap_or_else(|e| {
-                    error!(
-                        "ctc_actor::run: CRITICAL - Failed to send all visibility response: {e:?}"
+                .unwrap_or_else(|_| {
+                    debug!(
+                        "ctc_actor::run: Client disconnected before all visibility response sent"
                     );
                 });
         } else {
@@ -830,9 +829,9 @@ impl CtcActor {
                     trace!("ctc_actor::run: Write-only register, skipping verification");
                     respond_to
                         .send(Ok(ModbusResponse::Value(value)))
-                        .unwrap_or_else(|e| {
-                            error!(
-                                "ctc_actor::run: CRITICAL - Failed to send success response: {e:?}"
+                        .unwrap_or_else(|_| {
+                            debug!(
+                                "ctc_actor::run: Client disconnected before write response sent"
                             );
                         });
                     trace!("ctc_actor::run: Write operation COMPLETE (no verification)");
@@ -851,10 +850,8 @@ impl CtcActor {
                             trace!("ctc_actor::run: Read-back MATCHES, sending success response");
                             respond_to
                                 .send(Ok(ModbusResponse::Value(value)))
-                                .unwrap_or_else(|e| {
-                                    error!(
-                                    "ctc_actor::run: CRITICAL - Failed to send success response: {e:?}"
-                                );
+                                .unwrap_or_else(|_| {
+                                    debug!("ctc_actor::run: Client disconnected before write success response sent");
                                 });
                             trace!("ctc_actor::run: Write operation COMPLETE");
                         } else {
@@ -868,19 +865,17 @@ impl CtcActor {
                                     actual: return_value,
                                     register: param.id,
                                 }))
-                                .unwrap_or_else(|e| {
-                                    error!(
-                                        "ctc_actor::run: CRITICAL - Failed to send mismatch error: {e:?}"
-                                    );
+                                .unwrap_or_else(|_| {
+                                    debug!("ctc_actor::run: Client disconnected before mismatch error sent");
                                 });
                             trace!("ctc_actor::run: Write operation FAILED (mismatch)");
                         }
                     }
                     Err(e) => {
                         error!("ctc_actor::run: Read-back FAILED: {}", e);
-                        respond_to.send(Err(e)).unwrap_or_else(|e| {
-                            error!(
-                                "ctc_actor::run: CRITICAL - Failed to send read-back error: {e:?}"
+                        respond_to.send(Err(e)).unwrap_or_else(|_| {
+                            debug!(
+                                "ctc_actor::run: Client disconnected before read-back error sent"
                             );
                         });
                         trace!("ctc_actor::run: Write operation FAILED (read-back error)");
@@ -889,8 +884,8 @@ impl CtcActor {
             }
             Err(e) => {
                 error!("ctc_actor::run: Write FAILED: {}", e);
-                respond_to.send(Err(e)).unwrap_or_else(|e| {
-                    error!("ctc_actor::run: CRITICAL - Failed to send write error response: {e:?}");
+                respond_to.send(Err(e)).unwrap_or_else(|_| {
+                    debug!("ctc_actor::run: Client disconnected before write error sent");
                 });
                 trace!("ctc_actor::run: Write error response sent");
             }
@@ -937,16 +932,16 @@ impl CtcActor {
                 );
                 respond_to
                     .send(Ok(ModbusResponse::RawRegisters { start, values }))
-                    .unwrap_or_else(|e| {
-                        error!(
-                            "ctc_actor::run: CRITICAL - Failed to send raw registers response: {e:?}"
+                    .unwrap_or_else(|_| {
+                        debug!(
+                            "ctc_actor::run: Client disconnected before raw registers response sent"
                         );
                     });
             }
             Err(e) => {
                 error!("ctc_actor::run: Read raw registers FAILED: {}", e);
-                respond_to.send(Err(e)).unwrap_or_else(|e| {
-                    error!("ctc_actor::run: CRITICAL - Failed to send raw registers error: {e:?}");
+                respond_to.send(Err(e)).unwrap_or_else(|_| {
+                    debug!("ctc_actor::run: Client disconnected before raw registers error sent");
                 });
             }
         }
@@ -993,16 +988,16 @@ impl CtcActor {
                 );
                 respond_to
                     .send(Ok(ModbusResponse::Value(f32::from(value))))
-                    .unwrap_or_else(|e| {
-                        error!(
-                            "ctc_actor::run: CRITICAL - Failed to send raw write response: {e:?}"
+                    .unwrap_or_else(|_| {
+                        debug!(
+                            "ctc_actor::run: Client disconnected before raw write response sent"
                         );
                     });
             }
             Err(e) => {
                 error!("ctc_actor::run: Write raw register FAILED: {}", e);
-                respond_to.send(Err(e)).unwrap_or_else(|e| {
-                    error!("ctc_actor::run: CRITICAL - Failed to send raw write error: {e:?}");
+                respond_to.send(Err(e)).unwrap_or_else(|_| {
+                    debug!("ctc_actor::run: Client disconnected before raw write error sent");
                 });
             }
         }
@@ -1015,6 +1010,11 @@ impl CtcActor {
         loop {
             tokio::select! {
                 Some((operation, respond_to)) = self.receiver.recv() => {
+                    // Skip if client already disconnected (e.g., browser refresh)
+                    if respond_to.is_closed() {
+                        debug!("ctc_actor::run: Skipping {:?} - client disconnected", operation);
+                        continue;
+                    }
                     match operation {
                         ParameterOperation::Read(param) => {
                             self.handle_read_operation(&param, respond_to).await;

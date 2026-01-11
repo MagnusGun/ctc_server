@@ -164,16 +164,20 @@ impl PriceState {
         }
 
         // Fall back to tomorrow's prices (after midnight before new fetch)
-        inner.tomorrow.iter().find(|p| {
-            if let (Ok(start), Ok(end)) = (
-                chrono::DateTime::parse_from_rfc3339(&p.starts_at),
-                chrono::DateTime::parse_from_rfc3339(&p.ends_at),
-            ) {
-                now >= start && now < end
-            } else {
-                false
-            }
-        }).cloned()
+        inner
+            .tomorrow
+            .iter()
+            .find(|p| {
+                if let (Ok(start), Ok(end)) = (
+                    chrono::DateTime::parse_from_rfc3339(&p.starts_at),
+                    chrono::DateTime::parse_from_rfc3339(&p.ends_at),
+                ) {
+                    now >= start && now < end
+                } else {
+                    false
+                }
+            })
+            .cloned()
     }
 
     /// Get today's prices
@@ -239,8 +243,7 @@ impl PriceState {
             .iter()
             .chain(inner.tomorrow.iter())
             .filter(|p| {
-                chrono::DateTime::parse_from_rfc3339(&p.starts_at)
-                    .is_ok_and(|start| start > now)
+                chrono::DateTime::parse_from_rfc3339(&p.starts_at).is_ok_and(|start| start > now)
             })
             .cloned()
             .collect();
@@ -446,10 +449,7 @@ mod tests {
     use super::*;
 
     fn assert_float_eq(a: f64, b: f64, msg: &str) {
-        assert!(
-            (a - b).abs() < 0.0001,
-            "{msg}: expected {b}, got {a}"
-        );
+        assert!((a - b).abs() < 0.0001, "{msg}: expected {b}, got {a}");
     }
 
     #[test]

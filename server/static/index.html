@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CTC EcoHeat 410 Status</title>
     <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
     <header>
@@ -145,6 +146,120 @@
                 </div>
             </div>
         </section>
+
+        <!-- Heat Pump Statistics -->
+        <section class="heatpump-section">
+            <div class="card panel-card wide clickable" id="heatpump-stats-panel"
+                 data-tooltip="Click to view statistics charts" role="button" tabindex="0">
+                <div class="panel-header">
+                    <h2>Heat Pump Statistics</h2>
+                    <div class="tracking-info" id="hp-tracking-info">
+                        <span class="tracking-badge">Tracking: --</span>
+                    </div>
+                </div>
+                <div class="hp-stats-grid">
+                    <!-- Cycle Statistics -->
+                    <div class="stats-section">
+                        <h3>Cycle Times</h3>
+                        <div class="cycle-stats">
+                            <div class="cycle-stat" data-tooltip="Shortest compressor run time">
+                                <span class="cycle-label">Min</span>
+                                <span class="cycle-value" id="cycle-min">--:--</span>
+                            </div>
+                            <div class="cycle-stat" data-tooltip="Longest compressor run time">
+                                <span class="cycle-label">Max</span>
+                                <span class="cycle-value" id="cycle-max">--:--</span>
+                            </div>
+                            <div class="cycle-stat" data-tooltip="Average compressor run time">
+                                <span class="cycle-label">Avg</span>
+                                <span class="cycle-value" id="cycle-avg">--:--</span>
+                            </div>
+                            <div class="cycle-stat" data-tooltip="Total completed cycles since tracking started">
+                                <span class="cycle-label">Count</span>
+                                <span class="cycle-value" id="cycle-count">--</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Starts per Window -->
+                    <div class="stats-section">
+                        <h3>Compressor Starts</h3>
+                        <div class="starts-grid">
+                            <div class="starts-item">
+                                <span class="starts-label">This Hour</span>
+                                <span class="starts-value" id="starts-hour">--</span>
+                            </div>
+                            <div class="starts-item">
+                                <span class="starts-label">Today</span>
+                                <span class="starts-value" id="starts-day">--</span>
+                            </div>
+                            <div class="starts-item">
+                                <span class="starts-label">This Week</span>
+                                <span class="starts-value" id="starts-week">--</span>
+                            </div>
+                            <div class="starts-item">
+                                <span class="starts-label">This Month</span>
+                                <span class="starts-value" id="starts-month">--</span>
+                            </div>
+                            <div class="starts-item">
+                                <span class="starts-label">This Year</span>
+                                <span class="starts-value" id="starts-year">--</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Operating Hours -->
+                    <div class="stats-section">
+                        <h3>Operating Hours</h3>
+                        <div class="ophours-grid">
+                            <div class="ophours-item">
+                                <span class="ophours-label">This Hour</span>
+                                <span class="ophours-value" id="ophours-hour">-- min</span>
+                            </div>
+                            <div class="ophours-item">
+                                <span class="ophours-label">Today</span>
+                                <span class="ophours-value" id="ophours-day">-- h</span>
+                            </div>
+                            <div class="ophours-item">
+                                <span class="ophours-label">This Week</span>
+                                <span class="ophours-value" id="ophours-week">-- h</span>
+                            </div>
+                            <div class="ophours-item">
+                                <span class="ophours-label">This Month</span>
+                                <span class="ophours-value" id="ophours-month">-- h</span>
+                            </div>
+                            <div class="ophours-item">
+                                <span class="ophours-label">This Year</span>
+                                <span class="ophours-value" id="ophours-year">-- h</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Heat Pump Stats Modal -->
+        <div class="stats-modal" id="stats-modal" style="display: none;">
+            <div class="stats-modal-content">
+                <div class="stats-modal-header">
+                    <h2>Heat Pump Statistics Charts</h2>
+                    <button class="modal-close" id="stats-modal-close">&times;</button>
+                </div>
+                <div class="stats-modal-tabs">
+                    <button class="tab-btn active" data-chart="cycles">Cycles</button>
+                    <button class="tab-btn" data-chart="hours">Hours/Day</button>
+                    <button class="tab-btn" data-chart="starts">Starts/Day</button>
+                    <button class="tab-btn" data-chart="cycle-temp">Cycle vs Temp</button>
+                    <button class="tab-btn" data-chart="hours-temp">Hours vs Temp</button>
+                </div>
+                <div class="stats-modal-body">
+                    <div class="chart-empty" id="chart-empty">
+                        No data available yet. Statistics will appear after compressor cycles complete.
+                    </div>
+                    <canvas id="stats-chart"></canvas>
+                </div>
+            </div>
+        </div>
 
         <!-- Energy & Prices (merged Grid + Prices) -->
         <section class="info-row">

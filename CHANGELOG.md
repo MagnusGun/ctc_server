@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-01-11
+
+### Added
+- **Heat Pump Statistics Module** (`heatpump/`): Compressor cycle tracking and analysis
+  - `heatpump/stats.rs`: Tracks cycle times (min/max/avg), starts per window (hour/day/week/month/year), operating hours per window, outdoor temperature correlation
+  - `heatpump/poller.rs`: Background polling loop reading heat pump status register
+  - Configurable via `heatpump_stats.enabled` and `heatpump_stats.poll_interval_secs`
+- **Heat Pump Stats API**: New endpoints for statistics and historical data
+  - `GET /api/v1/heatpump/stats`: Current statistics summary with cycle times, starts, operating hours
+  - `GET /api/v1/heatpump/stats/history?days=N`: Historical data for charts (default 30 days, max 365)
+- **Dashboard Heat Pump Statistics Panel**: Interactive statistics display
+  - Cycle times (min/max/avg) with duration formatting
+  - Compressor starts per time window (hour/day/week/month/year)
+  - Operating hours per time window
+  - Click to open modal with Chart.js visualizations
+- **Statistics Charts Modal**: Five chart types for analysis
+  - Cycles: Bar chart of cycle durations over time
+  - Hours/Day: Daily operating hours
+  - Starts/Day: Daily compressor starts
+  - Cycle vs Temp: Scatter plot correlating cycle duration with outdoor temperature
+  - Hours vs Temp: Scatter plot correlating daily hours with average temperature
+- Chart.js integration (loaded from CDN) for dashboard charts
+
+### Changed
+- Modbus actor: Exposed raw register reading via `ParameterOperation::ReadRaw` for heat pump status polling
+- Configuration: Added `HeatPumpStatsConfig` struct with `enabled` (default: true) and `poll_interval_secs` (default: 10)
+
 ## [0.2.1] - 2026-01-11
 
 ### Fixed

@@ -146,7 +146,7 @@ impl GridState {
             let lowest = inner
                 .daily_peaks
                 .iter()
-                .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
+                .min_by(|a, b| a.1.1.partial_cmp(&b.1.1).unwrap())
                 .map(|(date, (_, kwh))| (*date, *kwh));
 
             if let Some((lowest_date, lowest_kwh)) = lowest {
@@ -403,7 +403,13 @@ impl GridState {
     /// Get the last 24 hours of 15-minute consumption data
     #[must_use]
     pub fn get_consumption_15min(&self) -> Vec<ConsumptionEntry> {
-        self.inner.lock().unwrap().consumption_15min.iter().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .consumption_15min
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Get the number of 15-minute entries recorded
@@ -674,7 +680,7 @@ mod tests {
             let lowest = inner
                 .daily_peaks
                 .iter()
-                .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
+                .min_by(|a, b| a.1.1.partial_cmp(&b.1.1).unwrap())
                 .map(|(date, _)| *date);
 
             if let Some(lowest_date) = lowest {

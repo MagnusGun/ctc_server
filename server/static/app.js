@@ -77,6 +77,13 @@ const chartState = {
     priceRange: null
 };
 
+// Heat pump stats state
+const hpStatsState = {
+    chart: null,
+    currentChartType: 'cycles',
+    historyData: null
+};
+
 // Initialize element references
 function initElements() {
     const ids = [
@@ -91,7 +98,13 @@ function initElements() {
         // Price elements
         'price-time', 'price-spot', 'price-level', 'price-spot-detail',
         'price-tibber-total', 'price-markup', 'tibber-section',
-        'price-min', 'price-max', 'price-avg', 'price-chart', 'chart-tooltip'
+        'price-min', 'price-max', 'price-avg', 'price-chart', 'chart-tooltip',
+        // Heat pump stats elements
+        'heatpump-stats-panel', 'hp-tracking-info',
+        'cycle-min', 'cycle-max', 'cycle-avg', 'cycle-count',
+        'starts-hour', 'starts-day', 'starts-week', 'starts-month', 'starts-year',
+        'ophours-hour', 'ophours-day', 'ophours-week', 'ophours-month', 'ophours-year',
+        'stats-modal', 'stats-modal-close', 'stats-chart', 'chart-empty'
     ];
     ids.forEach(id => {
         elements[id] = document.getElementById(id);
@@ -114,6 +127,18 @@ function formatPressure(value) {
 function formatPercent(value) {
     if (value === null || value === undefined || isNaN(value)) return '--%';
     return `${Math.round(value)}%`;
+}
+
+// Format duration in seconds as MM:SS or HH:MM:SS
+function formatDuration(secs) {
+    if (secs === null || secs === undefined || isNaN(secs)) return '--:--';
+    const hours = Math.floor(secs / 3600);
+    const mins = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    if (hours > 0) {
+        return `${hours}:${mins.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+    return `${mins}:${s.toString().padStart(2, '0')}`;
 }
 
 // Fetch JSON from API
@@ -786,6 +811,306 @@ async function updatePrices() {
     }
 }
 
+// Fetch and update heat pump statistics
+async function updateHeatPumpStats() {
+    try {
+        const data = await fetchJson(`${API_BASE}/heatpump/stats`);
+
+        // Cycle statistics
+        if (data.cycle_stats) {
+            const el = (id) => elements[id];
+            el('cycle-min').textContent = formatDuration(data.cycle_stats.min_secs);
+            el('cycle-max').textContent = formatDuration(data.cycle_stats.max_secs);
+            el('cycle-avg').textContent = formatDuration(Math.round(data.cycle_stats.avg_secs));
+            el('cycle-count').textContent = data.cycle_stats.cycle_count;
+        } else {
+            elements['cycle-min'].textContent = '--:--';
+            elements['cycle-max'].textContent = '--:--';
+            elements['cycle-avg'].textContent = '--:--';
+            elements['cycle-count'].textContent = '0';
+        }
+
+        // Starts per window
+        if (data.starts) {
+            elements['starts-hour'].textContent = data.starts.this_hour;
+            elements['starts-day'].textContent = data.starts.this_day;
+            elements['starts-week'].textContent = data.starts.this_week;
+            elements['starts-month'].textContent = data.starts.this_month;
+            elements['starts-year'].textContent = data.starts.this_year;
+        }
+
+        // Operating hours per window
+        if (data.operating_hours) {
+            const oh = data.operating_hours;
+            elements['ophours-hour'].textContent = `${(oh.this_hour * 60).toFixed(0)} min`;
+            elements['ophours-day'].textContent = `${oh.this_day.toFixed(1)} h`;
+            elements['ophours-week'].textContent = `${oh.this_week.toFixed(1)} h`;
+            elements['ophours-month'].textContent = `${oh.this_month.toFixed(1)} h`;
+            elements['ophours-year'].textContent = `${oh.this_year.toFixed(1)} h`;
+        }
+
+        // Tracking info
+        if (data.tracking) {
+            const trackingEl = elements['hp-tracking-info'];
+            if (trackingEl) {
+                const badge = trackingEl.querySelector('.tracking-badge');
+                if (badge) {
+                    const hours = data.tracking.tracking_hours.toFixed(1);
+                    badge.textContent = `Tracking: ${hours}h | ${data.tracking.total_starts} starts`;
+                }
+            }
+        }
+    } catch (err) {
+        console.error('Error fetching heat pump stats:', err);
+    }
+}
+
+// Show heat pump stats modal with charts
+async function showStatsModal() {
+    const modal = elements['stats-modal'];
+    if (!modal) return;
+
+    modal.style.display = 'flex';
+
+    // Fetch history data
+    try {
+        hpStatsState.historyData = await fetchJson(`${API_BASE}/heatpump/stats/history?days=30`);
+        renderStatsChart(hpStatsState.currentChartType);
+    } catch (err) {
+        console.error('Error fetching stats history:', err);
+    }
+}
+
+// Hide stats modal
+function hideStatsModal() {
+    const modal = elements['stats-modal'];
+    if (modal) {
+        modal.style.display = 'none';
+    }
+    if (hpStatsState.chart) {
+        hpStatsState.chart.destroy();
+        hpStatsState.chart = null;
+    }
+}
+
+// Render stats chart based on type
+function renderStatsChart(chartType) {
+    const canvas = elements['stats-chart'];
+    const emptyState = elements['chart-empty'];
+    if (!canvas || !hpStatsState.historyData) return;
+
+    // Destroy existing chart
+    if (hpStatsState.chart) {
+        hpStatsState.chart.destroy();
+        hpStatsState.chart = null;
+    }
+
+    const data = hpStatsState.historyData;
+    let chartConfig;
+    let hasData = false;
+
+    switch (chartType) {
+        case 'cycles':
+            hasData = data.cycles && data.cycles.length > 0;
+            if (hasData) chartConfig = buildCyclesChart(data.cycles);
+            break;
+        case 'hours':
+            hasData = data.daily && data.daily.length > 0;
+            if (hasData) chartConfig = buildDailyHoursChart(data.daily);
+            break;
+        case 'starts':
+            hasData = data.daily && data.daily.length > 0;
+            if (hasData) chartConfig = buildDailyStartsChart(data.daily);
+            break;
+        case 'cycle-temp':
+            hasData = data.cycles && data.cycles.some(c => c.outdoor_temp_c !== null);
+            if (hasData) chartConfig = buildCycleTempChart(data.cycles);
+            break;
+        case 'hours-temp':
+            hasData = data.daily && data.daily.some(d => d.avg_outdoor_temp_c !== null);
+            if (hasData) chartConfig = buildHoursTempChart(data.daily);
+            break;
+        default:
+            hasData = data.cycles && data.cycles.length > 0;
+            if (hasData) chartConfig = buildCyclesChart(data.cycles);
+    }
+
+    // Show/hide empty state
+    if (emptyState) {
+        emptyState.style.display = hasData ? 'none' : 'flex';
+    }
+    canvas.style.display = hasData ? 'block' : 'none';
+
+    if (hasData && chartConfig) {
+        hpStatsState.chart = new Chart(canvas, chartConfig);
+    }
+
+    hpStatsState.currentChartType = chartType;
+}
+
+// Build cycles bar chart (cycle durations over time)
+function buildCyclesChart(cycles) {
+    const labels = cycles.map(c => {
+        const d = new Date(c.timestamp);
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    });
+    const durations = cycles.map(c => c.duration_secs / 60); // Convert to minutes
+
+    return {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: 'Cycle Duration (min)',
+                data: durations,
+                backgroundColor: 'rgba(59, 130, 246, 0.7)',
+                borderColor: 'rgba(59, 130, 246, 1)',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: { display: true, text: 'Recent Cycle Durations', color: '#fff' },
+                legend: { labels: { color: '#fff' } }
+            },
+            scales: {
+                x: { ticks: { color: '#888', maxRotation: 45 }, grid: { color: 'rgba(255,255,255,0.1)' } },
+                y: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Minutes', color: '#888' } }
+            }
+        }
+    };
+}
+
+// Build daily operating hours bar chart
+function buildDailyHoursChart(daily) {
+    const labels = daily.map(d => d.date.slice(5)); // MM-DD
+    const hours = daily.map(d => d.operating_hours);
+
+    return {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: 'Operating Hours',
+                data: hours,
+                backgroundColor: 'rgba(34, 197, 94, 0.7)',
+                borderColor: 'rgba(34, 197, 94, 1)',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: { display: true, text: 'Daily Operating Hours', color: '#fff' },
+                legend: { labels: { color: '#fff' } }
+            },
+            scales: {
+                x: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' } },
+                y: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Hours', color: '#888' } }
+            }
+        }
+    };
+}
+
+// Build daily starts bar chart
+function buildDailyStartsChart(daily) {
+    const labels = daily.map(d => d.date.slice(5)); // MM-DD
+    const starts = daily.map(d => d.starts);
+
+    return {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: 'Compressor Starts',
+                data: starts,
+                backgroundColor: 'rgba(245, 158, 11, 0.7)',
+                borderColor: 'rgba(245, 158, 11, 1)',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: { display: true, text: 'Daily Compressor Starts', color: '#fff' },
+                legend: { labels: { color: '#fff' } }
+            },
+            scales: {
+                x: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' } },
+                y: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Starts', color: '#888' } }
+            }
+        }
+    };
+}
+
+// Build cycle time vs outdoor temp scatter chart
+function buildCycleTempChart(cycles) {
+    const points = cycles
+        .filter(c => c.outdoor_temp_c !== null)
+        .map(c => ({ x: c.outdoor_temp_c, y: c.duration_secs / 60 }));
+
+    return {
+        type: 'scatter',
+        data: {
+            datasets: [{
+                label: 'Cycle Duration vs Outdoor Temp',
+                data: points,
+                backgroundColor: 'rgba(139, 92, 246, 0.7)',
+                borderColor: 'rgba(139, 92, 246, 1)',
+                pointRadius: 5
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: { display: true, text: 'Cycle Duration vs Outdoor Temperature', color: '#fff' },
+                legend: { labels: { color: '#fff' } }
+            },
+            scales: {
+                x: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Outdoor Temp (°C)', color: '#888' } },
+                y: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Duration (min)', color: '#888' } }
+            }
+        }
+    };
+}
+
+// Build daily hours vs outdoor temp scatter chart
+function buildHoursTempChart(daily) {
+    const points = daily
+        .filter(d => d.avg_outdoor_temp_c !== null)
+        .map(d => ({ x: d.avg_outdoor_temp_c, y: d.operating_hours }));
+
+    return {
+        type: 'scatter',
+        data: {
+            datasets: [{
+                label: 'Daily Hours vs Avg Outdoor Temp',
+                data: points,
+                backgroundColor: 'rgba(236, 72, 153, 0.7)',
+                borderColor: 'rgba(236, 72, 153, 1)',
+                pointRadius: 5
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: { display: true, text: 'Daily Operating Hours vs Avg Outdoor Temperature', color: '#fff' },
+                legend: { labels: { color: '#fff' } }
+            },
+            scales: {
+                x: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Avg Outdoor Temp (°C)', color: '#888' } },
+                y: { ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Hours', color: '#888' } }
+            }
+        }
+    };
+}
+
 // Main update function
 async function updateAll() {
     try {
@@ -798,7 +1123,8 @@ async function updateAll() {
             updateAlarms(),
             updateSystemStatus(),
             updateGrid(),
-            updatePrices()
+            updatePrices(),
+            updateHeatPumpStats()
         ]);
 
         setConnectionStatus('connected');
@@ -934,6 +1260,49 @@ function init() {
             clearChartInteraction();
         });
     }
+
+    // Heat pump stats panel click handler (opens modal)
+    const statsPanel = elements['heatpump-stats-panel'];
+    if (statsPanel) {
+        statsPanel.addEventListener('click', showStatsModal);
+    }
+
+    // Stats modal close button
+    const modalClose = elements['stats-modal-close'];
+    if (modalClose) {
+        modalClose.addEventListener('click', hideStatsModal);
+    }
+
+    // Stats modal background click to close
+    const statsModal = elements['stats-modal'];
+    if (statsModal) {
+        statsModal.addEventListener('click', (e) => {
+            // Only close if clicking on the overlay background, not the content
+            if (e.target === statsModal) {
+                hideStatsModal();
+            }
+        });
+    }
+
+    // Escape key to close modal
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && statsModal && statsModal.style.display !== 'none') {
+            hideStatsModal();
+        }
+    });
+
+    // Stats modal tab buttons
+    const tabButtons = document.querySelectorAll('.tab-btn');
+    tabButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            // Update active tab styling
+            tabButtons.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            // Render the selected chart type
+            const chartType = btn.dataset.chart;
+            renderStatsChart(chartType);
+        });
+    });
 
     updateAll();
     setInterval(updateAll, REFRESH_INTERVAL);

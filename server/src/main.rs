@@ -1,6 +1,7 @@
 mod config;
 mod energy;
 mod error;
+mod heatpump;
 mod messages;
 mod modbus;
 mod routes;
@@ -144,6 +145,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create grid state for peak tracking
     let grid_state = GridState::new();
 
+    // Create heat pump stats tracker
+    let heatpump_stats = heatpump::HeatPumpStats::new();
+
+    // Start heat pump stats polling if enabled
+    if config.heatpump_stats.enabled {
+        info!(
+            "Heat pump statistics enabled: poll_interval={}s",
+            config.heatpump_stats.poll_interval_secs
+        );
+
+        let stats_clone = heatpump_stats.clone();
+        let modbus_tx_clone = tx.clone();
+        let poll_interval = config.heatpump_stats.poll_interval_secs;
+        let request_timeout = config.modbus.request_timeout_secs;
+
+        tokio::spawn(async move {
+            heatpump::poller::run_poll_loop(
+                modbus_tx_clone,
+                stats_clone,
+                poll_interval,
+                request_timeout,
+            )
+            .await;
+        });
+    } else {
+        debug!("Heat pump statistics tracking disabled");
+    }
+
     // Start Tibber WebSocket if configured
     let tibber_token = if config.tibber.enabled {
         if let Some(ref token) = config.tibber.api.token {
@@ -222,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             price_state,
             tibber_token.is_some(),
         ))
+        .merge(routes::heatpump_stats::routes(heatpump_stats))
         // Static file serving for web dashboard
         .nest_service("/static", ServeDir::new(static_dir()))
         .route(
@@ -249,7 +279,7 @@ async fn run_price_fetch_loop(
     fetch_interval_mins: u64,
 ) {
     use crate::energy::{elpris::ElprisClient, tibber::fetch_prices as fetch_tibber_prices};
-    use tokio::time::{interval, Duration};
+    use tokio::time::{Duration, interval};
 
     let elpris_client = ElprisClient::new(&price_zone);
     let mut ticker = interval(Duration::from_secs(fetch_interval_mins * 60));

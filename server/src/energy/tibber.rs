@@ -475,7 +475,9 @@ async fn connect_websocket(
         "type": "connection_init",
         "payload": {}
     });
-    write.send(Message::Text(init_msg.to_string().into())).await?;
+    write
+        .send(Message::Text(init_msg.to_string().into()))
+        .await?;
 
     // Wait for connection_ack
     let mut connection_acked = false;

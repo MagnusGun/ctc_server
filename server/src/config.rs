@@ -22,6 +22,7 @@ pub struct Config {
     pub gpio: GpioConfig,
     pub tibber: TibberConfig,
     pub price: PriceConfig,
+    pub heatpump_stats: HeatPumpStatsConfig,
 }
 
 /// HTTP server configuration
@@ -124,6 +125,15 @@ pub struct PriceConfig {
     pub fetch_interval_mins: u64,
 }
 
+/// Heat pump statistics tracking configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeatPumpStatsConfig {
+    /// Enable heat pump statistics tracking
+    pub enabled: bool,
+    /// Polling interval in seconds (how often to read heat pump status)
+    pub poll_interval_secs: u64,
+}
+
 impl Config {
     /// Load configuration from file, environment variables, and defaults
     ///
@@ -191,7 +201,10 @@ impl Config {
             // Price defaults
             .set_default("price.enabled", true)?
             .set_default("price.zone", "SE3")?
-            .set_default("price.fetch_interval_mins", 15)?;
+            .set_default("price.fetch_interval_mins", 15)?
+            // Heat pump stats defaults
+            .set_default("heatpump_stats.enabled", true)?
+            .set_default("heatpump_stats.poll_interval_secs", 10)?;
 
         builder.build()?.try_deserialize()
     }
@@ -353,6 +366,10 @@ mod tests {
             .set_default("price.zone", "SE3")
             .unwrap()
             .set_default("price.fetch_interval_mins", 15)
+            .unwrap()
+            .set_default("heatpump_stats.enabled", true)
+            .unwrap()
+            .set_default("heatpump_stats.poll_interval_secs", 10)
             .unwrap();
 
         let config: Config = builder.build().unwrap().try_deserialize().unwrap();

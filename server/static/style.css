@@ -1125,3 +1125,326 @@ footer {
         transform: none;
     }
 }
+
+/* Heat Pump Statistics Panel */
+.panel-card.clickable {
+    cursor: pointer;
+    position: relative;
+}
+
+.panel-card.clickable:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+/* Click indicator icon */
+.panel-card.clickable::after {
+    content: '⤢';
+    position: absolute;
+    right: 1rem;
+    top: 1rem;
+    font-size: 1.25rem;
+    color: var(--text-muted);
+    opacity: 0.5;
+    transition: opacity 0.2s, transform 0.2s;
+}
+
+.panel-card.clickable:hover::after {
+    opacity: 1;
+    transform: scale(1.1);
+}
+
+.hp-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.5rem;
+}
+
+.stats-section {
+    padding: 0.75rem;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: var(--radius-sm);
+}
+
+.stats-section h3 {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.75rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+/* Cycle Times Grid (4 columns) */
+.cycle-stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.5rem;
+}
+
+.cycle-stat {
+    text-align: center;
+    padding: 0.5rem 0.25rem;
+}
+
+.cycle-label {
+    display: block;
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 0.25rem;
+}
+
+.cycle-value {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Starts and Operating Hours Grids */
+.starts-grid,
+.ophours-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.5rem;
+}
+
+.starts-item,
+.ophours-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.375rem 0.5rem;
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 4px;
+}
+
+/* Make the 5th item (Year) span full width for visual balance */
+.starts-item:nth-child(5),
+.ophours-item:nth-child(5) {
+    grid-column: 1 / -1;
+    max-width: 50%;
+    margin: 0 auto;
+}
+
+.starts-label,
+.ophours-label {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+}
+
+.starts-value,
+.ophours-value {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Tracking Info Badge */
+.tracking-info {
+    display: flex;
+    align-items: center;
+}
+
+.tracking-badge {
+    font-size: 0.7rem;
+    padding: 0.25rem 0.5rem;
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--accent-blue);
+    border-radius: 4px;
+}
+
+/* Stats Modal */
+.stats-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.8);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+    backdrop-filter: blur(4px);
+}
+
+.stats-modal-content {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    width: 90%;
+    max-width: 900px;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.stats-modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.stats-modal-header h2 {
+    font-size: 1.125rem;
+    font-weight: 600;
+    margin: 0;
+}
+
+.modal-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0.25rem 0.5rem;
+    line-height: 1;
+    transition: color 0.2s;
+}
+
+.modal-close:hover {
+    color: var(--text-primary);
+}
+
+.stats-modal-tabs {
+    display: flex;
+    gap: 0.5rem;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid var(--border-color);
+    flex-wrap: wrap;
+}
+
+.tab-btn {
+    padding: 0.5rem 1rem;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.tab-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+}
+
+.tab-btn.active {
+    background: rgba(59, 130, 246, 0.2);
+    border-color: var(--accent-blue);
+    color: var(--accent-blue);
+}
+
+.stats-modal-body {
+    padding: 1.5rem;
+    flex: 1;
+    min-height: 400px;
+}
+
+.stats-modal-body canvas {
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 350px;
+}
+
+/* Empty state for charts */
+.chart-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 350px;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    text-align: center;
+    padding: 2rem;
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: var(--radius-sm);
+    border: 1px dashed var(--border-color);
+}
+
+.chart-empty::before {
+    content: '📊';
+    font-size: 3rem;
+    margin-bottom: 1rem;
+    opacity: 0.5;
+}
+
+/* Stats Panel Mobile Responsiveness */
+@media (max-width: 1024px) {
+    .hp-stats-grid {
+        grid-template-columns: 1fr;
+        gap: 1rem;
+    }
+}
+
+@media (max-width: 768px) {
+    .cycle-stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .starts-grid,
+    .ophours-grid {
+        grid-template-columns: 1fr;
+    }
+
+    /* Reset Year item to normal on mobile (single column) */
+    .starts-item:nth-child(5),
+    .ophours-item:nth-child(5) {
+        grid-column: auto;
+        max-width: 100%;
+        margin: 0;
+    }
+
+    .stats-modal-content {
+        width: 95%;
+        max-height: 95vh;
+    }
+
+    .stats-modal-tabs {
+        padding: 0.75rem 1rem;
+    }
+
+    .tab-btn {
+        padding: 0.375rem 0.75rem;
+        font-size: 0.7rem;
+    }
+
+    .stats-modal-body {
+        padding: 1rem;
+        min-height: 300px;
+    }
+
+    .stats-modal-body canvas {
+        min-height: 250px;
+    }
+}
+
+@media (max-width: 480px) {
+    .stats-modal-header {
+        padding: 0.75rem 1rem;
+    }
+
+    .stats-modal-header h2 {
+        font-size: 1rem;
+    }
+
+    .cycle-stat {
+        padding: 0.25rem;
+    }
+
+    .cycle-value {
+        font-size: 0.875rem;
+    }
+
+    .starts-value,
+    .ophours-value {
+        font-size: 0.8rem;
+    }
+}

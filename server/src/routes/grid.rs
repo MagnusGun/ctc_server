@@ -405,7 +405,8 @@ mod tests {
     async fn test_get_optimal_hours() {
         let state = create_test_state();
 
-        let result = get_optimal_hours(State(state), Query(OptimalHoursQuery { hours: Some(3) })).await;
+        let result =
+            get_optimal_hours(State(state), Query(OptimalHoursQuery { hours: Some(3) })).await;
         assert!(result.is_ok());
 
         let json = result.unwrap();
@@ -418,9 +419,13 @@ mod tests {
         let prices: Vec<PricePoint> = vec![];
         assert_eq!(calculate_price_trend(&prices), "unknown");
 
-        let prices = vec![
-            PricePoint::from_spot(String::new(), String::new(), 1.0, 0.0, 0.0),
-        ];
+        let prices = vec![PricePoint::from_spot(
+            String::new(),
+            String::new(),
+            1.0,
+            0.0,
+            0.0,
+        )];
         assert_eq!(calculate_price_trend(&prices), "unknown");
     }
 
@@ -440,7 +445,15 @@ mod tests {
     #[test]
     fn test_calculate_price_trend_rising() {
         let prices: Vec<PricePoint> = (0..24)
-            .map(|i| PricePoint::from_spot(String::new(), String::new(), 0.5 + (f64::from(i) * 0.05), 0.0, 0.0))
+            .map(|i| {
+                PricePoint::from_spot(
+                    String::new(),
+                    String::new(),
+                    0.5 + (f64::from(i) * 0.05),
+                    0.0,
+                    0.0,
+                )
+            })
             .collect();
         assert_eq!(calculate_price_trend(&prices), "rising");
     }
@@ -448,7 +461,15 @@ mod tests {
     #[test]
     fn test_calculate_price_trend_falling() {
         let prices: Vec<PricePoint> = (0..24)
-            .map(|i| PricePoint::from_spot(String::new(), String::new(), 1.5 - (f64::from(i) * 0.05), 0.0, 0.0))
+            .map(|i| {
+                PricePoint::from_spot(
+                    String::new(),
+                    String::new(),
+                    1.5 - (f64::from(i) * 0.05),
+                    0.0,
+                    0.0,
+                )
+            })
             .collect();
         assert_eq!(calculate_price_trend(&prices), "falling");
     }
