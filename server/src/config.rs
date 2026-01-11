@@ -170,8 +170,8 @@ impl Config {
             .set_default("serial.timeout_secs", 1)?
             // Modbus defaults
             .set_default("modbus.slave_id", 1)?
-            .set_default("modbus.channel_buffer_size", 24)?
-            .set_default("modbus.operation_timeout_secs", 5)?
+            .set_default("modbus.channel_buffer_size", 32)?
+            .set_default("modbus.operation_timeout_secs", 1)?
             .set_default("modbus.max_retries", 2)?
             .set_default("modbus.initial_retry_delay_ms", 100)?
             .set_default("modbus.backoff_multiplier", 2.0)?
@@ -370,7 +370,7 @@ mod tests {
     fn test_retry_config_defaults() {
         let config = Config::load(None).expect("Failed to load default config");
 
-        assert_eq!(config.modbus.operation_timeout_secs, 5);
+        assert_eq!(config.modbus.operation_timeout_secs, 1);
         assert_eq!(config.modbus.max_retries, 2);
         assert_eq!(config.modbus.initial_retry_delay_ms, 100);
         assert!((config.modbus.backoff_multiplier - 2.0).abs() < f64::EPSILON);

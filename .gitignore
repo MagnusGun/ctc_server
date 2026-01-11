@@ -28,6 +28,9 @@ Service document-BMS Register-17003548.pdf
 docker-compose.override.yml
 .env
 *.tar
+*.sh
+*.example
+*.zip
 
-# python
-.venv/CLAUDE.md
+#python
+/.venv

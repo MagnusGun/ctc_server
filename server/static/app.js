@@ -65,6 +65,18 @@ const state = {
     powersaveState: null
 };
 
+// Chart hover state
+const chartState = {
+    hoverIndex: null,
+    prices: [],
+    padding: null,
+    pointWidth: null,
+    chartWidth: null,
+    chartHeight: null,
+    minPrice: null,
+    priceRange: null
+};
+
 // Initialize element references
 function initElements() {
     const ids = [
@@ -79,7 +91,7 @@ function initElements() {
         // Price elements
         'price-time', 'price-spot', 'price-level', 'price-spot-detail',
         'price-tibber-total', 'price-markup', 'tibber-section',
-        'price-min', 'price-max', 'price-avg', 'price-chart', 'price-chart-status'
+        'price-min', 'price-max', 'price-avg', 'price-chart', 'chart-tooltip'
     ];
     ids.forEach(id => {
         elements[id] = document.getElementById(id);
@@ -314,7 +326,7 @@ async function updateGrid() {
         if (tariffEl) {
             const mode = data.tariff_mode || 'Unknown';
             const isHigh = mode.toLowerCase() === 'high';
-            tariffEl.textContent = isHigh ? 'Högtariff' : 'Lågtariff';
+            tariffEl.textContent = isHigh ? 'High Tariff' : 'Low Tariff';
             tariffEl.className = 'tariff-badge ' + mode.toLowerCase();
         }
 
@@ -387,10 +399,10 @@ function updatePeakPopup(peakHours) {
     popup.innerHTML = peakHours.map(hour => {
         const pct = (hour.kwh / maxKwh * 100).toFixed(0);
         const date = new Date(hour.timestamp);
-        const dateStr = date.toLocaleDateString('sv-SE', {
+        const dateStr = date.toLocaleDateString('en-GB', {
             month: 'short', day: 'numeric'
         });
-        const hourStr = date.toLocaleTimeString('sv-SE', {
+        const hourStr = date.toLocaleTimeString('en-GB', {
             hour: '2-digit', minute: '2-digit'
         });
         return `
@@ -504,7 +516,7 @@ function formatPrice(value, decimals = 2) {
 function formatPriceTime(isoString) {
     if (!isoString) return '--:--';
     const date = new Date(isoString);
-    return date.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+    return date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 }
 
 // Get color for price level
@@ -624,7 +636,7 @@ function drawPriceChart(canvas, prices, currentTime) {
                 ctx.fillStyle = '#fff';
                 ctx.font = 'bold 9px system-ui';
                 ctx.textAlign = 'center';
-                ctx.fillText('NU', x, padding.top - 5);
+                ctx.fillText('NOW', x, padding.top - 5);
 
                 break;
             }
@@ -641,6 +653,51 @@ function drawPriceChart(canvas, prices, currentTime) {
         const x = padding.left + i * pointWidth + pointWidth / 2;
         const time = formatPriceTime(prices[i].starts_at);
         ctx.fillText(time, x, height - 5);
+    }
+
+    // Store chart state for mouse interaction
+    chartState.prices = prices;
+    chartState.padding = padding;
+    chartState.pointWidth = pointWidth;
+    chartState.chartWidth = chartWidth;
+    chartState.chartHeight = chartHeight;
+    chartState.minPrice = minPrice;
+    chartState.priceRange = priceRange;
+
+    // Draw crosshair if hovering
+    if (chartState.hoverIndex !== null && chartState.hoverIndex >= 0 && chartState.hoverIndex < prices.length) {
+        const hoverPrice = prices[chartState.hoverIndex];
+        const hx = padding.left + chartState.hoverIndex * pointWidth + pointWidth / 2;
+        const hy = padding.top + chartHeight - ((hoverPrice.spot_sek - minPrice) / priceRange * chartHeight);
+
+        // Dashed vertical line
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+        ctx.setLineDash([3, 3]);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(hx, padding.top);
+        ctx.lineTo(hx, padding.top + chartHeight);
+        ctx.stroke();
+
+        // Dashed horizontal line
+        ctx.beginPath();
+        ctx.moveTo(padding.left, hy);
+        ctx.lineTo(padding.left + chartWidth, hy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Circle at intersection (outer white)
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(hx, hy, 6, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Inner circle with price level color
+        const levelColor = getPriceLevelColor(hoverPrice.level);
+        ctx.fillStyle = levelColor;
+        ctx.beginPath();
+        ctx.arc(hx, hy, 4, 0, Math.PI * 2);
+        ctx.fill();
     }
 }
 
@@ -723,16 +780,6 @@ async function updatePrices() {
                 chartPrices = chartPrices.concat(data.tomorrow.prices);
             }
             drawPriceChart(chartCanvas, chartPrices, true);
-
-            // Update chart status
-            const statusEl = elements['price-chart-status'];
-            if (statusEl) {
-                const todayCount = data.today.prices.length;
-                const tomorrowCount = data.tomorrow && data.tomorrow.available ? data.tomorrow.prices.length : 0;
-                statusEl.textContent = tomorrowCount > 0
-                    ? `Today: ${todayCount} prices, Tomorrow: ${tomorrowCount} prices`
-                    : `Today: ${todayCount} prices`;
-            }
         }
     } catch (err) {
         console.error('Error fetching prices:', err);
@@ -800,6 +847,91 @@ function init() {
                     popup.style.visibility = 'hidden';
                 }
             }
+        });
+    }
+
+    // Price chart hover/touch interaction
+    const chartCanvas = elements['price-chart'];
+    const chartTooltip = elements['chart-tooltip'];
+
+    if (chartCanvas && chartTooltip) {
+        // Shared function to handle chart interaction (mouse or touch)
+        function handleChartInteraction(clientX, clientY) {
+            if (chartState.prices.length === 0 || !chartState.padding || !chartState.pointWidth) {
+                return;
+            }
+
+            const rect = chartCanvas.getBoundingClientRect();
+            const scaleX = chartCanvas.width / rect.width;
+            const x = (clientX - rect.left) * scaleX / (window.devicePixelRatio || 1);
+
+            // Calculate which price bar the pointer is over
+            const index = Math.floor((x - chartState.padding.left) / chartState.pointWidth);
+
+            if (index >= 0 && index < chartState.prices.length) {
+                chartState.hoverIndex = index;
+                const price = chartState.prices[index];
+
+                // Update tooltip content
+                const time = formatPriceTime(price.starts_at);
+                chartTooltip.textContent = `${time}: ${price.spot_sek.toFixed(2)} kr/kWh`;
+
+                // Position tooltip above the point
+                const pointX = chartState.padding.left + index * chartState.pointWidth + chartState.pointWidth / 2;
+                const tooltipX = (pointX / scaleX) * (window.devicePixelRatio || 1);
+
+                chartTooltip.style.display = 'block';
+                chartTooltip.style.left = `${tooltipX / (window.devicePixelRatio || 1)}px`;
+                chartTooltip.style.top = '5px';
+
+                // Redraw chart with crosshair
+                drawPriceChart(chartCanvas, chartState.prices, true);
+            } else {
+                clearChartInteraction();
+            }
+        }
+
+        // Clear the chart interaction state
+        function clearChartInteraction() {
+            chartState.hoverIndex = null;
+            chartTooltip.style.display = 'none';
+            if (chartState.prices.length > 0) {
+                drawPriceChart(chartCanvas, chartState.prices, true);
+            }
+        }
+
+        // Mouse events
+        chartCanvas.addEventListener('mousemove', (e) => {
+            handleChartInteraction(e.clientX, e.clientY);
+        });
+
+        chartCanvas.addEventListener('mouseleave', () => {
+            clearChartInteraction();
+        });
+
+        // Touch events for mobile
+        chartCanvas.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 1) {
+                e.preventDefault(); // Prevent scrolling while interacting with chart
+                const touch = e.touches[0];
+                handleChartInteraction(touch.clientX, touch.clientY);
+            }
+        }, { passive: false });
+
+        chartCanvas.addEventListener('touchmove', (e) => {
+            if (e.touches.length === 1) {
+                e.preventDefault();
+                const touch = e.touches[0];
+                handleChartInteraction(touch.clientX, touch.clientY);
+            }
+        }, { passive: false });
+
+        chartCanvas.addEventListener('touchend', () => {
+            clearChartInteraction();
+        });
+
+        chartCanvas.addEventListener('touchcancel', () => {
+            clearChartInteraction();
         });
     }
 

@@ -142,9 +142,38 @@ impl PriceState {
     }
 
     /// Get the current price point
+    ///
+    /// Recalculates on each request to ensure freshness as price periods change
+    /// every 15 minutes but the fetch loop runs less frequently.
     pub fn get_current(&self) -> Option<PricePoint> {
         let inner = self.inner.lock().unwrap();
-        inner.current.clone()
+        let now = chrono::Utc::now();
+
+        // First check today's prices
+        if let Some(price) = inner.today.iter().find(|p| {
+            if let (Ok(start), Ok(end)) = (
+                chrono::DateTime::parse_from_rfc3339(&p.starts_at),
+                chrono::DateTime::parse_from_rfc3339(&p.ends_at),
+            ) {
+                now >= start && now < end
+            } else {
+                false
+            }
+        }) {
+            return Some(price.clone());
+        }
+
+        // Fall back to tomorrow's prices (after midnight before new fetch)
+        inner.tomorrow.iter().find(|p| {
+            if let (Ok(start), Ok(end)) = (
+                chrono::DateTime::parse_from_rfc3339(&p.starts_at),
+                chrono::DateTime::parse_from_rfc3339(&p.ends_at),
+            ) {
+                now >= start && now < end
+            } else {
+                false
+            }
+        }).cloned()
     }
 
     /// Get today's prices

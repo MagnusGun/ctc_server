@@ -817,13 +817,34 @@ main {
     height: 150px;
     background: rgba(255, 255, 255, 0.02);
     border-radius: var(--radius-sm);
+    cursor: crosshair;
 }
 
-.price-chart-status {
-    font-size: 0.7rem;
-    color: var(--text-muted);
-    text-align: right;
-    margin-top: 0.25rem;
+/* Chart hover tooltip */
+.chart-tooltip {
+    position: absolute;
+    background: rgba(0, 0, 0, 0.9);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: #fff;
+    pointer-events: none;
+    z-index: 100;
+    white-space: nowrap;
+    transform: translateX(-50%);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.chart-tooltip::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: rgba(0, 0, 0, 0.9);
 }
 
 /* Mobile adjustments for price panel */

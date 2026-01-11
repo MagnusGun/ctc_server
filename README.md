@@ -328,7 +328,7 @@ All settings can be overridden with environment variables using the `CTC_` prefi
 | `CTC_SERIAL_PARITY` | Parity (none/even/odd) | `even` |
 | `CTC_MODBUS_SLAVE_ID` | Modbus slave ID | `1` |
 | `CTC_MODBUS_MAX_RETRIES` | Max retry attempts | `2` |
-| `CTC_MODBUS_OPERATION_TIMEOUT_SECS` | Operation timeout | `5` |
+| `CTC_MODBUS_OPERATION_TIMEOUT_SECS` | Operation timeout | `1` |
 | `CTC_POWERSAVE` | Initial powersave mode on startup | `false` |
 | `CTC_TIBBER_ENABLED` | Enable Tibber integration | `false` |
 | `CTC_TIBBER_API_TOKEN` | Tibber API token (from developer.tibber.com) | - |

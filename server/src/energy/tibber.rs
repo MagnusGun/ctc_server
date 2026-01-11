@@ -19,6 +19,9 @@ use super::tariff::{TariffMode, get_tariff_at};
 const TIBBER_WS_URL: &str = "wss://websocket-api.tibber.com/v1-beta/gql/subscriptions";
 const TIBBER_API_URL: &str = "https://api.tibber.com/v1-beta/gql";
 const USER_AGENT: &str = "CTC-Server/1.0";
+/// Read timeout for WebSocket messages. Tibber sends keep-alive every ~30-60s,
+/// so 120s allows 2-4 missed keep-alives before declaring connection dead.
+const WS_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// GraphQL subscription message format
 #[derive(Debug, Serialize)]
@@ -534,26 +537,36 @@ async fn connect_websocket(
     // Track the last hour we recorded
     let mut last_recorded_hour: Option<u64> = None;
 
-    // Process incoming messages
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if let Err(e) = process_message(&text, grid_state, &mut last_recorded_hour) {
-                    error!("Tibber WS: Failed to process message: {}", e);
+    // Process incoming messages with read timeout to detect zombie connections.
+    loop {
+        match time::timeout(WS_READ_TIMEOUT, read.next()).await {
+            Ok(Some(Ok(msg))) => match msg {
+                Message::Text(text) => {
+                    if let Err(e) = process_message(&text, grid_state, &mut last_recorded_hour) {
+                        error!("Tibber WS: Failed to process message: {}", e);
+                    }
                 }
-            }
-            Ok(Message::Close(_)) => {
-                info!("Tibber WS: Closed by server");
-                break;
-            }
-            Ok(Message::Ping(data)) => {
-                let _ = write.send(Message::Pong(data)).await;
-            }
-            Err(e) => {
+                Message::Close(_) => {
+                    info!("Tibber WS: Closed by server");
+                    break;
+                }
+                Message::Ping(data) => {
+                    let _ = write.send(Message::Pong(data)).await;
+                }
+                _ => {}
+            },
+            Ok(Some(Err(e))) => {
                 error!("Tibber WS: Error: {}", e);
                 break;
             }
-            _ => {}
+            Ok(None) => {
+                info!("Tibber WS: Stream ended");
+                break;
+            }
+            Err(_) => {
+                warn!("Tibber WS: No message in {WS_READ_TIMEOUT:?}, reconnecting");
+                break;
+            }
         }
     }
 
@@ -632,66 +645,80 @@ fn extract_year_month(iso: &str) -> Option<(i32, u32)> {
 }
 
 /// Parse ISO 8601 timestamp to `SystemTime`
+///
+/// Handles formats like:
+/// - `"2025-01-15T14:30:00.000+01:00"` (with positive timezone offset)
+/// - `"2025-01-15T14:30:00.000-05:00"` (with negative timezone offset)
+/// - `"2025-01-15T13:30:00Z"` (UTC/Zulu time)
+/// - `"2025-01-15T13:30:00"` (no timezone, assumed UTC)
 fn parse_iso8601(s: &str) -> Result<SystemTime, Box<dyn std::error::Error + Send + Sync>> {
-    // Parse format: "2025-01-15T14:30:00.000+01:00" or "2025-01-15T13:30:00Z"
-    // Simple parser for common formats
-
-    // Remove fractional seconds and timezone for parsing
     let s = s.trim();
 
-    // Try to find the date and time parts
-    let date_time = if let Some(idx) = s.find('T') {
-        let date_part = &s[..idx];
-        let time_part = if let Some(plus_idx) = s[idx..].find('+') {
-            &s[idx + 1..idx + plus_idx]
-        } else if let Some(z_idx) = s[idx..].find('Z') {
-            &s[idx + 1..idx + z_idx]
-        } else if let Some(minus_idx) = s[idx + 1..].find('-') {
-            &s[idx + 1..idx + 1 + minus_idx]
-        } else {
-            &s[idx + 1..]
-        };
+    // Find the 'T' separator between date and time
+    let t_idx = s.find('T').ok_or("Invalid ISO 8601 format: missing 'T'")?;
+    let date_part = &s[..t_idx];
+    let time_and_tz = &s[t_idx + 1..];
 
-        // Remove fractional seconds
-        let time_part = if let Some(dot_idx) = time_part.find('.') {
-            &time_part[..dot_idx]
-        } else {
-            time_part
-        };
-
-        (date_part, time_part)
-    } else {
-        return Err("Invalid ISO 8601 format".into());
-    };
-
-    let parts: Vec<&str> = date_time.0.split('-').collect();
-    if parts.len() != 3 {
+    // Parse date components
+    let date_parts: Vec<&str> = date_part.split('-').collect();
+    if date_parts.len() != 3 {
         return Err("Invalid date format".into());
     }
-    let year: i32 = parts[0].parse()?;
-    let month: u32 = parts[1].parse()?;
-    let day: u32 = parts[2].parse()?;
+    let year: i32 = date_parts[0].parse()?;
+    let month: u32 = date_parts[1].parse()?;
+    let day: u32 = date_parts[2].parse()?;
 
-    let time_parts: Vec<&str> = date_time.1.split(':').collect();
+    // Separate time from timezone offset
+    // Look for 'Z', '+', or '-' (after position 2 to skip negative hours like -05)
+    let (time_part, offset_secs) = if let Some(z_idx) = time_and_tz.find('Z') {
+        (&time_and_tz[..z_idx], 0i64)
+    } else if let Some(plus_idx) = time_and_tz.find('+') {
+        let offset = parse_tz_offset(&time_and_tz[plus_idx + 1..]);
+        (&time_and_tz[..plus_idx], offset)
+    } else if let Some(minus_idx) = time_and_tz[2..].find('-') {
+        // Search after position 2 to avoid matching time like "14:30"
+        let actual_idx = minus_idx + 2;
+        let offset = parse_tz_offset(&time_and_tz[actual_idx + 1..]);
+        (&time_and_tz[..actual_idx], -offset)
+    } else {
+        // No timezone specified, assume UTC
+        (time_and_tz, 0i64)
+    };
+
+    // Remove fractional seconds (e.g., ".000" in "14:30:00.000")
+    let time_part = time_part.split('.').next().unwrap_or(time_part);
+
+    // Parse time components
+    let time_parts: Vec<&str> = time_part.split(':').collect();
     if time_parts.len() < 2 {
         return Err("Invalid time format".into());
     }
-    let hour: u32 = time_parts[0].parse()?;
-    let minute: u32 = time_parts[1].parse()?;
-    let second: u32 = if time_parts.len() > 2 {
+    let hour: i64 = time_parts[0].parse()?;
+    let minute: i64 = time_parts[1].parse()?;
+    let second: i64 = if time_parts.len() > 2 {
         time_parts[2].parse().unwrap_or(0)
     } else {
         0
     };
 
-    // Convert to Unix timestamp (assuming UTC for simplicity)
+    // Convert local time to UTC by subtracting the timezone offset
+    // For "+01:00", offset_secs is positive, so we subtract to get UTC
+    // For "-05:00", offset_secs is negative, so subtracting adds to get UTC
     let days = ymd_to_days(year, month, day);
+    let local_secs = days * 86400 + hour * 3600 + minute * 60 + second;
+    let utc_secs = local_secs - offset_secs;
 
     #[allow(clippy::cast_sign_loss)]
-    let secs =
-        (days * 86400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second)) as u64;
+    // utc_secs is always positive for dates after 1970
+    Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(utc_secs as u64))
+}
 
-    Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+/// Parse timezone offset string like "01:00" or "05:30" into seconds
+fn parse_tz_offset(offset_str: &str) -> i64 {
+    let parts: Vec<&str> = offset_str.split(':').collect();
+    let hours: i64 = parts.first().and_then(|h| h.parse().ok()).unwrap_or(0);
+    let mins: i64 = parts.get(1).and_then(|m| m.parse().ok()).unwrap_or(0);
+    hours * 3600 + mins * 60
 }
 
 /// Convert (year, month, day) to days since Unix epoch
@@ -732,16 +759,75 @@ fn days_to_ymd(days: u64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_iso8601_utc() {
-        let result = parse_iso8601("2025-01-15T14:30:00Z");
-        assert!(result.is_ok());
+    /// Extract hour from `SystemTime` (in UTC)
+    fn get_utc_hour(time: SystemTime) -> u32 {
+        let secs = time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        ((secs % 86400) / 3600) as u32
     }
 
     #[test]
-    fn test_parse_iso8601_with_offset() {
-        let result = parse_iso8601("2025-01-15T14:30:00.000+01:00");
-        assert!(result.is_ok());
+    fn test_parse_iso8601_utc() {
+        // "14:30:00Z" is already UTC, so result should be 14:30 UTC
+        let result = parse_iso8601("2025-01-15T14:30:00Z").unwrap();
+        assert_eq!(get_utc_hour(result), 14);
+    }
+
+    #[test]
+    fn test_parse_iso8601_positive_offset() {
+        // "14:30:00+01:00" means 14:30 local time at UTC+1
+        // Converting to UTC: 14:30 - 1:00 = 13:30 UTC
+        let result = parse_iso8601("2025-01-15T14:30:00.000+01:00").unwrap();
+        assert_eq!(get_utc_hour(result), 13);
+    }
+
+    #[test]
+    fn test_parse_iso8601_swedish_winter_time() {
+        // Swedish winter time is UTC+1
+        // "09:00:00+01:00" = 08:00 UTC
+        let result = parse_iso8601("2026-01-09T09:00:00.000+01:00").unwrap();
+        assert_eq!(get_utc_hour(result), 8);
+    }
+
+    #[test]
+    fn test_parse_iso8601_swedish_summer_time() {
+        // Swedish summer time is UTC+2
+        // "09:00:00+02:00" = 07:00 UTC
+        let result = parse_iso8601("2026-07-09T09:00:00.000+02:00").unwrap();
+        assert_eq!(get_utc_hour(result), 7);
+    }
+
+    #[test]
+    fn test_parse_iso8601_negative_offset() {
+        // US Eastern Standard Time is UTC-5
+        // "14:30:00-05:00" = 14:30 + 5:00 = 19:30 UTC
+        let result = parse_iso8601("2025-01-15T14:30:00.000-05:00").unwrap();
+        assert_eq!(get_utc_hour(result), 19);
+    }
+
+    #[test]
+    fn test_parse_iso8601_no_timezone() {
+        // No timezone assumes UTC
+        let result = parse_iso8601("2025-01-15T14:30:00").unwrap();
+        assert_eq!(get_utc_hour(result), 14);
+    }
+
+    #[test]
+    fn test_parse_iso8601_half_hour_offset() {
+        // India Standard Time is UTC+5:30
+        // "14:30:00+05:30" = 14:30 - 5:30 = 09:00 UTC
+        let result = parse_iso8601("2025-01-15T14:30:00+05:30").unwrap();
+        assert_eq!(get_utc_hour(result), 9);
+    }
+
+    #[test]
+    fn test_parse_tz_offset() {
+        assert_eq!(parse_tz_offset("01:00"), 3600);
+        assert_eq!(parse_tz_offset("05:30"), 19800);
+        assert_eq!(parse_tz_offset("00:00"), 0);
+        assert_eq!(parse_tz_offset("12:00"), 43200);
     }
 
     #[test]

@@ -146,37 +146,32 @@
             </div>
         </section>
 
-        <!-- Grid Information -->
+        <!-- Energy & Prices (merged Grid + Prices) -->
         <section class="info-row">
-            <div class="card panel-card wide" id="grid-panel">
-                <h2>📊 Grid</h2>
-                <div class="grid-info">
-                    <div class="grid-tariff-section">
-                        <span class="tariff-label">Tariff:</span>
-                        <span class="tariff-badge" id="tariff-mode" data-tooltip="Göteborg Energi time-of-use tariff">--</span>
-                    </div>
-                    <div class="grid-stats">
-                        <div class="grid-stat" data-tooltip="Energy consumed in the current hour (from Tibber if configured)">
-                            <span class="grid-stat-label">Current Hour</span>
-                            <span class="grid-stat-value" id="current-hour-kwh">-- kWh</span>
+            <div class="card panel-card wide" id="energy-panel">
+                <h2>⚡ Energy & Prices</h2>
+                <div class="price-info">
+                    <!-- Grid info row -->
+                    <div class="grid-info">
+                        <div class="grid-tariff-section">
+                            <span class="tariff-label">Tariff:</span>
+                            <span class="tariff-badge" id="tariff-mode" data-tooltip="Goteborg Energi time-of-use tariff">--</span>
                         </div>
-                        <div class="grid-stat has-popup" id="peak-stat" data-tooltip="Average of top 3 daily peaks this month (one peak per day)">
-                            <span class="grid-stat-label">Peak Avg (Top 3)</span>
-                            <span class="grid-stat-value" id="monthly-peak-kwh">-- kWh</span>
-                            <div class="peak-popup" id="peak-popup">
-                                <div class="peak-no-data">No peak data yet</div>
+                        <div class="grid-stats">
+                            <div class="grid-stat" data-tooltip="Energy consumed in the current hour (from Tibber if configured)">
+                                <span class="grid-stat-label">Current Hour</span>
+                                <span class="grid-stat-value" id="current-hour-kwh">-- kWh</span>
+                            </div>
+                            <div class="grid-stat has-popup" id="peak-stat" data-tooltip="Average of top 3 daily peaks this month (one peak per day)">
+                                <span class="grid-stat-label">Peak Avg (Top 3)</span>
+                                <span class="grid-stat-value" id="monthly-peak-kwh">-- kWh</span>
+                                <div class="peak-popup" id="peak-popup">
+                                    <div class="peak-no-data">No peak data yet</div>
+                                </div>
                             </div>
                         </div>
                     </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- Electricity Prices -->
-        <section class="info-row">
-            <div class="card panel-card wide" id="price-panel">
-                <h2>💰 Electricity Prices</h2>
-                <div class="price-info">
+                    <!-- Current price section -->
                     <div class="price-current-section">
                         <div class="price-current" id="price-current">
                             <div class="price-time" id="price-time">--:-- - --:--</div>
@@ -195,7 +190,7 @@
                                     <span class="price-row-value" id="price-tibber-total">--</span>
                                 </div>
                                 <div class="price-row tibber-row" style="display: none;">
-                                    <span class="price-row-label sub">└ Tibber påslag</span>
+                                    <span class="price-row-label sub">└ Tibber markup</span>
                                     <span class="price-row-value sub" id="price-markup">--</span>
                                 </div>
                             </div>
@@ -215,9 +210,10 @@
                             </div>
                         </div>
                     </div>
+                    <!-- Price chart with hover tooltip -->
                     <div class="price-chart-section">
                         <canvas id="price-chart" width="800" height="150"></canvas>
-                        <div class="price-chart-status" id="price-chart-status"></div>
+                        <div class="chart-tooltip" id="chart-tooltip" style="display: none;"></div>
                     </div>
                 </div>
             </div>

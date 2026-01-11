@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-01-11
+
+### Fixed
+- Timezone parsing in Tibber historical data: timestamps with offsets (+01:00) now correctly convert to UTC, fixing peak hour tracking and tariff detection
+- WebSocket zombie connection detection: added 120s read timeout with automatic reconnection
+
+### Changed
+- Price chart: Added interactive hover/touch with crosshair and tooltip showing price at hovered time
+- Dashboard UI: Merged Grid and Prices panels into single "Energy & Prices" section
+- Dashboard localization: Changed to English (High/Low Tariff, en-GB date format)
+- Modbus defaults: Operation timeout reduced from 5s to 1s, channel buffer size increased from 24 to 32
+- Price state: Current price recalculated on each request for 15-minute period freshness
+- Dockerfile: Added explicit `--platform=linux/arm64` for runtime stage
+
 ## [0.2.0] - 2026-01-05
 
 ### Added

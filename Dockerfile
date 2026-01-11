@@ -73,7 +73,7 @@ RUN cargo build --release --target aarch64-unknown-linux-gnu -p server \
     && aarch64-linux-gnu-strip /app/target/aarch64-unknown-linux-gnu/release/server
 
 # Stage 4: Runtime - Debian trixie-slim (glibc 2.38+)
-FROM debian:trixie-slim AS runtime
+FROM --platform=linux/arm64 debian:trixie-slim AS runtime
 WORKDIR /app
 
 # Install minimal runtime dependencies and create user
