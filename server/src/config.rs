@@ -23,6 +23,7 @@ pub struct Config {
     pub tibber: TibberConfig,
     pub price: PriceConfig,
     pub heatpump_stats: HeatPumpStatsConfig,
+    pub smartgrid: SmartGridConfig,
 }
 
 /// HTTP server configuration
@@ -138,6 +139,15 @@ pub struct HeatPumpStatsConfig {
     pub persist_path: Option<String>,
 }
 
+/// `SmartGrid` behavioural configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct SmartGridConfig {
+    /// Enable auto-resume to Normal after a manually-triggered Blocking
+    pub auto_resume_enabled: bool,
+    /// How far ahead the cheapest-slot scan looks (hours)
+    pub auto_resume_window_hours: u64,
+}
+
 impl Config {
     /// Load configuration from file, environment variables, and defaults
     ///
@@ -209,7 +219,10 @@ impl Config {
             // Heat pump stats defaults
             .set_default("heatpump_stats.enabled", true)?
             .set_default("heatpump_stats.poll_interval_secs", 10)?
-            .set_default("heatpump_stats.persist_path", None::<String>)?;
+            .set_default("heatpump_stats.persist_path", None::<String>)?
+            // SmartGrid defaults
+            .set_default("smartgrid.auto_resume_enabled", true)?
+            .set_default("smartgrid.auto_resume_window_hours", 8)?;
 
         builder.build()?.try_deserialize()
     }
@@ -377,6 +390,10 @@ mod tests {
             .set_default("heatpump_stats.poll_interval_secs", 10)
             .unwrap()
             .set_default("heatpump_stats.persist_path", None::<String>)
+            .unwrap()
+            .set_default("smartgrid.auto_resume_enabled", true)
+            .unwrap()
+            .set_default("smartgrid.auto_resume_window_hours", 8)
             .unwrap();
 
         let config: Config = builder.build().unwrap().try_deserialize().unwrap();

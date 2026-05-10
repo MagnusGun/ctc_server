@@ -459,9 +459,13 @@ async function updateSystemStatus() {
             sgEl.className = 'header-badge' + (mode === 'Normal' ? '' : ' active');
             state.smartgridMode = mode;
 
-            // Show timestamp from server (if mode has been changed since startup)
+            // Prefer the scheduled-resume time when one is pending; fall back
+            // to the last-changed timestamp otherwise.
             if (sgTimestamp) {
-                if (smartgrid.changed_at) {
+                if (smartgrid.scheduled_resume_at) {
+                    const t = new Date(smartgrid.scheduled_resume_at);
+                    sgTimestamp.textContent = `auto-resume ${t.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
+                } else if (smartgrid.changed_at) {
                     sgTimestamp.textContent = new Date(smartgrid.changed_at).toLocaleTimeString();
                 } else {
                     sgTimestamp.textContent = '';
@@ -482,7 +486,10 @@ async function updateSystemStatus() {
     }
 }
 
-// Toggle powersave mode
+// Toggle powersave mode.
+// When activating, ask the server for the cheapest 15-min slot in the next
+// configured window and let the user confirm whether to schedule an
+// auto-resume at that slot (OK = schedule, Cancel = block without schedule).
 async function togglePowersave() {
     if (state.powersaveToggling) return;
 
@@ -491,11 +498,34 @@ async function togglePowersave() {
     if (!toggleEl || !statusEl) return;
 
     const newActive = !state.powersaveState;
-    const action = newActive ? 'enable' : 'disable';
 
-    // Confirmation dialog
-    if (!confirm(`Are you sure you want to ${action} power saving mode?`)) {
-        return;
+    let scheduleResume = false;
+    if (newActive) {
+        // Try to fetch the proposed resume slot — non-fatal if it fails.
+        let proposed = null;
+        try {
+            proposed = await fetchJson(`${API_BASE}/smartgrid/proposed_resume`);
+        } catch (err) {
+            console.warn('Could not fetch proposed resume:', err);
+        }
+
+        if (proposed && proposed.starts_at) {
+            const t = new Date(proposed.starts_at);
+            const when = t.toLocaleString([], {dateStyle: 'short', timeStyle: 'short'});
+            const price = (typeof proposed.spot_sek === 'number')
+                ? proposed.spot_sek.toFixed(3) + ' SEK/kWh'
+                : 'unknown price';
+            const msg = `Block the heater and auto-resume at ${when} (${price})?\n\n` +
+                        `OK = schedule auto-resume.\nCancel = block without auto-resume.`;
+            // OK -> schedule, Cancel -> block-only. Either way, proceed.
+            scheduleResume = confirm(msg);
+        } else {
+            // No price data available — fall back to a plain confirm.
+            const msg = `Block the heater? (No price data available — cannot schedule auto-resume.)`;
+            if (!confirm(msg)) return;
+        }
+    } else {
+        if (!confirm('Disable power saving mode?')) return;
     }
 
     state.powersaveToggling = true;
@@ -503,15 +533,26 @@ async function togglePowersave() {
     toggleEl.classList.remove('error');
 
     try {
-        const response = await fetch(`${API_BASE}/ctc/powersave?active=${newActive}`, {
-            method: 'POST'
-        });
+        const url = `${API_BASE}/ctc/powersave?active=${newActive}` +
+                    (newActive && scheduleResume ? '&schedule_resume=true' : '');
+        const response = await fetch(url, { method: 'POST' });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const data = await response.json();
         state.powersaveState = data.powersave;
         statusEl.textContent = data.powersave ? 'Active' : 'Off';
         statusEl.className = 'header-badge' + (data.powersave ? ' active' : '');
+
+        // Surface the scheduled resume time in the smartgrid timestamp area.
+        const sgTimestamp = elements['smartgrid-timestamp'];
+        if (sgTimestamp) {
+            if (data.scheduled_resume_at) {
+                const t = new Date(data.scheduled_resume_at);
+                sgTimestamp.textContent = `auto-resume ${t.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
+            } else if (!data.powersave) {
+                sgTimestamp.textContent = '';
+            }
+        }
     } catch (err) {
         console.error('Error toggling powersave:', err);
         toggleEl.classList.add('error');

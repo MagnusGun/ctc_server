@@ -5,7 +5,7 @@
 //! - Tibber: Total prices with markup and price levels
 
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 
@@ -256,6 +256,78 @@ impl PriceState {
         });
 
         future_prices.into_iter().take(count).collect()
+    }
+
+    /// Returns the moment the current run of cheap slots ends, capped by `window`.
+    ///
+    /// Used for `LowPrice` / `Overcapacity` auto-resume: the user buffers heat now
+    /// because prices are cheap, so we want to flip back to Normal as soon as
+    /// prices stop being cheap. "Cheap" = level is `Some(VeryCheap | Cheap)`.
+    ///
+    /// - No price data with usable levels in the window → `None`.
+    /// - First non-cheap slot inside the window → return its `starts_at`.
+    /// - All in-window slots are cheap → return `now + window` so we never
+    ///   stay in a buffer mode indefinitely.
+    pub fn cheap_window_end(&self, window: Duration) -> Option<SystemTime> {
+        let inner = self.inner.lock().unwrap();
+
+        let now = chrono::Utc::now();
+        let chrono_window = chrono::Duration::from_std(window).ok()?;
+        let cutoff = now + chrono_window;
+
+        // Walk slots chronologically. We need price data with levels to reason about
+        // "cheap", so a slot with `level: None` is treated as a hard stop on the run
+        // (we can't know whether it's still cheap).
+        let mut found_in_window = false;
+        for slot in inner.today.iter().chain(inner.tomorrow.iter()) {
+            let Ok(start) = chrono::DateTime::parse_from_rfc3339(&slot.starts_at) else {
+                continue;
+            };
+            if start <= now {
+                continue;
+            }
+            if start > cutoff {
+                break;
+            }
+            found_in_window = true;
+            let is_cheap = matches!(slot.level, Some(PriceLevel::VeryCheap | PriceLevel::Cheap));
+            if !is_cheap {
+                return Some(SystemTime::from(start));
+            }
+        }
+
+        if found_in_window {
+            // All slots in the window were cheap — schedule at end of window.
+            Some(SystemTime::from(cutoff))
+        } else {
+            None
+        }
+    }
+
+    /// Get the single cheapest future price slot whose start is within `window` from now.
+    ///
+    /// Used for `SmartGrid` auto-resume: when the user blocks the heater, this picks
+    /// the lowest-price 15-minute slot inside the configured horizon (e.g. 8h).
+    pub fn cheapest_within(&self, window: Duration) -> Option<PricePoint> {
+        let inner = self.inner.lock().unwrap();
+
+        let now = chrono::Utc::now();
+        let cutoff = now + chrono::Duration::from_std(window).ok()?;
+
+        inner
+            .today
+            .iter()
+            .chain(inner.tomorrow.iter())
+            .filter(|p| {
+                chrono::DateTime::parse_from_rfc3339(&p.starts_at)
+                    .is_ok_and(|start| start > now && start <= cutoff)
+            })
+            .min_by(|a, b| {
+                a.spot_sek
+                    .partial_cmp(&b.spot_sek)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned()
     }
 
     /// Analyze Tibber markup over spot price
@@ -537,5 +609,183 @@ mod tests {
         let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let variance = calculate_variance(&values);
         assert_float_eq(variance, 2.0, "variance");
+    }
+
+    fn slot(offset_mins: i64, spot_sek: f64) -> PricePoint {
+        let start = chrono::Utc::now() + chrono::Duration::minutes(offset_mins);
+        let end = start + chrono::Duration::minutes(15);
+        PricePoint::from_spot(start.to_rfc3339(), end.to_rfc3339(), spot_sek, 0.0, 0.0)
+    }
+
+    #[test]
+    fn test_cheapest_within_empty_state() {
+        let state = PriceState::new("SE3".to_string());
+        assert!(
+            state
+                .cheapest_within(Duration::from_secs(8 * 3600))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_cheapest_within_picks_min_in_window() {
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![
+            slot(30, 1.50),
+            slot(60, 0.20), // cheapest within 8h
+            slot(120, 0.50),
+            slot(240, 0.30),
+        ];
+        state.update_prices(today, vec![]);
+        let pick = state
+            .cheapest_within(Duration::from_secs(8 * 3600))
+            .unwrap();
+        assert_float_eq(pick.spot_sek, 0.20, "cheapest spot");
+    }
+
+    #[test]
+    fn test_cheapest_within_excludes_past_slots() {
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![
+            slot(-60, 0.05), // very cheap but in the past — must be skipped
+            slot(30, 1.00),
+            slot(60, 0.40),
+        ];
+        state.update_prices(today, vec![]);
+        let pick = state
+            .cheapest_within(Duration::from_secs(8 * 3600))
+            .unwrap();
+        assert_float_eq(pick.spot_sek, 0.40, "ignores past, picks future min");
+    }
+
+    #[test]
+    fn test_cheapest_within_excludes_slots_beyond_window() {
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![
+            slot(60, 1.00),
+            slot(120, 0.80),
+            slot(600, 0.10), // 10h ahead — outside the 8h window even though cheapest
+        ];
+        state.update_prices(today, vec![]);
+        let pick = state
+            .cheapest_within(Duration::from_secs(8 * 3600))
+            .unwrap();
+        assert_float_eq(pick.spot_sek, 0.80, "stays inside window");
+    }
+
+    #[test]
+    fn test_cheapest_within_spans_today_and_tomorrow() {
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![slot(30, 1.20), slot(60, 0.90)];
+        let tomorrow = vec![slot(180, 0.25), slot(240, 0.75)];
+        state.update_prices(today, tomorrow);
+        let pick = state
+            .cheapest_within(Duration::from_secs(8 * 3600))
+            .unwrap();
+        assert_float_eq(pick.spot_sek, 0.25, "tomorrow slot wins");
+    }
+
+    #[test]
+    fn test_cheapest_within_zero_window_returns_none() {
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![slot(30, 0.50)];
+        state.update_prices(today, vec![]);
+        assert!(state.cheapest_within(Duration::ZERO).is_none());
+    }
+
+    fn slot_with_level(offset_mins: i64, spot_sek: f64, level: PriceLevel) -> PricePoint {
+        let mut p = slot(offset_mins, spot_sek);
+        p.level = Some(level);
+        p
+    }
+
+    #[test]
+    fn test_cheap_window_end_no_data() {
+        let state = PriceState::new("SE3".to_string());
+        assert!(
+            state
+                .cheap_window_end(Duration::from_secs(8 * 3600))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_cheap_window_end_all_cheap_returns_window_end() {
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![
+            slot_with_level(15, 0.10, PriceLevel::VeryCheap),
+            slot_with_level(45, 0.12, PriceLevel::Cheap),
+            slot_with_level(120, 0.11, PriceLevel::VeryCheap),
+        ];
+        state.update_prices(today, vec![]);
+        let window = Duration::from_secs(4 * 3600);
+        let result = state.cheap_window_end(window).unwrap();
+        // Should be ~now + 4h. Allow small slack for test execution time.
+        let now = SystemTime::now();
+        let expected_max = now + window + Duration::from_secs(5);
+        let expected_min = now + window - Duration::from_secs(5);
+        assert!(result >= expected_min && result <= expected_max);
+    }
+
+    #[test]
+    fn test_cheap_window_end_transition_returns_first_normal() {
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![
+            slot_with_level(15, 0.10, PriceLevel::VeryCheap),
+            slot_with_level(45, 0.12, PriceLevel::Cheap),
+            slot_with_level(75, 0.50, PriceLevel::Normal),
+            slot_with_level(105, 0.80, PriceLevel::Expensive),
+        ];
+        state.update_prices(today, vec![]);
+        let result = state
+            .cheap_window_end(Duration::from_secs(4 * 3600))
+            .unwrap();
+        // Should be the start of the +75min slot.
+        let target = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(75));
+        let diff = result
+            .duration_since(target)
+            .or_else(|e| Ok::<_, ()>(e.duration()))
+            .unwrap();
+        assert!(diff < Duration::from_secs(5), "diff was {diff:?}");
+    }
+
+    #[test]
+    fn test_cheap_window_end_immediate_normal_returns_first_slot() {
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![
+            slot_with_level(15, 0.50, PriceLevel::Normal),
+            slot_with_level(45, 0.60, PriceLevel::Expensive),
+        ];
+        state.update_prices(today, vec![]);
+        let result = state
+            .cheap_window_end(Duration::from_secs(4 * 3600))
+            .unwrap();
+        let target = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(15));
+        let diff = result
+            .duration_since(target)
+            .or_else(|e| Ok::<_, ()>(e.duration()))
+            .unwrap();
+        assert!(diff < Duration::from_secs(5), "diff was {diff:?}");
+    }
+
+    #[test]
+    fn test_cheap_window_end_unknown_level_treated_as_not_cheap() {
+        // A slot with no level is treated as "not cheap": we cannot prove it's
+        // cheap, and the safer interpretation is to end the buffer mode early.
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![
+            slot_with_level(15, 0.10, PriceLevel::VeryCheap),
+            slot(45, 0.30), // level = None
+        ];
+        state.update_prices(today, vec![]);
+        let result = state
+            .cheap_window_end(Duration::from_secs(4 * 3600))
+            .unwrap();
+        let target = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(45));
+        let diff = result
+            .duration_since(target)
+            .or_else(|e| Ok::<_, ()>(e.duration()))
+            .unwrap();
+        assert!(diff < Duration::from_secs(5), "diff was {diff:?}");
     }
 }

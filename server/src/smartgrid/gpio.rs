@@ -9,9 +9,18 @@ use std::time::SystemTime;
 
 use gpiocdev::line::Value;
 use gpiocdev::request::Request;
+use tokio::task::AbortHandle;
 use tracing::{debug, error};
 
 use super::mode::SmartGridMode;
+
+/// A pending auto-resume scheduled by the route handler. Stored on
+/// `GpioController` so the GET endpoint can surface `fires_at` and so
+/// any new manual mode change can `abort()` the pending task.
+pub struct ScheduledResume {
+    pub fires_at: SystemTime,
+    pub handle: AbortHandle,
+}
 
 /// GPIO controller for `SmartGrid` relays
 #[derive(Clone)]
@@ -23,6 +32,8 @@ pub struct GpioController {
     current_mode: Arc<Mutex<SmartGridMode>>,
     /// Timestamp when mode was last changed (None if never changed since startup)
     mode_changed_at: Arc<Mutex<Option<SystemTime>>>,
+    /// Pending auto-resume task; cleared whenever mode is changed manually.
+    scheduled_resume: Arc<Mutex<Option<ScheduledResume>>>,
 }
 
 impl GpioController {
@@ -44,6 +55,53 @@ impl GpioController {
             active_low,
             current_mode: Arc::new(Mutex::new(SmartGridMode::Normal)),
             mode_changed_at: Arc::new(Mutex::new(None)),
+            scheduled_resume: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Read-only accessor for the GET endpoint: when an auto-resume is
+    /// pending, returns the `SystemTime` it will fire at.
+    #[must_use]
+    pub fn scheduled_resume_at(&self) -> Option<SystemTime> {
+        self.scheduled_resume
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|r| r.fires_at))
+    }
+
+    /// Cancel any pending auto-resume (idempotent). Always called by the
+    /// route handler before applying a new manual mode, so a user-initiated
+    /// change can never leave a stale schedule that would later flip the heater.
+    pub fn cancel_scheduled_resume(&self) {
+        if let Ok(mut guard) = self.scheduled_resume.lock()
+            && let Some(prev) = guard.take()
+        {
+            prev.handle.abort();
+            debug!(
+                "Cancelled pending auto-resume scheduled at {:?}",
+                prev.fires_at
+            );
+        }
+    }
+
+    /// Replace any existing schedule with a new one, aborting the previous task.
+    pub fn set_scheduled_resume(&self, fires_at: SystemTime, handle: AbortHandle) {
+        if let Ok(mut guard) = self.scheduled_resume.lock() {
+            if let Some(prev) = guard.take() {
+                prev.handle.abort();
+            }
+            *guard = Some(ScheduledResume { fires_at, handle });
+        }
+    }
+
+    /// Clear the schedule slot only if the currently-stored `fires_at` matches
+    /// the supplied one. Used by the auto-resume task to clean up after itself
+    /// without clobbering a newer schedule the user installed in the meantime.
+    pub fn clear_resume_if_matches(&self, fires_at: SystemTime) {
+        if let Ok(mut guard) = self.scheduled_resume.lock()
+            && guard.as_ref().is_some_and(|r| r.fires_at == fires_at)
+        {
+            *guard = None;
         }
     }
 

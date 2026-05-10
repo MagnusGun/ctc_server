@@ -241,9 +241,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tx.clone(),
             config.modbus.request_timeout_secs,
             gpio_controller.clone(),
+            price_state.clone(),
+            config.smartgrid.clone(),
         ))
         .merge(routes::smartgrid::routes(
             gpio_controller,
+            price_state.clone(),
+            config.smartgrid.clone(),
             config.modbus.request_timeout_secs,
         ))
         .merge(routes::visibility::routes(
@@ -281,7 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 error!("Failed to install Ctrl-C handler: {e}");
                 return;
             }
-            info!("Shutdown signal received â persisting heatpump stats");
+            info!("Shutdown signal received — persisting heatpump stats");
             if let Err(e) = stats_for_shutdown.save_to_disk() {
                 error!("Failed to save heatpump stats on shutdown: {e}");
             }
