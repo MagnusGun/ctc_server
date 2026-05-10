@@ -132,6 +132,10 @@ pub struct HeatPumpStatsConfig {
     pub enabled: bool,
     /// Polling interval in seconds (how often to read heat pump status)
     pub poll_interval_secs: u64,
+    /// Optional path to a JSON file used to persist accumulators and history
+    /// across restarts. `None` (or empty) disables persistence.
+    #[serde(default)]
+    pub persist_path: Option<String>,
 }
 
 impl Config {
@@ -204,7 +208,8 @@ impl Config {
             .set_default("price.fetch_interval_mins", 15)?
             // Heat pump stats defaults
             .set_default("heatpump_stats.enabled", true)?
-            .set_default("heatpump_stats.poll_interval_secs", 10)?;
+            .set_default("heatpump_stats.poll_interval_secs", 10)?
+            .set_default("heatpump_stats.persist_path", None::<String>)?;
 
         builder.build()?.try_deserialize()
     }
@@ -370,6 +375,8 @@ mod tests {
             .set_default("heatpump_stats.enabled", true)
             .unwrap()
             .set_default("heatpump_stats.poll_interval_secs", 10)
+            .unwrap()
+            .set_default("heatpump_stats.persist_path", None::<String>)
             .unwrap();
 
         let config: Config = builder.build().unwrap().try_deserialize().unwrap();

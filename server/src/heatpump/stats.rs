@@ -7,12 +7,16 @@
 //! - Outdoor temperature correlation for each cycle
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
-use serde::Serialize;
-use tracing::trace;
+use serde::{Deserialize, Serialize};
+use tracing::{trace, warn};
+
+/// On-disk format version. Bump when `PersistedStats` shape changes.
+const PERSIST_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum number of cycles to keep in history
 const MAX_CYCLE_HISTORY: usize = 1000;
@@ -24,6 +28,21 @@ const MAX_DAILY_HISTORY: usize = 365;
 #[derive(Clone)]
 pub struct HeatPumpStats {
     inner: Arc<Mutex<HeatPumpStatsInner>>,
+    /// Optional path used by `save_to_disk()`; `None` disables persistence.
+    persist_path: Option<PathBuf>,
+}
+
+/// Subset of stats persisted to disk. Excludes derived/rolling-window state
+/// (those repopulate naturally on the next poll tick) and live cycle state
+/// (we let the existing first-poll path re-sync compressor on/off).
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedStats {
+    schema_version: u32,
+    tracking_started_unix_secs: u64,
+    total_starts: u64,
+    total_operating_secs: u64,
+    cycle_history: VecDeque<CycleRecord>,
+    daily_history: VecDeque<DailyRecord>,
 }
 
 /// Internal state for heat pump statistics
@@ -89,7 +108,7 @@ struct HeatPumpStatsInner {
 }
 
 /// A single completed compressor cycle
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CycleRecord {
     /// ISO 8601 timestamp when cycle started
     pub timestamp: String,
@@ -100,7 +119,7 @@ pub struct CycleRecord {
 }
 
 /// Daily aggregated statistics
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyRecord {
     /// Date string (YYYY-MM-DD)
     pub date: String,
@@ -187,52 +206,73 @@ pub struct HeatPumpHistoryResponse {
 }
 
 impl HeatPumpStats {
-    /// Create a new heat pump statistics tracker
+    /// Create a new in-memory-only heat pump statistics tracker.
+    /// Data is lost on restart. Used by tests and for runs with no persist path.
     #[must_use]
     pub fn new() -> Self {
-        let now = SystemTime::now();
-        let now_secs = system_time_to_secs(now);
-        let (year, month, day) = secs_to_ymd(now_secs);
-
         Self {
-            inner: Arc::new(Mutex::new(HeatPumpStatsInner {
-                initialized: false,
-                observed_cycle_start: false,
-                compressor_on: false,
-                state_started_at: now,
-                cycle_start_temp: None,
-                cycle_history: VecDeque::with_capacity(MAX_CYCLE_HISTORY),
-                daily_history: VecDeque::with_capacity(MAX_DAILY_HISTORY),
-
-                starts_this_hour: 0,
-                starts_this_day: 0,
-                starts_this_week: 0,
-                starts_this_month: 0,
-                starts_this_year: 0,
-
-                operating_secs_this_hour: 0,
-                operating_secs_this_day: 0,
-                operating_secs_this_week: 0,
-                operating_secs_this_month: 0,
-                operating_secs_this_year: 0,
-
-                current_hour_start: hour_start(now_secs),
-                current_day_start: day_start(now_secs),
-                current_week_start: week_start(now_secs),
-                current_month_start: month_start(year, month),
-                current_year_start: year_start(year),
-
-                current_day_date: (year, month, day),
-                current_day_starts: 0,
-                current_day_operating_secs: 0,
-                current_day_temp_sum: 0.0,
-                current_day_temp_count: 0,
-
-                tracking_started: now,
-                total_starts: 0,
-                total_operating_secs: 0,
-            })),
+            inner: Arc::new(Mutex::new(fresh_inner(SystemTime::now()))),
+            persist_path: None,
         }
+    }
+
+    /// Create a tracker that loads previous accumulators from `path` if available
+    /// and writes to `path` on cycle completion / day rollover / shutdown.
+    ///
+    /// If the file does not exist, is unreadable, or fails to parse, this falls
+    /// back to a fresh tracker (logging a warning) so a corrupt persistence file
+    /// never blocks server startup.
+    #[must_use]
+    pub fn new_with_persistence<P: Into<PathBuf>>(path: P) -> Self {
+        let path = path.into();
+        let inner = match load_persisted(&path) {
+            Ok(Some(persisted)) => {
+                let mut inner = fresh_inner(SystemTime::now());
+                inner.tracking_started =
+                    unix_secs_to_system_time(persisted.tracking_started_unix_secs);
+                inner.total_starts = persisted.total_starts;
+                inner.total_operating_secs = persisted.total_operating_secs;
+                inner.cycle_history = persisted.cycle_history;
+                inner.daily_history = persisted.daily_history;
+                inner
+            }
+            Ok(None) => fresh_inner(SystemTime::now()),
+            Err(e) => {
+                warn!(
+                    "Failed to load persisted heatpump stats from {}: {e} — starting fresh",
+                    path.display()
+                );
+                fresh_inner(SystemTime::now())
+            }
+        };
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            persist_path: Some(path),
+        }
+    }
+
+    /// Persist the current accumulators and history to disk via an atomic
+    /// write (temp file + rename). No-op if persistence is disabled.
+    pub fn save_to_disk(&self) -> std::io::Result<()> {
+        let Some(path) = self.persist_path.as_ref() else {
+            return Ok(());
+        };
+        let snapshot = {
+            let inner = self.inner.lock().unwrap();
+            PersistedStats {
+                schema_version: PERSIST_SCHEMA_VERSION,
+                tracking_started_unix_secs: system_time_to_unix_secs(inner.tracking_started),
+                total_starts: inner.total_starts,
+                total_operating_secs: inner.total_operating_secs,
+                cycle_history: inner.cycle_history.clone(),
+                daily_history: inner.daily_history.clone(),
+            }
+        };
+        let json = serde_json::to_vec_pretty(&snapshot).map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Update compressor state based on polled status code
@@ -244,90 +284,102 @@ impl HeatPumpStats {
         let is_on = matches!(status_code, 3..=5);
         let now = SystemTime::now();
         let now_secs = system_time_to_secs(now);
+        let mut should_persist = false;
 
-        let mut inner = self.inner.lock().unwrap();
+        {
+            let mut inner = self.inner.lock().unwrap();
 
-        // Handle first update - just sync state without counting anything
-        // This ensures we don't count partial cycles if server starts with heater ON
-        if !inner.initialized {
-            inner.initialized = true;
-            inner.compressor_on = is_on;
-            inner.state_started_at = now;
-            // observed_cycle_start stays false - we didn't observe the actual start
-            return;
-        }
-
-        // Check for window rollovers first
-        inner.check_window_rollovers(now_secs);
-
-        // Record outdoor temp for daily average (if available)
-        if let Some(temp) = outdoor_temp {
-            inner.current_day_temp_sum += f64::from(temp);
-            inner.current_day_temp_count += 1;
-        }
-
-        // State transition: ON -> OFF (cycle complete)
-        if inner.compressor_on && !is_on {
-            // Only record cycle if we observed the actual start (not a partial cycle)
-            if inner.observed_cycle_start {
-                let duration = now
-                    .duration_since(inner.state_started_at)
-                    .unwrap_or_default();
-                let duration_secs = duration.as_secs();
-
-                trace!(
-                    "Compressor cycle complete: {} seconds, temp: {:?}",
-                    duration_secs, inner.cycle_start_temp
-                );
-
-                // Record the completed cycle
-                let cycle = CycleRecord {
-                    timestamp: format_timestamp(inner.state_started_at),
-                    duration_secs,
-                    outdoor_temp_c: inner.cycle_start_temp,
-                };
-
-                inner.cycle_history.push_back(cycle);
-                if inner.cycle_history.len() > MAX_CYCLE_HISTORY {
-                    inner.cycle_history.pop_front();
-                }
-
-                // Update operating time counters
-                inner.operating_secs_this_hour += duration_secs;
-                inner.operating_secs_this_day += duration_secs;
-                inner.operating_secs_this_week += duration_secs;
-                inner.operating_secs_this_month += duration_secs;
-                inner.operating_secs_this_year += duration_secs;
-                inner.total_operating_secs += duration_secs;
-                inner.current_day_operating_secs += duration_secs;
+            // Handle first update - just sync state without counting anything
+            // This ensures we don't count partial cycles if server starts with heater ON
+            if !inner.initialized {
+                inner.initialized = true;
+                inner.compressor_on = is_on;
+                inner.state_started_at = now;
+                // observed_cycle_start stays false - we didn't observe the actual start
+                return;
             }
 
-            // Reset for next cycle
-            inner.observed_cycle_start = false;
-        }
+            // Check for window rollovers first
+            if inner.check_window_rollovers(now_secs) {
+                should_persist = true;
+            }
 
-        // State transition: OFF -> ON (cycle start)
-        if !inner.compressor_on && is_on {
-            trace!("Compressor cycle started, temp: {:?}", outdoor_temp);
+            // Record outdoor temp for daily average (if available)
+            if let Some(temp) = outdoor_temp {
+                inner.current_day_temp_sum += f64::from(temp);
+                inner.current_day_temp_count += 1;
+            }
 
-            // Mark that we observed this start (for valid cycle tracking)
-            inner.observed_cycle_start = true;
+            // State transition: ON -> OFF (cycle complete)
+            if inner.compressor_on && !is_on {
+                // Only record cycle if we observed the actual start (not a partial cycle)
+                if inner.observed_cycle_start {
+                    let duration = now
+                        .duration_since(inner.state_started_at)
+                        .unwrap_or_default();
+                    let duration_secs = duration.as_secs();
 
-            inner.starts_this_hour += 1;
-            inner.starts_this_day += 1;
-            inner.starts_this_week += 1;
-            inner.starts_this_month += 1;
-            inner.starts_this_year += 1;
-            inner.total_starts += 1;
-            inner.current_day_starts += 1;
+                    trace!(
+                        "Compressor cycle complete: {} seconds, temp: {:?}",
+                        duration_secs, inner.cycle_start_temp
+                    );
 
-            inner.cycle_start_temp = outdoor_temp;
-        }
+                    // Record the completed cycle
+                    let cycle = CycleRecord {
+                        timestamp: format_timestamp(inner.state_started_at),
+                        duration_secs,
+                        outdoor_temp_c: inner.cycle_start_temp,
+                    };
 
-        // Update state if changed
-        if inner.compressor_on != is_on {
-            inner.compressor_on = is_on;
-            inner.state_started_at = now;
+                    inner.cycle_history.push_back(cycle);
+                    if inner.cycle_history.len() > MAX_CYCLE_HISTORY {
+                        inner.cycle_history.pop_front();
+                    }
+
+                    // Update operating time counters
+                    inner.operating_secs_this_hour += duration_secs;
+                    inner.operating_secs_this_day += duration_secs;
+                    inner.operating_secs_this_week += duration_secs;
+                    inner.operating_secs_this_month += duration_secs;
+                    inner.operating_secs_this_year += duration_secs;
+                    inner.total_operating_secs += duration_secs;
+                    inner.current_day_operating_secs += duration_secs;
+
+                    // Cycle completion advances accumulators — persist.
+                    should_persist = true;
+                }
+
+                // Reset for next cycle
+                inner.observed_cycle_start = false;
+            }
+
+            // State transition: OFF -> ON (cycle start)
+            if !inner.compressor_on && is_on {
+                trace!("Compressor cycle started, temp: {:?}", outdoor_temp);
+
+                // Mark that we observed this start (for valid cycle tracking)
+                inner.observed_cycle_start = true;
+
+                inner.starts_this_hour += 1;
+                inner.starts_this_day += 1;
+                inner.starts_this_week += 1;
+                inner.starts_this_month += 1;
+                inner.starts_this_year += 1;
+                inner.total_starts += 1;
+                inner.current_day_starts += 1;
+
+                inner.cycle_start_temp = outdoor_temp;
+            }
+
+            // Update state if changed
+            if inner.compressor_on != is_on {
+                inner.compressor_on = is_on;
+                inner.state_started_at = now;
+            }
+        } // drop inner lock before any I/O
+
+        if should_persist && let Err(e) = self.save_to_disk() {
+            warn!("Failed to persist heatpump stats: {e}");
         }
     }
 
@@ -443,10 +495,84 @@ impl Default for HeatPumpStats {
     }
 }
 
+fn fresh_inner(now: SystemTime) -> HeatPumpStatsInner {
+    let now_secs = system_time_to_secs(now);
+    let (year, month, day) = secs_to_ymd(now_secs);
+    HeatPumpStatsInner {
+        initialized: false,
+        observed_cycle_start: false,
+        compressor_on: false,
+        state_started_at: now,
+        cycle_start_temp: None,
+        cycle_history: VecDeque::with_capacity(MAX_CYCLE_HISTORY),
+        daily_history: VecDeque::with_capacity(MAX_DAILY_HISTORY),
+
+        starts_this_hour: 0,
+        starts_this_day: 0,
+        starts_this_week: 0,
+        starts_this_month: 0,
+        starts_this_year: 0,
+
+        operating_secs_this_hour: 0,
+        operating_secs_this_day: 0,
+        operating_secs_this_week: 0,
+        operating_secs_this_month: 0,
+        operating_secs_this_year: 0,
+
+        current_hour_start: hour_start(now_secs),
+        current_day_start: day_start(now_secs),
+        current_week_start: week_start(now_secs),
+        current_month_start: month_start(year, month),
+        current_year_start: year_start(year),
+
+        current_day_date: (year, month, day),
+        current_day_starts: 0,
+        current_day_operating_secs: 0,
+        current_day_temp_sum: 0.0,
+        current_day_temp_count: 0,
+
+        tracking_started: now,
+        total_starts: 0,
+        total_operating_secs: 0,
+    }
+}
+
+/// Returns `Ok(Some(_))` on a successful load, `Ok(None)` if the file does not
+/// exist (a clean first run), or `Err` if the file exists but is unreadable
+/// or unparseable.
+fn load_persisted(path: &Path) -> std::io::Result<Option<PersistedStats>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let parsed: PersistedStats =
+                serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+            if parsed.schema_version != PERSIST_SCHEMA_VERSION {
+                return Err(std::io::Error::other(format!(
+                    "unsupported schema version {}",
+                    parsed.schema_version
+                )));
+            }
+            Ok(Some(parsed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn system_time_to_unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn unix_secs_to_system_time(secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(secs)
+}
+
 impl HeatPumpStatsInner {
-    /// Check and handle window rollovers (hour, day, week, month, year)
-    fn check_window_rollovers(&mut self, now_secs: u64) {
+    /// Check and handle window rollovers (hour, day, week, month, year).
+    /// Returns `true` when a day rollover archived a `DailyRecord` (caller
+    /// should persist to disk in that case).
+    fn check_window_rollovers(&mut self, now_secs: u64) -> bool {
         let (year, month, day) = secs_to_ymd(now_secs);
+        let mut archived = false;
 
         // Hour rollover
         let new_hour_start = hour_start(now_secs);
@@ -464,6 +590,7 @@ impl HeatPumpStatsInner {
 
             // Archive the previous day's stats
             self.archive_current_day();
+            archived = true;
 
             self.starts_this_day = 0;
             self.operating_secs_this_day = 0;
@@ -503,6 +630,8 @@ impl HeatPumpStatsInner {
             self.operating_secs_this_year = 0;
             self.current_year_start = new_year_start;
         }
+
+        archived
     }
 
     /// Archive the current day's stats to daily history
@@ -926,5 +1055,100 @@ mod tests {
         let summary = stats.get_summary();
         assert_float_eq(summary.operating_hours.this_hour, 0.0, "No operating hours");
         assert_eq!(summary.tracking.total_starts, 0);
+    }
+
+    fn unique_persist_path(label: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("ctc_stats_{label}_{pid}_{nanos}.json"));
+        p
+    }
+
+    #[test]
+    fn test_persist_round_trip() {
+        let path = unique_persist_path("round_trip");
+        let stats = HeatPumpStats::new_with_persistence(path.clone());
+
+        // Drive a complete cycle so accumulators advance.
+        stats.update_state(0, Some(10.0));
+        stats.update_state(3, Some(11.0));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stats.update_state(0, Some(12.0));
+
+        let before = stats.get_summary();
+        assert_eq!(before.tracking.total_starts, 1);
+
+        // Reload — start times must match (same tracking_started_unix_secs)
+        // and total_starts must survive.
+        let reloaded = HeatPumpStats::new_with_persistence(path.clone());
+        let after = reloaded.get_summary();
+        assert_eq!(after.tracking.total_starts, 1);
+        assert_eq!(after.tracking.started_at, before.tracking.started_at);
+
+        // Cycle history must round-trip.
+        let history = reloaded.get_history(7);
+        assert_eq!(history.cycles.len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_persist_missing_file_starts_fresh() {
+        let path = unique_persist_path("missing");
+        assert!(!path.exists());
+        let stats = HeatPumpStats::new_with_persistence(path.clone());
+        assert_eq!(stats.get_summary().tracking.total_starts, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_persist_corrupt_file_starts_fresh() {
+        let path = unique_persist_path("corrupt");
+        std::fs::write(&path, b"this is not json").unwrap();
+        let stats = HeatPumpStats::new_with_persistence(path.clone());
+        // Falls back cleanly without panic.
+        assert_eq!(stats.get_summary().tracking.total_starts, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_persist_unknown_schema_version_starts_fresh() {
+        let path = unique_persist_path("schema");
+        let bogus = serde_json::json!({
+            "schema_version": 999,
+            "tracking_started_unix_secs": 1_700_000_000u64,
+            "total_starts": 42u64,
+            "total_operating_secs": 1234u64,
+            "cycle_history": [],
+            "daily_history": [],
+        });
+        std::fs::write(&path, serde_json::to_vec(&bogus).unwrap()).unwrap();
+        let stats = HeatPumpStats::new_with_persistence(path.clone());
+        // Schema mismatch → we treat the file as unreadable and start fresh.
+        assert_eq!(stats.get_summary().tracking.total_starts, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_save_to_disk_atomic_write() {
+        let path = unique_persist_path("atomic");
+        let stats = HeatPumpStats::new_with_persistence(path.clone());
+        stats.save_to_disk().unwrap();
+        // After a successful save, the .tmp must not be lingering.
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "temp file should be renamed away");
+        assert!(path.exists(), "final file should exist");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_new_disables_persistence() {
+        // The plain `new()` keeps existing test ergonomics: no file is created.
+        let stats = HeatPumpStats::new();
+        stats.save_to_disk().unwrap(); // no-op, never errors
     }
 }

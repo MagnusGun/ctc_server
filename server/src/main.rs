@@ -145,8 +145,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create grid state for peak tracking
     let grid_state = GridState::new();
 
-    // Create heat pump stats tracker
-    let heatpump_stats = heatpump::HeatPumpStats::new();
+    // Create heat pump stats tracker.
+    // When `persist_path` is configured (and non-empty), accumulators and
+    // history survive restarts; otherwise the tracker is in-memory only.
+    let heatpump_stats = match config.heatpump_stats.persist_path.as_deref() {
+        Some(p) if !p.is_empty() => {
+            info!("Heat pump stats persistence enabled at {p}");
+            heatpump::HeatPumpStats::new_with_persistence(p)
+        }
+        _ => heatpump::HeatPumpStats::new(),
+    };
 
     // Start heat pump stats polling if enabled
     if config.heatpump_stats.enabled {
@@ -251,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             price_state,
             tibber_token.is_some(),
         ))
-        .merge(routes::heatpump_stats::routes(heatpump_stats))
+        .merge(routes::heatpump_stats::routes(heatpump_stats.clone()))
         // Static file serving for web dashboard
         .nest_service("/static", ServeDir::new(static_dir()))
         .route(
@@ -263,7 +271,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
     info!("Starting server on {}", bind_addr);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    axum::serve(listener, app).await?;
+
+    // Graceful shutdown: on Ctrl-C, persist heatpump stats one last time
+    // before exiting so the final accumulator state survives the restart.
+    let stats_for_shutdown = heatpump_stats.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                error!("Failed to install Ctrl-C handler: {e}");
+                return;
+            }
+            info!("Shutdown signal received â persisting heatpump stats");
+            if let Err(e) = stats_for_shutdown.save_to_disk() {
+                error!("Failed to save heatpump stats on shutdown: {e}");
+            }
+        })
+        .await?;
 
     Ok(())
 }
