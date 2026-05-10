@@ -87,7 +87,7 @@ pub async fn read_parameter(
     match timeout(request_timeout, response_rx).await {
         Ok(Ok(Ok(ModbusResponse::Value(value)))) => {
             trace!("{log_context}: {value}");
-            Ok(format!("{{\"{json_key}\": {value}}}\n"))
+            Ok(format!("{{\"{json_key}\": {value:?}}}\n"))
         }
         Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
             error!("Unexpected RawRegisters response in {log_context}");
@@ -154,7 +154,7 @@ pub async fn write_parameter(
     match timeout(request_timeout, response_rx).await {
         Ok(Ok(Ok(_))) => {
             trace!("{log_context}: write_parameter - Response received: SUCCESS");
-            Ok(format!("{{\"{json_key}\": {value}}}\n"))
+            Ok(format!("{{\"{json_key}\": {value:?}}}\n"))
         }
         Ok(Ok(Err(e))) => {
             // Log full error details internally
@@ -359,7 +359,7 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "{\"temperature\": 23}\n");
+        assert_eq!(result.unwrap(), "{\"temperature\": 23.0}\n");
     }
 
     #[tokio::test]
