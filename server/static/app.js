@@ -1177,8 +1177,20 @@ async function updateAll() {
 }
 
 // Initialize and start updates
+async function fetchServerVersion() {
+    const el = document.getElementById('server-version');
+    if (!el) return;
+    try {
+        const data = await fetchJson(`${API_BASE}/version`);
+        el.textContent = `v${data.version}`;
+    } catch (err) {
+        el.textContent = '';
+    }
+}
+
 function init() {
     initElements();
+    fetchServerVersion();
 
     // Powersave toggle handler
     const powersaveToggle = elements['powersave-toggle'];
