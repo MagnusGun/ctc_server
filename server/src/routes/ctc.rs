@@ -137,7 +137,9 @@ async fn post_ctc_data(
 struct PowerSave {
     active: bool,
     /// When set with `active=true`, schedule an auto-resume to Normal at the
-    /// cheapest 15-min slot inside the configured window.
+    /// start of the cheapest contiguous `auto_resume_min_duration_minutes`
+    /// run inside the configured window, falling back to the cheapest single
+    /// slot when no run of that length fits.
     #[serde(default)]
     schedule_resume: bool,
 }
@@ -267,7 +269,8 @@ mod tests {
     fn test_smartgrid_config() -> SmartGridConfig {
         SmartGridConfig {
             auto_resume_enabled: true,
-            auto_resume_window_hours: 8,
+            auto_resume_window_hours: 12,
+            auto_resume_min_duration_minutes: 30,
         }
     }
 

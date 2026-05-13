@@ -9,7 +9,7 @@ const LEVEL_VAR = {
 };
 const levelColor = lvl => LEVEL_VAR[lvl] ?? "var(--text-3)";
 
-const EnergyChart = ({ today, nowIndex, height = 200 }) => {
+const EnergyChart = ({ today, nowIndex, scheduledResumeAt = null, scheduledRunMinutes = null, height = 200 }) => {
   const [hover, setHover] = React.useState(null);
   const w = 1200;
   const h = height;
@@ -20,6 +20,31 @@ const EnergyChart = ({ today, nowIndex, height = 200 }) => {
   const slots = Array.isArray(today) ? today : [];
   const N = slots.length;
   const hasData = slots.some(p => p?.spot_sek != null && p.spot_sek > 0);
+
+  // Scheduled-run overlay. The visibility check uses the actual slot time
+  // domain (not wall-clock "today") so the band is robust to brief
+  // mismatches around midnight when server-side price rollover lags the
+  // calendar by a few seconds.
+  const resumeBand = (() => {
+    if (!hasData || !scheduledResumeAt || !(scheduledRunMinutes > 0) || N < 1) return null;
+    const startMs = Date.parse(slots[0]?.starts_at);
+    const endMs = Date.parse(slots[N - 1]?.ends_at);
+    const resumeMs = Date.parse(scheduledResumeAt);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || !Number.isFinite(resumeMs)) return null;
+    if (!(endMs > startMs) || resumeMs < startMs || resumeMs >= endMs) return null;
+    const span = endMs - startMs;
+    const xLeft = padL + ((resumeMs - startMs) / span) * innerW;
+    const widthRaw = (scheduledRunMinutes * 60_000 / span) * innerW;
+    const xRight = Math.min(padL + innerW, xLeft + widthRaw);
+    const bandW = Math.max(2, xRight - xLeft);
+    return (
+      <g pointerEvents="none">
+        <rect className="resume-band" x={xLeft} y={padT} width={bandW} height={innerH} />
+        <line className="resume-edge" x1={xLeft} x2={xLeft} y1={padT} y2={h - padB} />
+        <text className="resume-label" x={xLeft + 4} y={padT + 11}>RESUME</text>
+      </g>
+    );
+  })();
 
   const yMin = 0;
   const yMax = hasData
@@ -93,6 +118,7 @@ const EnergyChart = ({ today, nowIndex, height = 200 }) => {
       {hasData && (
         <>
           <path d={buildArea()} fill="url(#todayFill)" />
+          {resumeBand}
           {slots.slice(0, -1).map((p, i) => {
             const a = p?.spot_sek;
             const b = slots[i + 1]?.spot_sek;

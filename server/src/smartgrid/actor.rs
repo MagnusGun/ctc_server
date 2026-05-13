@@ -261,6 +261,34 @@ pub fn spawn(
     Ok((SmartGridHandle { tx }, join))
 }
 
+/// Pick the wall-clock instant at which `mode` should auto-resume to Normal.
+///
+/// `Blocking` resumes at the start of the cheapest contiguous run of length
+/// `auto_resume_min_duration_minutes` within the `auto_resume_window_hours`
+/// horizon. If no run of that length fits (sparse price data, fragmented
+/// today/tomorrow boundary), falls back to the cheapest single slot so we
+/// still schedule. `LowPrice` / `Overcapacity` resume when the current cheap
+/// run ends, capped by the window. `Normal` never schedules.
+fn compute_resume_target(
+    price_state: &PriceState,
+    config: &SmartGridConfig,
+    mode: SmartGridMode,
+) -> Option<SystemTime> {
+    let window = Duration::from_secs(config.auto_resume_window_hours.saturating_mul(3600));
+    let run_duration =
+        Duration::from_secs(u64::from(config.auto_resume_min_duration_minutes).saturating_mul(60));
+    match mode {
+        SmartGridMode::Blocking => price_state
+            .cheapest_run_within(window, run_duration)
+            .or_else(|| price_state.cheapest_within(window))
+            .and_then(|slot| parse_iso8601(&slot.starts_at).ok()),
+        SmartGridMode::LowPrice | SmartGridMode::Overcapacity => {
+            price_state.cheap_window_end(window)
+        }
+        SmartGridMode::Normal => None,
+    }
+}
+
 impl SmartGridActor {
     async fn run(mut self, mut rx: mpsc::Receiver<SmartGridCmd>, cancel: CancellationToken) {
         info!("SmartGrid actor started");
@@ -347,17 +375,7 @@ impl SmartGridActor {
             return Ok(None);
         }
 
-        let window = Duration::from_secs(self.config.auto_resume_window_hours.saturating_mul(3600));
-        let fires_at = match mode {
-            SmartGridMode::Blocking => self
-                .price_state
-                .cheapest_within(window)
-                .and_then(|slot| parse_iso8601(&slot.starts_at).ok()),
-            SmartGridMode::LowPrice | SmartGridMode::Overcapacity => {
-                self.price_state.cheap_window_end(window)
-            }
-            SmartGridMode::Normal => unreachable!("returned above"),
-        };
+        let fires_at = compute_resume_target(&self.price_state, &self.config, mode);
 
         let Some(fires_at) = fires_at else {
             warn!(
@@ -501,7 +519,8 @@ mod tests {
     fn test_config() -> SmartGridConfig {
         SmartGridConfig {
             auto_resume_enabled: true,
-            auto_resume_window_hours: 8,
+            auto_resume_window_hours: 12,
+            auto_resume_min_duration_minutes: 30,
         }
     }
 
@@ -687,6 +706,66 @@ mod tests {
         assert!(pump_on_for(SmartGridMode::LowPrice));
         assert!(pump_on_for(SmartGridMode::Overcapacity));
         assert!(!pump_on_for(SmartGridMode::Blocking));
+    }
+
+    use crate::energy::price::test_support::{make_run, slot as isolated_slot};
+
+    /// Blocking-mode resume must pick the start of the cheapest contiguous
+    /// 30-min run, not an isolated single slot that happens to be cheaper
+    /// on its own. Regression for the original "cheapest 15-min" behaviour
+    /// where a brief dip would unblock the heater into a price that ramps
+    /// up immediately afterwards.
+    #[test]
+    fn compute_resume_target_blocking_prefers_contiguous_run_over_isolated_cheaper_slot() {
+        let state = PriceState::new("SE3".to_string());
+        let mut prices = Vec::new();
+        prices.extend(make_run(60, &[0.10, 0.10])); // contiguous 30-min run @ avg 0.10
+        prices.push(isolated_slot(180, 0.02)); // isolated cheaper single slot (no neighbour)
+        state.update_prices(prices, vec![]);
+        let cfg = test_config();
+        let target = compute_resume_target(&state, &cfg, SmartGridMode::Blocking)
+            .expect("Blocking with prices in window must produce a target");
+        let expected = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(60));
+        let diff = target
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            diff < Duration::from_secs(5),
+            "target must be ~now+60min (start of contiguous run), got diff {diff:?}"
+        );
+    }
+
+    /// When no run of the required length fits anywhere inside the window,
+    /// the helper falls back to `cheapest_within` so we still schedule a
+    /// resume — better imperfect than nothing.
+    #[test]
+    fn compute_resume_target_blocking_falls_back_to_single_slot_when_no_run_fits() {
+        let state = PriceState::new("SE3".to_string());
+        // Only one 15-min slot; no second slot adjacent to it — a 30-min
+        // contiguous run cannot be formed.
+        state.update_prices(vec![isolated_slot(45, 0.20)], vec![]);
+        let cfg = test_config();
+        let target = compute_resume_target(&state, &cfg, SmartGridMode::Blocking)
+            .expect("fallback to cheapest_within must keep a schedule");
+        let expected = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(45));
+        let diff = target
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            diff < Duration::from_secs(5),
+            "fallback target must be the single available slot, got diff {diff:?}"
+        );
+    }
+
+    /// `Normal` is a guarded case in `do_set_mode` (early-returned before we
+    /// reach this helper), but the helper itself must be total — return
+    /// `None` rather than panic.
+    #[test]
+    fn compute_resume_target_normal_returns_none() {
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let cfg = test_config();
+        assert!(compute_resume_target(&state, &cfg, SmartGridMode::Normal).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

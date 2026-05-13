@@ -727,6 +727,8 @@ function App() {
                 <EnergyChart
                   today={todayPrices}
                   nowIndex={nowIdx}
+                  scheduledResumeAt={sgResp?.scheduled_resume_at}
+                  scheduledRunMinutes={sgResp?.run_minutes ?? proposedResume?.run_minutes}
                   height={narrow ? 140 : 200}
                 />
               </>
@@ -968,12 +970,13 @@ function App() {
         // previous slot before the new fetch lands.
         const closeConfirm = () => { setConfirm(null); setProposedResume(null); };
         // Use the backend's proposed auto-resume time directly. The dashboard
-        // doesn't recompute it — the backend picks the slot (cheapest-within
-        // for Blocking, cheap-window-end for LowPrice/Overcapacity) and we
-        // display whatever it returns, labeled as the auto-resume time.
+        // doesn't recompute it — the backend picks the slot
+        // (cheapest_run_within for Blocking, cheap_window_end for
+        // LowPrice/Overcapacity) and we display whatever it returns.
         const autoResumeAt = proposedResume?.starts_at
           ? new Date(proposedResume.starts_at).toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", hour12: false })
           : "—";
+        const runMins = sgResp?.run_minutes ?? proposedResume?.run_minutes;
         // Derive the next significant price increase from today's curve.
         // "Significant" = next upcoming 15-min slot priced ≥ 1.5× the current one.
         const priceUp = (() => {
@@ -1002,7 +1005,9 @@ function App() {
           <>Boost mode — heat aggressively while there is surplus capacity on the grid. Price is forecast to rise from <strong>{priceUpFrom}</strong> to <strong>{priceUpTo} kr/kWh</strong> at <strong>{priceUpAt}</strong>.</>
         );
         const optA = isPS
-          ? { t: `Auto-resume at ${autoResumeAt}`, d: "Heat will turn back on automatically at the time chosen by the server." }
+          ? { t: `Auto-resume at ${autoResumeAt}`, d: runMins
+              ? `Heat resumes at the start of the cheapest ${runMins}-minute window in the next few hours.`
+              : "Heat will turn back on automatically at the time chosen by the server." }
           : isLP
           ? { t: `Auto-return to Normal at ${autoResumeAt}`, d: "Switches back when the cheap-price window ends." }
           : { t: `Auto-return to Normal at ${priceUpAt}`, d: "Switches back right before the next price increase." };

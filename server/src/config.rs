@@ -163,13 +163,25 @@ pub struct HeatPumpStatsConfig {
     pub persist_path: Option<String>,
 }
 
-/// `SmartGrid` behavioural configuration
+/// `SmartGrid` behavioural configuration.
+///
+/// The `auto_resume_*` prefix is intentional: all three fields belong to the
+/// auto-resume scheduler. Flattening or renaming would either lose the
+/// grouping in the TOML file or require a nested table — both worse than
+/// the prefix repetition. Hence `#[allow(clippy::struct_field_names)]`.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SmartGridConfig {
     /// Enable auto-resume to Normal after a manually-triggered Blocking
     pub auto_resume_enabled: bool,
     /// How far ahead the cheapest-slot scan looks (hours)
     pub auto_resume_window_hours: u64,
+    /// Minimum contiguous run length the Blocking-resume scan looks for, in
+    /// minutes. Picking a single 15-min slot can land the heater in a brief
+    /// dip that is over before recovery heating completes; widening this to
+    /// 30 min (default) selects the start of the cheapest 30-min contiguous
+    /// stretch instead. Clamped to `[15, 240]`.
+    pub auto_resume_min_duration_minutes: u16,
 }
 
 /// Homey REST API integration for controlling the Cirkulationspump smart plug.
@@ -321,7 +333,8 @@ impl Config {
             .set_default("heatpump_stats.persist_path", None::<String>)?
             // SmartGrid defaults
             .set_default("smartgrid.auto_resume_enabled", true)?
-            .set_default("smartgrid.auto_resume_window_hours", 8)?
+            .set_default("smartgrid.auto_resume_window_hours", 12)?
+            .set_default("smartgrid.auto_resume_min_duration_minutes", 30)?
             // Homey defaults — disabled by default; opt in via [homey].enabled
             // or CTC_HOMEY_ENABLED=true.
             .set_default("homey.enabled", false)?
@@ -340,6 +353,13 @@ impl Config {
         // `.saturating_mul(3600)` overflow path on misconfig.
         cfg.smartgrid.auto_resume_window_hours =
             cfg.smartgrid.auto_resume_window_hours.clamp(1, 48);
+        // Anything below 15 min would degenerate to the previous single-slot
+        // behaviour; anything above 4 h is longer than any plausible recovery
+        // cycle and would forbid valid runs from being selected.
+        cfg.smartgrid.auto_resume_min_duration_minutes = cfg
+            .smartgrid
+            .auto_resume_min_duration_minutes
+            .clamp(15, 240);
         // Hour-of-day is 0..=23. Anything else is a config bug; clamp so a
         // typo doesn't cause the scheduler to skip days.
         if cfg.price.fetch_hour_local > 23 {
@@ -607,7 +627,9 @@ mod tests {
             .unwrap()
             .set_default("smartgrid.auto_resume_enabled", true)
             .unwrap()
-            .set_default("smartgrid.auto_resume_window_hours", 8)
+            .set_default("smartgrid.auto_resume_window_hours", 12)
+            .unwrap()
+            .set_default("smartgrid.auto_resume_min_duration_minutes", 30)
             .unwrap()
             .set_default("homey.enabled", false)
             .unwrap()

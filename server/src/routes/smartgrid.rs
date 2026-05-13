@@ -75,6 +75,10 @@ struct SmartGridResponse {
     changed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduled_resume_at: Option<String>,
+    /// Configured run length the Blocking-resume scheduler aims for.
+    /// Exposed so the dashboard can render an overlay band on the price
+    /// chart whose width matches the scheduled run.
+    run_minutes: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +86,7 @@ struct SetSmartGridResponse {
     smartgrid_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduled_resume_at: Option<String>,
+    run_minutes: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +95,8 @@ struct ProposedResumeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     spot_sek: Option<f64>,
     window_hours: u64,
+    /// Length of the contiguous run whose start the scheduler chose.
+    run_minutes: u16,
 }
 
 /// Set `SmartGrid` mode via GPIO.
@@ -98,9 +105,11 @@ struct ProposedResumeResponse {
 ///
 /// Valid modes: normal, blocking, lowprice, overcapacity
 ///
-/// When `mode=blocking&schedule_resume=true`, the server picks the cheapest
-/// 15-minute price slot inside the configured horizon and schedules an
-/// automatic flip back to Normal at that time.
+/// When `mode=blocking&schedule_resume=true`, the server picks the start of
+/// the cheapest contiguous `auto_resume_min_duration_minutes` run inside
+/// the configured horizon and schedules an automatic flip back to Normal
+/// at that time. See `compute_resume_target` in `smartgrid::actor` for the
+/// full per-mode logic.
 async fn set_smartgrid(
     State(state): State<SmartGridState>,
     Query(query): Query<SmartGridQuery>,
@@ -128,6 +137,7 @@ async fn set_smartgrid(
     let response = SetSmartGridResponse {
         smartgrid_mode: mode.to_string(),
         scheduled_resume_at: fires_at.map(format_system_time),
+        run_minutes: state.config.auto_resume_min_duration_minutes,
     };
     serde_json::to_string(&response)
         .map(|s| format!("{s}\n"))
@@ -162,6 +172,7 @@ async fn get_smartgrid(State(state): State<SmartGridState>) -> Result<String, Ap
         smartgrid_mode: mode.to_string(),
         changed_at: changed_at.map(format_system_time),
         scheduled_resume_at: scheduled_resume_at.map(format_system_time),
+        run_minutes: state.config.auto_resume_min_duration_minutes,
     };
 
     serde_json::to_string(&response)
@@ -172,17 +183,30 @@ async fn get_smartgrid(State(state): State<SmartGridState>) -> Result<String, Ap
         })
 }
 
-/// Preview the cheapest slot the server *would* schedule if asked, without
-/// performing any side effect. Drives the dashboard confirmation dialog.
+/// Preview the slot the Blocking-resume scheduler *would* pick if asked,
+/// without performing any side effect. Drives the dashboard confirmation
+/// dialog and chart-overlay placement.
+///
+/// Uses the same `cheapest_run_within` → `cheapest_within` fallback chain
+/// the actor uses, so the preview matches the actual schedule. `spot_sek`
+/// is the price of the run-start slot itself (not the run's weighted
+/// average) — kept for backwards compatibility with the existing dialog.
 async fn get_proposed_resume(State(state): State<SmartGridState>) -> Result<String, ApiError> {
     let window =
         std::time::Duration::from_secs(state.config.auto_resume_window_hours.saturating_mul(3600));
-    let slot = state.price_state.cheapest_within(window);
+    let run_duration = std::time::Duration::from_secs(
+        u64::from(state.config.auto_resume_min_duration_minutes).saturating_mul(60),
+    );
+    let slot = state
+        .price_state
+        .cheapest_run_within(window, run_duration)
+        .or_else(|| state.price_state.cheapest_within(window));
 
     let response = ProposedResumeResponse {
         starts_at: slot.as_ref().map(|p| p.starts_at.clone()),
         spot_sek: slot.as_ref().map(|p| p.spot_sek),
         window_hours: state.config.auto_resume_window_hours,
+        run_minutes: state.config.auto_resume_min_duration_minutes,
     };
     serde_json::to_string(&response)
         .map(|s| format!("{s}\n"))
@@ -236,10 +260,15 @@ mod tests {
     use crate::smartgrid::actor::test_support::spawn_with_test_gpio;
     use tokio_util::sync::CancellationToken;
 
+    fn assert_float_eq(a: f64, b: f64, msg: &str) {
+        assert!((a - b).abs() < 0.0001, "{msg}: expected {b}, got {a}");
+    }
+
     fn test_config() -> SmartGridConfig {
         SmartGridConfig {
             auto_resume_enabled: true,
-            auto_resume_window_hours: 8,
+            auto_resume_window_hours: 12,
+            auto_resume_min_duration_minutes: 30,
         }
     }
 
@@ -287,7 +316,66 @@ mod tests {
         let result = get_proposed_resume(State(state)).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
         assert!(parsed["starts_at"].is_null());
-        assert_eq!(parsed["window_hours"], 8);
+        assert_eq!(parsed["window_hours"], 12);
+        assert_eq!(parsed["run_minutes"], 30);
+    }
+
+    /// The preview endpoint must use the same `cheapest_run_within` →
+    /// `cheapest_within` fallback as the actor, so the dashboard's
+    /// confirmation dialog and chart overlay match what will actually be
+    /// scheduled.
+    #[tokio::test]
+    async fn test_proposed_resume_picks_contiguous_run() {
+        let price_state = PriceState::new("SE3".to_string());
+        // Contiguous 30-min run starting in 60 min at avg 0.10.
+        let base = chrono::Utc::now() + chrono::Duration::minutes(60);
+        let s1_end = base + chrono::Duration::minutes(15);
+        let s2_end = s1_end + chrono::Duration::minutes(15);
+        let prices = vec![
+            crate::energy::price::PricePoint::from_spot(
+                base.to_rfc3339(),
+                s1_end.to_rfc3339(),
+                0.10,
+                0.0,
+                0.0,
+            ),
+            crate::energy::price::PricePoint::from_spot(
+                s1_end.to_rfc3339(),
+                s2_end.to_rfc3339(),
+                0.10,
+                0.0,
+                0.0,
+            ),
+        ];
+        // Plus an isolated cheaper single slot — must NOT win because it
+        // can't anchor a 30-min run.
+        let isolated_start = chrono::Utc::now() + chrono::Duration::minutes(180);
+        let isolated_end = isolated_start + chrono::Duration::minutes(15);
+        let isolated = crate::energy::price::PricePoint::from_spot(
+            isolated_start.to_rfc3339(),
+            isolated_end.to_rfc3339(),
+            0.02,
+            0.0,
+            0.0,
+        );
+        let mut today = prices;
+        today.push(isolated);
+        price_state.update_prices(today, vec![]);
+
+        let state = SmartGridState {
+            handle: None,
+            price_state,
+            config: test_config(),
+        };
+        let result = get_proposed_resume(State(state)).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
+        assert_eq!(parsed["run_minutes"], 30);
+        let spot = parsed["spot_sek"].as_f64().expect("spot_sek present");
+        assert_float_eq(
+            spot,
+            0.10,
+            "preview returns run-start, not isolated 0.02 slot",
+        );
     }
 
     #[tokio::test]

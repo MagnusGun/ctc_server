@@ -239,8 +239,11 @@ impl PriceState {
 
     /// Get the single cheapest future price slot whose start is within `window` from now.
     ///
-    /// Used for `SmartGrid` auto-resume: when the user blocks the heater, this picks
-    /// the lowest-price 15-minute slot inside the configured horizon (e.g. 8h).
+    /// Serves two callers: it's the **fallback** for Blocking auto-resume
+    /// when no contiguous run of `auto_resume_min_duration_minutes` fits
+    /// inside the window (see [`Self::cheapest_run_within`]), and it backs
+    /// the proposed-resume preview endpoint when its run-based pick is
+    /// unavailable for the same reason.
     pub fn cheapest_within(&self, window: Duration) -> Option<PricePoint> {
         let inner = self.inner.lock().unwrap();
 
@@ -261,6 +264,90 @@ impl PriceState {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .cloned()
+    }
+
+    /// Start of the cheapest contiguous run of length `run_duration` inside `window`.
+    ///
+    /// Walks the chained today/tomorrow slot timeline and, for each future
+    /// slot whose start is inside `window`, accumulates strictly-adjacent
+    /// neighbours until the run covers `run_duration`. A slot is "adjacent"
+    /// to its predecessor only when its `starts_at` equals the predecessor's
+    /// `ends_at` exactly — a gap or overlap ends the run. Slots with
+    /// unparseable timestamps end the run too. The score for a run is the
+    /// duration-weighted average `spot_sek`; the helper returns the start
+    /// slot of the cheapest qualifying run, or `None` when no run of the
+    /// required length fits anywhere inside `window`.
+    ///
+    /// Used for Blocking-mode `SmartGrid` auto-resume: we want the heater to
+    /// resume into a cheap stretch that lasts long enough for an actual
+    /// recovery cycle, not just the single cheapest 15-min tick.
+    // i64 seconds → f64 for the weighted-average accumulation. Slot
+    // durations are bounded (a day's worth fits in ~86_400 s, well inside
+    // f64's 2^53 exact-integer range), so the precision-loss lint is moot.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn cheapest_run_within(
+        &self,
+        window: Duration,
+        run_duration: Duration,
+    ) -> Option<PricePoint> {
+        let inner = self.inner.lock().unwrap();
+
+        let now = chrono::Utc::now();
+        let cutoff = now + chrono::Duration::from_std(window).ok()?;
+        let target_secs = i64::try_from(run_duration.as_secs()).ok()?;
+
+        let slots: Vec<&PricePoint> = inner.today.iter().chain(inner.tomorrow.iter()).collect();
+
+        let mut best: Option<(f64, PricePoint)> = None;
+        for i in 0..slots.len() {
+            let start_slot = slots[i];
+            let Ok(start) = chrono::DateTime::parse_from_rfc3339(&start_slot.starts_at) else {
+                continue;
+            };
+            if start <= now || start > cutoff {
+                continue;
+            }
+
+            let mut total_secs: i64 = 0;
+            let mut weighted_sum: f64 = 0.0;
+            let mut prev_end: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+            let mut covered = false;
+
+            for slot in &slots[i..] {
+                let (Ok(s), Ok(e)) = (
+                    chrono::DateTime::parse_from_rfc3339(&slot.starts_at),
+                    chrono::DateTime::parse_from_rfc3339(&slot.ends_at),
+                ) else {
+                    break;
+                };
+                if let Some(prev) = prev_end
+                    && s != prev
+                {
+                    break;
+                }
+                let secs = (e - s).num_seconds();
+                if secs <= 0 {
+                    break;
+                }
+                total_secs += secs;
+                weighted_sum += slot.spot_sek * (secs as f64);
+                prev_end = Some(e);
+                if total_secs >= target_secs {
+                    covered = true;
+                    break;
+                }
+            }
+
+            if covered && total_secs > 0 {
+                let avg = weighted_sum / (total_secs as f64);
+                let better = best.as_ref().is_none_or(|(best_avg, _)| avg < *best_avg);
+                if better {
+                    best = Some((avg, start_slot.clone()));
+                }
+            }
+        }
+
+        best.map(|(_, slot)| slot)
     }
 }
 
@@ -327,7 +414,44 @@ impl PricePoint {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::PricePoint;
+
+    /// Build a 15-min `PricePoint` starting `offset_mins` from now. The
+    /// timestamp is captured per call, so two `slot(...)` invocations are
+    /// not contiguous in wall-clock terms (each picks up its own `now()`).
+    /// Use [`make_run`] when contiguity matters.
+    pub fn slot(offset_mins: i64, spot_sek: f64) -> PricePoint {
+        let start = chrono::Utc::now() + chrono::Duration::minutes(offset_mins);
+        let end = start + chrono::Duration::minutes(15);
+        PricePoint::from_spot(start.to_rfc3339(), end.to_rfc3339(), spot_sek, 0.0, 0.0)
+    }
+
+    /// Build strictly-contiguous 15-min slots whose first slot starts at
+    /// `now + start_offset_mins`. Each slot's `ends_at` equals the next
+    /// slot's `starts_at` exactly — the format `cheapest_run_within` needs.
+    pub fn make_run(start_offset_mins: i64, prices: &[f64]) -> Vec<PricePoint> {
+        let base = chrono::Utc::now() + chrono::Duration::minutes(start_offset_mins);
+        let mut out = Vec::with_capacity(prices.len());
+        let mut s = base;
+        for &p in prices {
+            let e = s + chrono::Duration::minutes(15);
+            out.push(PricePoint::from_spot(
+                s.to_rfc3339(),
+                e.to_rfc3339(),
+                p,
+                0.0,
+                0.0,
+            ));
+            s = e;
+        }
+        out
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{make_run, slot};
     use super::*;
 
     fn assert_float_eq(a: f64, b: f64, msg: &str) {
@@ -446,12 +570,6 @@ mod tests {
         assert_float_eq(stats.median, 0.875, "median"); // (0.75 + 1.0) / 2
     }
 
-    fn slot(offset_mins: i64, spot_sek: f64) -> PricePoint {
-        let start = chrono::Utc::now() + chrono::Duration::minutes(offset_mins);
-        let end = start + chrono::Duration::minutes(15);
-        PricePoint::from_spot(start.to_rfc3339(), end.to_rfc3339(), spot_sek, 0.0, 0.0)
-    }
-
     #[test]
     fn test_cheapest_within_empty_state() {
         let state = PriceState::new("SE3".to_string());
@@ -532,6 +650,119 @@ mod tests {
         let mut p = slot(offset_mins, spot_sek);
         p.level = Some(level);
         p
+    }
+
+    #[test]
+    fn test_cheapest_run_within_empty_state() {
+        let state = PriceState::new("SE3".to_string());
+        let result =
+            state.cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_cheapest_run_within_finds_min_avg_run() {
+        // Two contiguous spans of 30 minutes each.
+        //   Run A: [0.20, 0.40] -> weighted avg 0.30
+        //   Run B: [0.10, 0.10] -> weighted avg 0.10   <-- cheapest
+        //   Isolated singleton at 0.05 (only 15min available -> doesn't qualify)
+        let state = PriceState::new("SE3".to_string());
+        let mut today = Vec::new();
+        today.extend(make_run(30, &[0.20, 0.40])); // 30..45, 45..60
+        today.extend(make_run(120, &[0.10, 0.10])); // 120..135, 135..150
+        today.extend(make_run(240, &[0.05])); // single 15-min slot -> insufficient
+        state.update_prices(today, vec![]);
+
+        let pick = state
+            .cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60))
+            .unwrap();
+        assert_float_eq(pick.spot_sek, 0.10, "run-B start should win");
+    }
+
+    #[test]
+    fn test_cheapest_run_within_skips_non_contiguous_runs() {
+        // Two cheap slots with a 30-min gap — they cannot form a contiguous
+        // 30-min run.
+        let state = PriceState::new("SE3".to_string());
+        let today = vec![
+            slot(30, 0.10), // 30..45
+            slot(75, 0.10), // 75..90 — 30-min gap
+        ];
+        state.update_prices(today, vec![]);
+        let result =
+            state.cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60));
+        assert!(
+            result.is_none(),
+            "non-contiguous cheap slots must not combine"
+        );
+    }
+
+    #[test]
+    fn test_cheapest_run_within_rejects_two_cheap_slots_split_by_expensive() {
+        // Three contiguous slots: [cheap, expensive, cheap]. The two cheap
+        // slots are NOT adjacent, so they cannot form a 30-min cheap run.
+        // Both qualifying 30-min runs (slots [0..1] and [1..2]) include the
+        // expensive middle slot and have the same weighted avg 0.55. The
+        // helper's strict `<` tie-break keeps the first run found, so the
+        // returned run-start is slot[0] with spot_sek 0.10.
+        let state = PriceState::new("SE3".to_string());
+        let today = make_run(30, &[0.10, 1.00, 0.10]);
+        state.update_prices(today, vec![]);
+        let pick = state
+            .cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60))
+            .unwrap();
+        assert_float_eq(pick.spot_sek, 0.10, "first contiguous run wins on tie");
+    }
+
+    #[test]
+    fn test_cheapest_run_within_returns_none_when_no_run_fits_window() {
+        // Only one 15-min slot available — a requested 30-min run cannot fit.
+        let state = PriceState::new("SE3".to_string());
+        let today = make_run(30, &[0.20]);
+        state.update_prices(today, vec![]);
+        let result =
+            state.cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60));
+        assert!(
+            result.is_none(),
+            "single 15-min slot cannot host 30-min run"
+        );
+    }
+
+    #[test]
+    fn test_cheapest_run_within_handles_wider_slot() {
+        let state = PriceState::new("SE3".to_string());
+        let start = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let end = start + chrono::Duration::minutes(60);
+        let today = vec![PricePoint::from_spot(
+            start.to_rfc3339(),
+            end.to_rfc3339(),
+            0.15,
+            0.0,
+            0.0,
+        )];
+        state.update_prices(today, vec![]);
+        let pick = state
+            .cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60))
+            .unwrap();
+        assert_float_eq(pick.spot_sek, 0.15, "wider slot satisfies run on its own");
+    }
+
+    #[test]
+    fn test_cheapest_run_within_excludes_past_slot_starts() {
+        // Even with a contiguous future run available, a past slot must not
+        // be returned as the run start.
+        let state = PriceState::new("SE3".to_string());
+        let mut today = vec![slot(-60, 0.05)]; // very cheap, but in the past
+        today.extend(make_run(30, &[0.20, 0.30])); // contiguous future run
+        state.update_prices(today, vec![]);
+        let pick = state
+            .cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60))
+            .unwrap();
+        assert_float_eq(
+            pick.spot_sek,
+            0.20,
+            "run must start at first future slot, not the past one",
+        );
     }
 
     #[test]
