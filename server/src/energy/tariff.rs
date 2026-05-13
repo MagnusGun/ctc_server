@@ -53,10 +53,7 @@ pub fn get_tariff_at(time: SystemTime) -> TariffMode {
 
 /// Convert `SystemTime` to local time components in the given timezone,
 /// accounting for DST.
-pub(crate) fn system_time_to_local(
-    time: SystemTime,
-    tz: chrono_tz::Tz,
-) -> (i32, u32, u32, u32) {
+pub(crate) fn system_time_to_local(time: SystemTime, tz: chrono_tz::Tz) -> (i32, u32, u32, u32) {
     let utc: DateTime<Utc> = time.into();
     let local = utc.with_timezone(&tz);
     (local.year(), local.month(), local.day(), local.hour())
@@ -65,12 +62,7 @@ pub(crate) fn system_time_to_local(
 /// Return the UTC Unix-seconds of local midnight on the given date in `tz`.
 /// On the ambiguous fall-back day (rare — most IANA zones jump at 02:00 or
 /// 03:00, never midnight) the earliest mapping is chosen.
-pub(crate) fn local_midnight_utc_secs(
-    year: i32,
-    month: u32,
-    day: u32,
-    tz: chrono_tz::Tz,
-) -> u64 {
+pub(crate) fn local_midnight_utc_secs(year: i32, month: u32, day: u32, tz: chrono_tz::Tz) -> u64 {
     let naive = NaiveDate::from_ymd_opt(year, month, day)
         .and_then(|d| d.and_hms_opt(0, 0, 0))
         .expect("valid local date");
@@ -486,7 +478,8 @@ mod tests {
         let pre = SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400 + 1800) as u64);
         // 01:30 UTC (= 02:30 CET, post fall-back)
         #[allow(clippy::cast_sign_loss)]
-        let post = SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400 + 3600 + 1800) as u64);
+        let post =
+            SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400 + 3600 + 1800) as u64);
         assert_eq!(get_tariff_at(pre), TariffMode::Low);
         assert_eq!(get_tariff_at(post), TariffMode::Low);
     }
@@ -498,8 +491,7 @@ mod tests {
     fn system_time_to_local_handles_non_stockholm_tz() {
         let days = ymd_to_days(2026, 7, 15);
         #[allow(clippy::cast_sign_loss)]
-        let utc = SystemTime::UNIX_EPOCH
-            + Duration::from_secs((days * 86400 + 12 * 3600) as u64);
+        let utc = SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400 + 12 * 3600) as u64);
         let (y, mo, d, h) = system_time_to_local(utc, chrono_tz::America::New_York);
         assert_eq!((y, mo, d, h), (2026, 7, 15, 8));
     }

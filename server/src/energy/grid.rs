@@ -431,7 +431,6 @@ impl GridState {
             .cloned()
             .collect()
     }
-
 }
 
 impl Default for GridState {
@@ -486,7 +485,6 @@ fn timestamp_to_components_in(time: SystemTime, tz: Tz) -> (i32, u32, u32, u64) 
     let (year, month, day, _hour) = system_time_to_local(time, tz);
     (year, month, day, hour_start)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -600,12 +598,10 @@ mod tests {
         // of DST because both CET and CEST offsets are whole hours.
         let winter = 1_736_951_400; // 2025-01-15 14:30:00 UTC
         let summer = 1_752_618_600; // 2025-07-15 22:30:00 UTC
-        let q_winter = timestamp_to_quarter_start(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(winter),
-        );
-        let q_summer = timestamp_to_quarter_start(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(summer),
-        );
+        let q_winter =
+            timestamp_to_quarter_start(SystemTime::UNIX_EPOCH + Duration::from_secs(winter));
+        let q_summer =
+            timestamp_to_quarter_start(SystemTime::UNIX_EPOCH + Duration::from_secs(summer));
         assert_eq!(q_winter % 900, 0);
         assert_eq!(q_summer % 900, 0);
         // 14:30 UTC rounds to 14:30 UTC; 22:30 UTC rounds to 22:30 UTC.

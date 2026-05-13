@@ -1,0 +1,179 @@
+# CTC Server REST API Test File
+# Use with VS Code REST Client extension or IntelliJ HTTP Client
+#
+# Usage:
+#   - VS Code: Install "REST Client" extension by Huachao Mao
+#   - IntelliJ: Built-in HTTP Client support
+#   - Click "Send Request" above each request to execute
+
+@baseUrl = http://192.168.10.19:3000
+
+### ============================================================
+### TEMPERATURE ENDPOINTS
+### ============================================================
+
+### Get current room temperature
+GET {{baseUrl}}/api/v1/temperature/room
+
+### Get room temperature setpoint
+GET {{baseUrl}}/api/v1/temperature/room/setpoint
+
+### Set room temperature setpoint
+# Note: Trailing slash required for POST
+POST {{baseUrl}}/api/v1/temperature/room/setpoint/?value=21.5
+
+### Get outdoor temperature
+GET {{baseUrl}}/api/v1/temperature/outdoor
+
+### Get flow temperature (heating circuit)
+GET {{baseUrl}}/api/v1/temperature/flow
+
+### Get return temperature (heating circuit return)
+GET {{baseUrl}}/api/v1/temperature/flow/return
+
+### ============================================================
+### SMARTGRID ENDPOINTS
+### ============================================================
+
+### Get current SmartGrid mode
+GET {{baseUrl}}/api/v1/smartgrid
+
+### Set SmartGrid mode to Normal
+POST {{baseUrl}}/api/v1/smartgrid?mode=normal
+
+### Set SmartGrid mode to Blocking (power save / stop heating)
+POST {{baseUrl}}/api/v1/smartgrid?mode=blocking
+
+### Set SmartGrid mode to LowPrice (prioritize cheap energy)
+POST {{baseUrl}}/api/v1/smartgrid?mode=lowprice
+
+### Set SmartGrid mode to Overcapacity (maximum operation)
+POST {{baseUrl}}/api/v1/smartgrid?mode=overcapacity
+
+### ============================================================
+### POWER SAVE ENDPOINTS
+### ============================================================
+
+### Get power save status
+GET {{baseUrl}}/api/v1/ctc/powersave
+
+### Enable power save mode (uses SmartGrid Blocking)
+POST {{baseUrl}}/api/v1/ctc/powersave?active=true
+
+### Disable power save mode (returns to Normal)
+POST {{baseUrl}}/api/v1/ctc/powersave?active=false
+
+### ============================================================
+### CIRKULATIONSPUMP (via Homey)
+### ============================================================
+# Returns 503 when [homey].enabled = false in config.
+
+### Get circulation pump state
+# { "on": true|false|null, "stale": bool, "last_observed_unix_secs": int|null }
+GET {{baseUrl}}/api/v1/pump
+
+### ============================================================
+### VISIBILITY REGISTER ENDPOINTS
+### ============================================================
+
+### Get all visibility registers (62500-62548)
+# Returns all 49 visibility registers with their bitmask values
+GET {{baseUrl}}/api/v1/visibility
+
+### Check if a specific BMS parameter is visible
+# Example: HEATSYSTEM_ROOM_SETTEMP (register 61509)
+GET {{baseUrl}}/api/v1/visibility/parameter/61509
+
+### Check visibility of outdoor temperature parameter
+GET {{baseUrl}}/api/v1/visibility/parameter/62000
+
+### Check visibility of alarm count parameter (always visible)
+GET {{baseUrl}}/api/v1/visibility/parameter/65001
+
+### Check visibility of unknown parameter
+GET {{baseUrl}}/api/v1/visibility/parameter/64000
+
+### Read visibility register 62500 (first register)
+GET {{baseUrl}}/api/v1/visibility/62500
+
+### Read visibility register 62510
+GET {{baseUrl}}/api/v1/visibility/62510
+
+### Read visibility register 62520
+GET {{baseUrl}}/api/v1/visibility/62520
+
+### Read visibility register 62548 (last register)
+GET {{baseUrl}}/api/v1/visibility/62548
+
+### ============================================================
+### GENERIC CTC PARAMETER ENDPOINTS
+### ============================================================
+
+### Read a known CTC parameter by address
+# Example: Current room temperature (register 62203)
+GET {{baseUrl}}/api/v1/ctc?addr=62203
+
+### Read outdoor temperature
+GET {{baseUrl}}/api/v1/ctc?addr=62000
+
+### Read flow temperature
+GET {{baseUrl}}/api/v1/ctc?addr=62011
+
+### Read a custom CTC parameter with factor
+# Example: Custom register with 0.1 scaling factor
+GET {{baseUrl}}/api/v1/ctc?addr=62203&factor=0.1&custom=true
+
+### Write a CTC parameter by address
+# Example: Set room temperature setpoint (register 61509) to 22.0
+POST {{baseUrl}}/api/v1/ctc?addr=61509&value=22.0
+
+### Set heating inclination
+POST {{baseUrl}}/api/v1/ctc?addr=61513&value=1.5
+
+### ============================================================
+### COMMON CTC REGISTER ADDRESSES (for reference)
+### ============================================================
+#
+# Temperature Registers (read-only):
+#   62203 - CTC_ROOM_TEMP (Current room temp 1)
+#   62000 - CTC_OUTDOOR_TEMP (Outdoor temperature)
+#   62011 - HEATSYSTEM_FLOW_TEMP (Primary flow temperature)
+#   62015 - CTC_RETURN_TEMP (Return temp)
+#
+# Setpoint Registers (read-write):
+#   61509 - HEATSYSTEM_ROOM_SETTEMP (Set room temperature)
+#   61513 - HEATSYSTEM_INCLINATION (Change inclination)
+#   61517 - HEATSYSTEM_ADJUSTMENT (Change adjustment)
+#   61534 - HEATSYSTEM_FLOW_MAX_TEMP (Max primary flow)
+#   61538 - HEATSYSTEM_FLOW_MIN_TEMP (Min primary flow)
+#
+# Status/Mode Registers:
+#   61542 - HEATSYSTEM_HEATING_MODE
+#   1100  - SmartGrid control register
+#
+# Visibility Registers:
+#   62500-62548 - Hardware capability bitmasks (49 registers)
+#
+# Alarm Registers:
+#   65001 - Alarm/info count (low byte=alarms, high byte=infos)
+#   65010-65059 - Alarm bitmask (800 alarms)
+#   65060-65069 - Info bitmask (160 info messages)
+#   65100 - Text buffer transfer register (write-only)
+#   65101-65125 - ASCII text buffer (50 characters)
+#
+### ============================================================
+
+### ============================================================
+### ALARM ENDPOINTS
+### ============================================================
+
+### Get alarm status (quick check for polling)
+# Returns alarm and info counts - fast, suitable for frequent polling
+GET {{baseUrl}}/api/v1/alarms/status
+
+### Get all active alarms and info messages with full details
+# Returns parsed alarm/info messages with codes and English translations
+# Note: Slower than /status as it reads text buffers for each active alarm
+GET {{baseUrl}}/api/v1/alarms
+
+### ============================================================

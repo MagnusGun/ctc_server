@@ -2,6 +2,7 @@ mod config;
 mod energy;
 mod error;
 mod heatpump;
+mod homey;
 mod messages;
 mod modbus;
 mod routes;
@@ -43,6 +44,13 @@ fn static_dir() -> PathBuf {
     }
     // Fallback to relative path
     relative
+}
+
+struct HomeyBundle {
+    hooks: crate::smartgrid::actor::HomeyHooks,
+    cache: std::sync::Arc<crate::homey::cache::HomeyPumpCache>,
+    client: crate::homey::HomeyClient,
+    desired_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -298,6 +306,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create price state for electricity price tracking
     let price_state = PriceState::new(config.price.zone.clone());
 
+    // Build the Homey integration before the SmartGrid actor so we can hand
+    // it `HomeyHooks` at construction. The actor seeds the watch channel
+    // with the correct initial desired state during `spawn`, so the poller
+    // (spawned afterwards) sees the right value on its first tick.
+    let homey: Option<HomeyBundle> = if config.homey.enabled {
+        match crate::homey::HomeyClient::new(&config.homey) {
+            Ok(client) => {
+                info!(
+                    "Homey integration enabled for pump {} at {} (poll_interval = {} s)",
+                    config.homey.pump_device_id, config.homey.url, config.homey.poll_interval_secs
+                );
+                let cache = std::sync::Arc::new(crate::homey::cache::HomeyPumpCache::new());
+                // Placeholder; the actor's spawn() overrides synchronously
+                // with the real initial mode.
+                let (desired_tx, desired_rx) = tokio::sync::watch::channel(true);
+                let hooks = crate::smartgrid::actor::HomeyHooks {
+                    client: client.clone(),
+                    cache: cache.clone(),
+                    desired_tx,
+                };
+                Some(HomeyBundle {
+                    hooks,
+                    cache,
+                    client,
+                    desired_rx,
+                })
+            }
+            Err(e) => {
+                error!(
+                    "Homey client setup failed: {e} — /api/v1/pump will return 503 and the pump will not be slaved to SmartGrid mode"
+                );
+                None
+            }
+        }
+    } else {
+        debug!("Homey integration disabled");
+        None
+    };
+
+    let homey_hooks_for_actor = homey.as_ref().map(|b| b.hooks.clone());
+    let pump_cache_for_route = homey.as_ref().map(|b| b.cache.clone());
+
     // Spawn the SmartGrid actor (required for SmartGrid control). Owns the
     // GpioController and processes all set-mode / read-mode / scheduled-
     // resume commands serially. Routes get a cheap-clone SmartGridHandle.
@@ -323,6 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial_mode,
             price_state.clone(),
             config.smartgrid.clone(),
+            homey_hooks_for_actor,
             cancel.clone(),
         ) {
             Ok((handle, join)) => {
@@ -344,6 +395,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug!("GPIO control disabled - SmartGrid endpoints will return ServiceUnavailable");
         None
     };
+
+    // Spawn the Homey reconciliation poller AFTER the SmartGrid actor so its
+    // first tick reads the actor-seeded desired state, not the placeholder.
+    if let Some(bundle) = homey {
+        if config.homey.poll_interval_secs > 0 {
+            let period = std::time::Duration::from_secs(config.homey.poll_interval_secs);
+            let client = bundle.client;
+            let cache = bundle.cache;
+            let desired_rx = bundle.desired_rx;
+            let cancel_for_poller = cancel.clone();
+            background_tasks.push(supervisor::spawn_with_shutdown(
+                "homey-poller",
+                cancel.clone(),
+                async move {
+                    crate::homey::poller::run(client, cache, desired_rx, period, cancel_for_poller)
+                        .await;
+                },
+            ));
+        } else {
+            info!("Homey reconciliation poller disabled (poll_interval_secs = 0)");
+        }
+    }
 
     // Start price fetch background task if enabled
     if config.price.enabled {
@@ -411,6 +484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .merge(routes::grid::routes(grid_state, price_state))
         .merge(routes::heatpump_stats::routes(heatpump_stats.clone()))
+        .merge(routes::pump::routes(pump_cache_for_route))
         .merge(routes::series::routes(store.clone()))
         .merge(routes::activity::routes(store.clone()))
         .merge(routes::step_response::routes(store.clone()))

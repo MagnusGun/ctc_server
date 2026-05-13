@@ -164,6 +164,13 @@ async function setSmartGridMode(mode, scheduleResume = false) {
 async function getGrid()   { return fetchJson(`${API_BASE}/grid`); }
 async function getPrices() { return fetchJson(`${API_BASE}/prices`); }
 
+// Cirkulationspump state via Homey. 503 means the Homey integration is
+// disabled — the badge should hide itself when this resolves to null.
+async function getPump() {
+    try { return await fetchJson(`${API_BASE}/pump`); }
+    catch { return null; }
+}
+
 async function getVersion() { return fetchJson(`${API_BASE}/version`); }
 
 window.api = {
@@ -173,6 +180,6 @@ window.api = {
     getSeries, getActivity, getStepResponse,
     getAlarms,
     getSmartGrid, getSmartGridResume, setSmartGridMode,
-    getGrid, getPrices,
+    getGrid, getPrices, getPump,
     getVersion,
 };

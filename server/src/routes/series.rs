@@ -8,14 +8,14 @@ use crate::error::ApiError;
 use crate::routes::series_window;
 use crate::storage::{Sensor, Store};
 
-#[cfg(test)]
-use std::time::SystemTime;
 use axum::{
     Router,
     extract::{Query, State},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::time::SystemTime;
 
 pub fn routes(store: Store) -> Router {
     Router::new()

@@ -158,6 +158,7 @@ function App() {
   const [lowerSeries]  = useSeries("lower", 24);
   const [alarmsResp]   = useAlarms();
   const [sgResp, sgMeta] = useSmartGrid();
+  const [pumpResp, pumpMeta] = usePump();
   const [stepEvents]   = useStepResponse(6);
   const stepData = useMemo(() => window.transformStepEvents(stepEvents), [stepEvents]);
 
@@ -403,6 +404,29 @@ function App() {
               </>
             )}
           </div>
+          {(() => {
+            // Pump badge only renders when /api/v1/pump is reachable (Homey
+            // integration enabled on the server). 503 → pumpResp stays null
+            // → chip is hidden. Stale flag → amber tone + tooltip.
+            if (!pumpResp || pumpMeta?.error) return null;
+            const on = pumpResp.on;
+            const stale = !!pumpResp.stale;
+            const valueLabel = on == null ? "?" : (on ? "Aktiv" : "Av");
+            const tone = stale ? "warn" : "";
+            const stamp = pumpResp.last_observed_unix_secs;
+            const ageText = stamp == null
+              ? "ej observerad ännu"
+              : `uppdaterad för ${Math.max(0, Math.floor(Date.now() / 1000 - stamp))} s sedan`;
+            const tip = stale
+              ? `Homey ej tillgänglig (${ageText})`
+              : `Cirkulationspump · ${ageText}`;
+            return (
+              <span className={`chip ${tone}`} title={tip}>
+                <span className="label">Pump</span>
+                <span className="value">{valueLabel}</span>
+              </span>
+            );
+          })()}
           {errorCount > 0 && (
             <span className="chip alert-chip"
                   onClick={() => document.getElementById("messages-section")?.scrollIntoView()}

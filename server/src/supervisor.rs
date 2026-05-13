@@ -47,8 +47,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
     async fn ok_completion_does_not_cancel() {
@@ -64,7 +64,9 @@ mod tests {
         let handle = spawn_with_shutdown("panicker", cancel.clone(), async {
             panic!("boom");
         });
-        handle.await.expect("task should join cleanly after catch_unwind");
+        handle
+            .await
+            .expect("task should join cleanly after catch_unwind");
         assert!(cancel.is_cancelled());
     }
 

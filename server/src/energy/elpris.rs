@@ -146,7 +146,6 @@ impl ElprisClient {
             }
         }
     }
-
 }
 
 /// Error types for elpris API

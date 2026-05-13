@@ -294,6 +294,7 @@ const useAlarms         = () => usePolledFetch(window.api.getAlarms, POLL_LIVE);
 const useSmartGrid      = () => usePolledFetch(window.api.getSmartGrid, POLL_LIVE);
 const useGrid           = () => usePolledFetch(window.api.getGrid, POLL_LIVE);
 const usePrices         = () => usePolledFetch(window.api.getPrices, POLL_PRICES);
+const usePump           = () => usePolledFetch(window.api.getPump, POLL_LIVE);
 
 window.POLL_LIVE = POLL_LIVE;
 window.POLL_PRICES = POLL_PRICES;
@@ -312,3 +313,4 @@ window.useAlarms = useAlarms;
 window.useSmartGrid = useSmartGrid;
 window.useGrid = useGrid;
 window.usePrices = usePrices;
+window.usePump = usePump;

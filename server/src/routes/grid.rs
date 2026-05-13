@@ -360,7 +360,9 @@ mod tests {
     async fn test_get_grid_status() {
         let state = create_test_state();
 
-        let json = get_grid_status(State(state)).await.expect("get_grid_status");
+        let json = get_grid_status(State(state))
+            .await
+            .expect("get_grid_status");
         let v = parse(&json);
         assert!(v["tariff_mode"].is_string());
         // monthly_peak_avg_kwh starts at 0 with no recorded peaks.
@@ -384,7 +386,9 @@ mod tests {
     async fn test_get_current_price() {
         let state = create_test_state();
 
-        let json = get_current_price(State(state)).await.expect("get_current_price");
+        let json = get_current_price(State(state))
+            .await
+            .expect("get_current_price");
         let v = parse(&json);
         assert_eq!(v["price_zone"].as_str(), Some("SE3"));
     }

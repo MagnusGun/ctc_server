@@ -779,7 +779,6 @@ fn day_start_in(secs: u64, tz: Tz) -> u64 {
     crate::energy::tariff::local_midnight_utc_secs(year, month, day, tz)
 }
 
-
 /// Get the start of the week (Monday UTC midnight) containing the given timestamp.
 fn week_start(secs: u64) -> u64 {
     let datetime = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
@@ -827,7 +826,6 @@ fn secs_to_ymd_in(secs: u64, tz: Tz) -> (i32, u32, u32) {
     let (year, month, day, _hour) = crate::energy::tariff::system_time_to_local(time, tz);
     (year, month, day)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1128,8 +1126,7 @@ mod tests {
         // Simulate an in-progress cycle that started 30 min before Monday-midnight.
         inner.compressor_on = true;
         inner.observed_cycle_start = true;
-        inner.state_started_at =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(cycle_start_secs);
+        inner.state_started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(cycle_start_secs);
 
         let archived = inner
             .check_window_rollovers(after_midnight_secs)
@@ -1138,7 +1135,10 @@ mod tests {
 
         // Sunday should be credited with the 30 min pre-midnight portion.
         let archived_secs = (archived.1.operating_hours * 3600.0).round() as i64;
-        assert_eq!(archived_secs, 1800, "Sunday operating_secs from pre-midnight credit");
+        assert_eq!(
+            archived_secs, 1800,
+            "Sunday operating_secs from pre-midnight credit"
+        );
 
         // current_cycle_credited_secs records the credit so the eventual
         // cycle close subtracts it instead of double-counting.
@@ -1173,8 +1173,7 @@ mod tests {
         );
         inner.compressor_on = true;
         inner.observed_cycle_start = true;
-        inner.state_started_at =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(cycle_start_secs);
+        inner.state_started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(cycle_start_secs);
 
         let archived = inner
             .check_window_rollovers(after_midnight_secs)
@@ -1182,7 +1181,10 @@ mod tests {
         assert_eq!(archived.0, 20_261_025, "yyyymmdd for archived Sunday");
 
         let archived_secs = (archived.1.operating_hours * 3600.0).round() as i64;
-        assert_eq!(archived_secs, 2700, "Sunday operating_secs (45 min pre-midnight)");
+        assert_eq!(
+            archived_secs, 2700,
+            "Sunday operating_secs (45 min pre-midnight)"
+        );
         assert_eq!(inner.current_cycle_credited_secs, 2700);
         assert_eq!(inner.current_day_start, monday_midnight_secs);
         assert_eq!(inner.current_day_date, (2026, 10, 26));

@@ -4,6 +4,7 @@ pub mod ctc;
 pub mod grid;
 pub mod heatpump_stats;
 pub mod modbus;
+pub mod pump;
 pub mod series;
 pub mod smartgrid;
 pub mod step_response;

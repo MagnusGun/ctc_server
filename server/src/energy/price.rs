@@ -370,12 +370,16 @@ mod tests {
         let snapshot_a = vec![PricePoint::from_spot(
             "2026-01-04T00:00:00Z".to_string(),
             "2026-01-04T00:15:00Z".to_string(),
-            1.0, 0.0, 0.0,
+            1.0,
+            0.0,
+            0.0,
         )];
         let snapshot_b = vec![PricePoint::from_spot(
             "2026-01-04T00:00:00Z".to_string(),
             "2026-01-04T00:15:00Z".to_string(),
-            2.0, 0.0, 0.0,
+            2.0,
+            0.0,
+            0.0,
         )];
 
         let state = PriceState::new("SE3".to_string());

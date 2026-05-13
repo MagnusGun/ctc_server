@@ -13,9 +13,10 @@
 //! `JoinHandle` is in `main`'s `background_tasks` vector so the
 //! graceful-shutdown 5 s window waits for it.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -23,9 +24,54 @@ use tracing::{debug, error, info, warn};
 use crate::config::SmartGridConfig;
 use crate::energy::price::PriceState;
 use crate::energy::tibber::parse_iso8601;
+use crate::homey::HomeyClient;
+use crate::homey::cache::HomeyPumpCache;
 
 use super::gpio::GpioController;
 use super::mode::SmartGridMode;
+
+/// Side-channel for slaving the Cirkulationspump to `SmartGrid` mode via Homey.
+///
+/// Optional: when the user has not configured `[homey].enabled = true`, the
+/// actor stores `None` and the pump-push helpers are zero-cost no-ops.
+#[derive(Clone)]
+pub struct HomeyHooks {
+    pub client: HomeyClient,
+    pub cache: Arc<HomeyPumpCache>,
+    /// Latest desired pump state (`true` = on). Read by the reconciliation
+    /// poller so it always uses the current mode's intent, not whatever it
+    /// captured at startup.
+    pub desired_tx: watch::Sender<bool>,
+}
+
+/// Compute the pump's desired state from the `SmartGrid` mode.
+///
+/// Pump OFF only when actively blocking; in every other mode it should run.
+#[must_use]
+pub fn pump_on_for(mode: SmartGridMode) -> bool {
+    !matches!(mode, SmartGridMode::Blocking)
+}
+
+/// Fire-and-forget: push the pump state implied by `mode` to Homey, and
+/// publish the desired state synchronously so the reconciliation poller
+/// observes it immediately. On push failure the cache is marked stale; the
+/// poller's next tick retries.
+pub fn push_pump_to_homey(hooks: Option<&HomeyHooks>, mode: SmartGridMode) {
+    let Some(hooks) = hooks else { return };
+    let on = pump_on_for(mode);
+    let _ = hooks.desired_tx.send(on);
+    let client = hooks.client.clone();
+    let cache = hooks.cache.clone();
+    tokio::spawn(async move {
+        match client.set_pump_onoff(on).await {
+            Ok(()) => cache.write_fresh(on).await,
+            Err(e) => {
+                tracing::warn!("Homey pump push failed: {e}");
+                cache.mark_stale().await;
+            }
+        }
+    });
+}
 
 /// Errors a SetMode command can surface.
 #[derive(Debug)]
@@ -172,13 +218,17 @@ struct SmartGridActor {
     config: SmartGridConfig,
     /// Cloned for the resume timer task to post back `ResumeFire`.
     self_tx: mpsc::Sender<SmartGridCmd>,
+    /// When `Some`, every successful mode write is mirrored to Homey to
+    /// drive the Cirkulationspump on/off.
+    homey: Option<HomeyHooks>,
 }
 
 /// Spawn the actor.
 ///
 /// On hardware error during construction or initial mode write, returns an
 /// error. The caller (main) treats that as "GPIO unavailable" and proceeds
-/// without a SmartGrid handle — every route returns `ServiceUnavailable`.
+/// without a `SmartGrid` handle — every route returns `ServiceUnavailable`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     gpio_k24: u32,
     gpio_k25: u32,
@@ -186,12 +236,17 @@ pub fn spawn(
     initial_mode: SmartGridMode,
     price_state: PriceState,
     config: SmartGridConfig,
+    homey: Option<HomeyHooks>,
     cancel: CancellationToken,
 ) -> Result<(SmartGridHandle, JoinHandle<()>), String> {
     let mut gpio = GpioController::new(gpio_k24, gpio_k25, active_low)?;
     if let Err(e) = gpio.set_mode(initial_mode) {
         return Err(format!("Initial GPIO set_mode({initial_mode}) failed: {e}"));
     }
+
+    // Seed Homey with the initial mode's desired pump state so the first
+    // poll doesn't reconcile against a stale value.
+    push_pump_to_homey(homey.as_ref(), initial_mode);
 
     let (tx, rx) = mpsc::channel(32);
     let actor = SmartGridActor {
@@ -200,6 +255,7 @@ pub fn spawn(
         price_state,
         config,
         self_tx: tx.clone(),
+        homey,
     };
     let join = tokio::spawn(actor.run(rx, cancel));
     Ok((SmartGridHandle { tx }, join))
@@ -284,6 +340,10 @@ impl SmartGridActor {
 
         self.gpio.set_mode(mode).map_err(ApplyModeError::Gpio)?;
 
+        // Pump tracks SmartGrid mode: ON for Normal/LowPrice/Overcapacity,
+        // OFF for Blocking. Fire-and-forget — must not stall the actor.
+        push_pump_to_homey(self.homey.as_ref(), mode);
+
         if mode == SmartGridMode::Normal || !schedule_resume || !self.config.auto_resume_enabled {
             return Ok(None);
         }
@@ -362,6 +422,8 @@ impl SmartGridActor {
             {
                 self.scheduled_resume = None;
             }
+            // Auto-resume always targets Normal → pump comes back on.
+            push_pump_to_homey(self.homey.as_ref(), SmartGridMode::Normal);
             info!("Auto-resume fired — heater set back to Normal");
         } else {
             error!("Auto-resume: failed to set Normal");
@@ -394,6 +456,7 @@ pub(crate) mod test_support {
             price_state,
             config,
             self_tx: tx.clone(),
+            homey: None,
         };
         let join = tokio::spawn(actor.run(rx, cancel));
         (SmartGridHandle { tx }, join)
@@ -404,6 +467,37 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::spawn_with_test_gpio;
     use super::*;
+    use crate::homey::test_support::{SharedMock, make_client, spawn_mock};
+    use std::net::SocketAddr;
+
+    fn make_hooks(addr: SocketAddr) -> (HomeyHooks, watch::Receiver<bool>) {
+        let client = make_client(addr);
+        let cache = Arc::new(HomeyPumpCache::new());
+        let (desired_tx, desired_rx) = watch::channel(true);
+        (
+            HomeyHooks {
+                client,
+                cache,
+                desired_tx,
+            },
+            desired_rx,
+        )
+    }
+
+    /// Wait briefly for the fire-and-forget `tokio::spawn` inside
+    /// `push_pump_to_homey` to complete and the mock to record the call.
+    async fn wait_for_sets(state: &SharedMock, want_len: usize) {
+        for _ in 0..50 {
+            if state.lock().unwrap().set_calls.len() >= want_len {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "expected at least {want_len} sets, got {:?}",
+            state.lock().unwrap().set_calls
+        );
+    }
 
     fn test_config() -> SmartGridConfig {
         SmartGridConfig {
@@ -577,5 +671,80 @@ mod tests {
             .await
             .expect("actor must exit within 200 ms")
             .expect("actor must not panic");
+    }
+
+    // ── push_pump_to_homey: unit tests for the helper itself ─────────
+    //
+    // The helper is tested in isolation rather than driving it through
+    // the full actor loop. Two reasons: the test-only GpioController
+    // errors on every `set_mode`, which would short-circuit the helper
+    // call site inside `do_set_mode`; and the helper has its own
+    // fire-and-forget tokio::spawn, so going through the actor adds
+    // timing noise without exercising any additional code path.
+
+    #[test]
+    fn pump_on_for_matches_plan() {
+        assert!(pump_on_for(SmartGridMode::Normal));
+        assert!(pump_on_for(SmartGridMode::LowPrice));
+        assert!(pump_on_for(SmartGridMode::Overcapacity));
+        assert!(!pump_on_for(SmartGridMode::Blocking));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_pump_none_is_noop() {
+        // No panic, no work. Just confirm the branch handles None.
+        push_pump_to_homey(None, SmartGridMode::Blocking);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_pump_blocking_pushes_false_and_updates_watch() {
+        let state: SharedMock = Arc::default();
+        let addr = spawn_mock(state.clone()).await;
+        let (hooks, mut rx) = make_hooks(addr);
+
+        push_pump_to_homey(Some(&hooks), SmartGridMode::Blocking);
+
+        // Watch update is synchronous — no waiting needed.
+        rx.changed().await.unwrap();
+        assert!(!(*rx.borrow()));
+
+        wait_for_sets(&state, 1).await;
+        assert_eq!(state.lock().unwrap().set_calls, vec![false]);
+
+        // Cache was written-fresh by the push completion.
+        let snap = hooks.cache.read().await;
+        assert_eq!(snap.actual, Some(false));
+        assert!(!snap.stale);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_pump_normal_pushes_true() {
+        let state: SharedMock = Arc::default();
+        let addr = spawn_mock(state.clone()).await;
+        let (hooks, _rx) = make_hooks(addr);
+
+        push_pump_to_homey(Some(&hooks), SmartGridMode::Normal);
+
+        wait_for_sets(&state, 1).await;
+        assert_eq!(state.lock().unwrap().set_calls, vec![true]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_pump_unreachable_homey_marks_cache_stale() {
+        // Point at a port nobody's listening on so reqwest fails fast.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (hooks, _rx) = make_hooks(addr);
+
+        push_pump_to_homey(Some(&hooks), SmartGridMode::Blocking);
+
+        // Wait for the spawned task to fail and mark stale.
+        for _ in 0..200 {
+            let snap = hooks.cache.read().await;
+            if snap.stale {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("cache never became stale despite Homey being unreachable");
     }
 }

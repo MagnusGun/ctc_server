@@ -93,12 +93,9 @@ mod tests {
         for i in 0..3 {
             store.record_step_event(make_event(i));
         }
-        let r = get_step_response(
-            State(store),
-            Query(StepResponseQuery { limit: Some(10) }),
-        )
-        .await
-        .expect("get_step_response");
+        let r = get_step_response(State(store), Query(StepResponseQuery { limit: Some(10) }))
+            .await
+            .expect("get_step_response");
         assert_eq!(r.0.len(), 3);
     }
 

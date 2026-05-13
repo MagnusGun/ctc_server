@@ -25,6 +25,7 @@ pub struct Config {
     pub price: PriceConfig,
     pub heatpump_stats: HeatPumpStatsConfig,
     pub smartgrid: SmartGridConfig,
+    pub homey: HomeyConfig,
     pub storage: StorageConfig,
     /// IANA timezone used for local-time conversions (e.g. daily-stats keying,
     /// price-fetch schedule). The Göteborg Energi tariff calendar is always
@@ -171,6 +172,29 @@ pub struct SmartGridConfig {
     pub auto_resume_window_hours: u64,
 }
 
+/// Homey REST API integration for controlling the Cirkulationspump smart plug.
+///
+/// When `enabled = true`, the `SmartGrid` actor pushes the pump on/off via the
+/// Homey REST API on every mode change (`Blocking` → off, anything else → on),
+/// and a reconciliation poller corrects drift every `poll_interval_secs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HomeyConfig {
+    /// Enable Homey REST integration
+    pub enabled: bool,
+    /// Homey Pro LAN URL (no trailing slash), e.g. `http://192.168.10.10`
+    pub url: String,
+    /// Personal Access Token. Required scopes:
+    /// `homey.device.control`, `homey.device.readonly`.
+    /// Set via `CTC_HOMEY_TOKEN` env var — never commit.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Device id of the smart plug acting as the pump switch.
+    pub pump_device_id: String,
+    /// Reconciliation poll interval in seconds. `0` disables the poller
+    /// (push-only mode — drift will not be corrected).
+    pub poll_interval_secs: u64,
+}
+
 impl Config {
     /// Load configuration from file, environment variables, and defaults
     ///
@@ -237,6 +261,11 @@ impl Config {
                 "CTC_MODBUS_CHANNEL_BUFFER_SIZE",
                 "modbus.channel_buffer_size",
             ),
+            ("CTC_HOMEY_ENABLED", "homey.enabled"),
+            ("CTC_HOMEY_URL", "homey.url"),
+            ("CTC_HOMEY_TOKEN", "homey.token"),
+            ("CTC_HOMEY_PUMP_DEVICE_ID", "homey.pump_device_id"),
+            ("CTC_HOMEY_POLL_INTERVAL_SECS", "homey.poll_interval_secs"),
         ] {
             if let Some(v) = get_env(env_key) {
                 builder = builder.set_override(cfg_key, v)?;
@@ -288,6 +317,13 @@ impl Config {
             // SmartGrid defaults
             .set_default("smartgrid.auto_resume_enabled", true)?
             .set_default("smartgrid.auto_resume_window_hours", 8)?
+            // Homey defaults — disabled by default; opt in via [homey].enabled
+            // or CTC_HOMEY_ENABLED=true.
+            .set_default("homey.enabled", false)?
+            .set_default("homey.url", "")?
+            .set_default("homey.token", None::<String>)?
+            .set_default("homey.pump_device_id", "")?
+            .set_default("homey.poll_interval_secs", 60)?
             // Storage defaults — CTC_DB_PATH env var overrides
             .set_default("storage.db_path", "./data/ctc.redb")?
             // Timezone default — Stockholm preserves prior hardcoded behaviour.
@@ -314,6 +350,26 @@ impl Config {
                 "Invalid tz: '{}' is not a valid IANA timezone (e.g. 'Europe/Stockholm', 'America/New_York')",
                 cfg.tz
             )));
+        }
+        // When Homey is enabled, every connection parameter must be present —
+        // surface the misconfig at startup rather than at the first failed
+        // request. When disabled, the fields are unused.
+        if cfg.homey.enabled {
+            if cfg.homey.url.is_empty() {
+                return Err(ConfigError::Message(
+                    "homey.enabled = true but homey.url is empty (set CTC_HOMEY_URL)".into(),
+                ));
+            }
+            if cfg.homey.token.as_deref().is_none_or(str::is_empty) {
+                return Err(ConfigError::Message(
+                    "homey.enabled = true but homey.token is empty (set CTC_HOMEY_TOKEN)".into(),
+                ));
+            }
+            if cfg.homey.pump_device_id.is_empty() {
+                return Err(ConfigError::Message(
+                    "homey.enabled = true but homey.pump_device_id is empty (set CTC_HOMEY_PUMP_DEVICE_ID)".into(),
+                ));
+            }
         }
         Ok(cfg)
     }
@@ -548,6 +604,16 @@ mod tests {
             .unwrap()
             .set_default("smartgrid.auto_resume_window_hours", 8)
             .unwrap()
+            .set_default("homey.enabled", false)
+            .unwrap()
+            .set_default("homey.url", "")
+            .unwrap()
+            .set_default("homey.token", None::<String>)
+            .unwrap()
+            .set_default("homey.pump_device_id", "")
+            .unwrap()
+            .set_default("homey.poll_interval_secs", 60)
+            .unwrap()
             .set_default("storage.db_path", "./data/ctc.redb")
             .unwrap()
             .set_default("tz", "Europe/Stockholm")
@@ -623,5 +689,93 @@ mod tests {
         let cfg = Config::load_with_env(None, |_| None).expect("load");
         assert_eq!(cfg.storage.db_path, "./data/ctc.redb");
         assert!(cfg.heatpump_stats.persist_path.is_none());
+    }
+
+    #[test]
+    fn homey_disabled_by_default() {
+        let cfg = Config::load(None).expect("load");
+        assert!(!cfg.homey.enabled);
+        assert!(cfg.homey.url.is_empty());
+        assert!(cfg.homey.token.is_none());
+        assert!(cfg.homey.pump_device_id.is_empty());
+        assert_eq!(cfg.homey.poll_interval_secs, 60);
+    }
+
+    #[test]
+    fn homey_env_vars_route_correctly() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "CTC_HOMEY_ENABLED" => Some("true".into()),
+                "CTC_HOMEY_URL" => Some("http://homey.local".into()),
+                "CTC_HOMEY_TOKEN" => Some("pat-abc".into()),
+                "CTC_HOMEY_PUMP_DEVICE_ID" => Some("dev-xyz".into()),
+                "CTC_HOMEY_POLL_INTERVAL_SECS" => Some("30".into()),
+                _ => None,
+            }
+        };
+        let cfg = Config::load_with_env(None, env).expect("load");
+        assert!(cfg.homey.enabled);
+        assert_eq!(cfg.homey.url, "http://homey.local");
+        assert_eq!(cfg.homey.token.as_deref(), Some("pat-abc"));
+        assert_eq!(cfg.homey.pump_device_id, "dev-xyz");
+        assert_eq!(cfg.homey.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn homey_enabled_requires_url() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "CTC_HOMEY_ENABLED" => Some("true".into()),
+                "CTC_HOMEY_TOKEN" => Some("pat-abc".into()),
+                "CTC_HOMEY_PUMP_DEVICE_ID" => Some("dev-xyz".into()),
+                _ => None,
+            }
+        };
+        let err = Config::load_with_env(None, env).unwrap_err();
+        assert!(
+            err.to_string().contains("homey.url"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn homey_enabled_requires_token() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "CTC_HOMEY_ENABLED" => Some("true".into()),
+                "CTC_HOMEY_URL" => Some("http://homey.local".into()),
+                "CTC_HOMEY_PUMP_DEVICE_ID" => Some("dev-xyz".into()),
+                _ => None,
+            }
+        };
+        let err = Config::load_with_env(None, env).unwrap_err();
+        assert!(
+            err.to_string().contains("homey.token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn homey_enabled_requires_pump_device_id() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "CTC_HOMEY_ENABLED" => Some("true".into()),
+                "CTC_HOMEY_URL" => Some("http://homey.local".into()),
+                "CTC_HOMEY_TOKEN" => Some("pat-abc".into()),
+                _ => None,
+            }
+        };
+        let err = Config::load_with_env(None, env).unwrap_err();
+        assert!(
+            err.to_string().contains("homey.pump_device_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn homey_disabled_accepts_empty_fields() {
+        // Defaults: enabled=false, all fields empty/None. Must still validate.
+        let cfg = Config::load_with_env(None, |_| None).expect("load");
+        assert!(!cfg.homey.enabled);
     }
 }

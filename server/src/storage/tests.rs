@@ -111,8 +111,8 @@ fn ring_retains_sample_exactly_at_retention_boundary() {
     let now = SystemTime::now();
     // Place a sample at exactly the boundary: now - SERIES_RETENTION_SECS.
     // record_sample drops samples STRICTLY older than that, so this one stays.
-    let boundary = now
-        - std::time::Duration::from_secs(crate::storage::SERIES_RETENTION_SECS as u64);
+    let boundary =
+        now - std::time::Duration::from_secs(crate::storage::SERIES_RETENTION_SECS as u64);
     store.record_sample(Sensor::Room, boundary, 7.5).unwrap();
     // A second sample at "now" triggers the retention sweep.
     store.record_sample(Sensor::Room, now, 8.0).unwrap();

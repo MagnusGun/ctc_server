@@ -41,6 +41,16 @@ services:
       # Tibber integration for real-time consumption tracking
       - CTC_TIBBER_ENABLED=${TIBBER_ENABLED:-false}
       - CTC_TIBBER_API_TOKEN=${TIBBER_API_TOKEN:-}
+      # Homey integration for controlling the Cirkulationspump smart plug.
+      # When enabled, the SmartGrid actor slaves the pump on/off to mode
+      # and a reconciliation poller corrects drift every
+      # CTC_HOMEY_POLL_INTERVAL_SECS seconds. PAT needs scopes
+      # homey.device.control + homey.device.readonly.
+      - CTC_HOMEY_ENABLED=${HOMEY_ENABLED:-false}
+      - CTC_HOMEY_URL=${HOMEY_URL:-}
+      - CTC_HOMEY_TOKEN=${HOMEY_TOKEN:-}
+      - CTC_HOMEY_PUMP_DEVICE_ID=${HOMEY_PUMP_DEVICE_ID:-864d0cbf-eb44-450f-a37a-cbf14a1b705f}
+      - CTC_HOMEY_POLL_INTERVAL_SECS=${HOMEY_POLL_INTERVAL_SECS:-60}
       # Uncomment to override other settings
       # - CTC_SERIAL_BAUD_RATE=9600
       # - CTC_SERIAL_PARITY=even
