@@ -266,9 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(routes::heatpump_stats::routes(heatpump_stats.clone()))
         .route(
             "/api/v1/version",
-            get(|| async {
-                concat!("{\"version\": \"", env!("CARGO_PKG_VERSION"), "\"}\n")
-            }),
+            get(|| async { concat!("{\"version\": \"", env!("CARGO_PKG_VERSION"), "\"}\n") }),
         )
         // Static file serving for web dashboard
         .nest_service("/static", ServeDir::new(static_dir()))
