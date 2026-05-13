@@ -271,13 +271,13 @@ const RadialClock = ({ data }) => {
 };
 
 /* ---------- Heating system: flow/return/ΔT trend + step response ---------- */
-const HeatingTrend = ({ data }) => {
+const HeatingTrend = ({ data, height = 220 }) => {
   const [hov, setHov] = React.useState(null);
   if (!data || !Array.isArray(data.flow) || !Array.isArray(data.ret)
       || data.flow.length === 0 || data.ret.length === 0) {
     return <EmptyChart/>;
   }
-  const w = 1200, h = 220, pad = 36;
+  const w = 1200, h = height, pad = 36;
   // Label each bucket with the wall-clock hour at its end so the rightmost
   // tick reads the current local hour.
   const nowHour = new Date().getHours();

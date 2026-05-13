@@ -130,6 +130,7 @@ function App() {
   const overcap   = mode === "overcapacity";
   const lowprice  = mode === "lowprice";
   const [sgOpen, setSgOpen] = useState(false);
+  const narrow = useIsNarrow();
 
   /* ---------- Live data from backend ---------- */
   const [activitySegs] = useActivity();
@@ -726,6 +727,7 @@ function App() {
                 <EnergyChart
                   today={todayPrices}
                   nowIndex={nowIdx}
+                  height={narrow ? 140 : 200}
                 />
               </>
             );
@@ -741,7 +743,7 @@ function App() {
                 const totalH = segs.reduce((s, seg) => s + (seg.end - seg.start), 0);
                 return `compressor on ${totalH.toFixed(1)} h today`;
               })()}>
-          <ActivityTimeline segments={activitySegs || []}/>
+          <ActivityTimeline segments={activitySegs || []} height={narrow ? 48 : 60}/>
           <div className="legend">
             <span className="leg"><i style={{ background: "var(--accent)" }}/> Heating circuit</span>
             <span className="leg"><i style={{ background: "var(--hot)" }}/> Domestic hot water</span>
@@ -864,7 +866,7 @@ function App() {
                     <h4>Flow / Return / ΔT · last 24 h</h4>
                     <span className="ss-sub">filled band = ΔT · narrow band = system in balance · wide band = drawing heat</span>
                   </div>
-                  <HeatingTrend data={statsData?.heating || undefined}/>
+                  <HeatingTrend data={statsData?.heating || undefined} height={narrow ? 180 : 220}/>
                 </div>
                 <div className="stats-section">
                   <div className="ss-head">
@@ -924,7 +926,7 @@ function App() {
               <div className="empty-chart">Failed to load trend data: {trendError}</div>
             ) : (
               <>
-                <TrendChart series={trend.series} yMin={trend.yMin} yMax={trend.yMax} unit={trend.unit}/>
+                <TrendChart series={trend.series} yMin={trend.yMin} yMax={trend.yMax} unit={trend.unit} height={narrow ? 180 : 200}/>
                 <div className="tm-stats">
                   {trend.series.map((s, i) => {
                     // Filter null gap hours before computing stats so missing

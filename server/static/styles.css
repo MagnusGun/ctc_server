@@ -73,7 +73,6 @@ body {
   font-feature-settings: "ss01", "cv11";
   -webkit-font-smoothing: antialiased;
   letter-spacing: -0.005em;
-  min-width: 1280px;
 }
 
 /* ============================================================
@@ -1473,4 +1472,106 @@ body {
   fill: var(--text-2);
   letter-spacing: 0.1em;
   text-transform: uppercase;
+}
+
+/* ============================================================
+   Responsive — phone & tablet
+   ============================================================ */
+
+/* Tablet landscape / small desktop — collapse the 4-up heat-pump grid */
+@media (max-width: 1024px) {
+  .metric-grid.cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .app { padding: 18px 22px 64px; }
+}
+
+/* Tablet portrait — single-column rows, 2-col tile grids, looser padding.
+   Switch all `1fr` tracks to `minmax(0, 1fr)` so a grid item with intrinsic
+   max-content (a long tooltip label, an SVG width) can't push its track
+   wider than the viewport. */
+@media (max-width: 768px) {
+  .row.full,
+  .row.split-58 { grid-template-columns: minmax(0, 1fr); }
+  .metric-grid.cols-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .card-head { flex-wrap: wrap; row-gap: 8px; }
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .status-strip { flex-wrap: wrap; justify-content: flex-start; }
+  .app { padding: 14px 16px 56px; }
+}
+
+/* Phone — single-column tile grids, sheet-style popovers and modals,
+   44 px tap-target floor on every interactive element. */
+@media (max-width: 480px) {
+  .metric-grid.cols-2,
+  .metric-grid.cols-3,
+  .metric-grid.cols-4 { grid-template-columns: minmax(0, 1fr); }
+  .stats { grid-template-columns: minmax(0, 1fr); }
+  .pumps { grid-template-columns: minmax(0, 1fr); }
+
+  /* Current-price block stacks vertically so the price card and the
+     min/max/avg row each get the full width. */
+  .price-now {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+  .minmax { gap: 10px; }
+
+  .app { padding: 10px 12px 48px; }
+  .card { padding: 14px 12px; min-width: 0; }
+  .topbar { padding-bottom: 14px; margin-bottom: 14px; }
+
+  /* Hover-only `.has-tip` popups are unreachable on touch and (with their
+     `white-space: nowrap`) push their absolute-positioned children past the
+     viewport edge, contributing to horizontal overflow. Drop them on phones. */
+  .has-tip > .tip { display: none; }
+
+  /* Tap-target floor — anything the user might prod with a thumb. */
+  .chip,
+  .metric.clickable,
+  .sb-link,
+  .tm-close,
+  .dialog .actions .btn,
+  .sg-opt { min-height: 44px; }
+  .dialog .actions .btn { padding: 10px 16px; }
+
+  /* SmartGrid popover becomes a full-width sheet anchored to the screen edges
+     instead of the mode chip — the chip sits inside a wrapped status strip
+     and there isn't always room to anchor below it. */
+  .sg-pop {
+    position: fixed;
+    top: auto;
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    min-width: 0;
+    width: auto;
+    max-height: 80vh;
+    overflow-y: auto;
+  }
+
+  /* Confirm dialog: drop the 380 px min-width so it fits a 375 px viewport. */
+  .dialog {
+    min-width: 0;
+    width: calc(100vw - 24px);
+    max-width: 100%;
+    padding: 18px 16px 14px;
+  }
+  .dialog .actions { flex-direction: column-reverse; }
+  .dialog .actions .btn { width: 100%; }
+
+  /* Trend / stats modals become full-screen sheets. */
+  .trend-modal,
+  .stats-modal {
+    width: 100vw;
+    max-width: 100vw;
+    max-height: 100vh;
+    border-radius: 0;
+    padding: 14px 14px 12px;
+  }
+  .trend-modal .tm-head { gap: 12px; }
+  .trend-modal .tm-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

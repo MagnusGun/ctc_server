@@ -296,6 +296,21 @@ const useGrid           = () => usePolledFetch(window.api.getGrid, POLL_LIVE);
 const usePrices         = () => usePolledFetch(window.api.getPrices, POLL_PRICES);
 const usePump           = () => usePolledFetch(window.api.getPump, POLL_LIVE);
 
+/* Match a media query and re-render on viewport change. Used to retune
+   chart heights at the 480 px phone breakpoint — CSS handles every other
+   responsive concern. */
+function useMediaQuery(query) {
+    const [match, setMatch] = React.useState(() => window.matchMedia(query).matches);
+    React.useEffect(() => {
+        const mq = window.matchMedia(query);
+        const handler = e => setMatch(e.matches);
+        mq.addEventListener("change", handler);
+        return () => mq.removeEventListener("change", handler);
+    }, [query]);
+    return match;
+}
+const useIsNarrow = () => useMediaQuery("(max-width: 480px)");
+
 window.POLL_LIVE = POLL_LIVE;
 window.POLL_PRICES = POLL_PRICES;
 window.bucketHourly = bucketHourly;
@@ -314,3 +329,4 @@ window.useSmartGrid = useSmartGrid;
 window.useGrid = useGrid;
 window.usePrices = usePrices;
 window.usePump = usePump;
+window.useIsNarrow = useIsNarrow;
