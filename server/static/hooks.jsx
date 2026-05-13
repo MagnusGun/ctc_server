@@ -248,7 +248,7 @@ function buildStatsData(history, flowSeries, retSeries) {
     const startsDays = daily.slice(-60)
         .filter(d => d.avg_outdoor_temp_c != null)
         .map(d => ({
-            date: new Date(d.date),
+            date: parseLocalDate(d.date),
             starts: d.starts || 0,
             outdoor: d.avg_outdoor_temp_c,
         }));

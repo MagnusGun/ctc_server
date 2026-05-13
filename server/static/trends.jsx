@@ -130,9 +130,22 @@ const TrendChart = ({ series, height = 200, yMin, yMax, hours = 24, unit = "°C"
     const v = min + (max - min) * (i / 4);
     ticks.push({ v, y: yFor(v) });
   }
+  // Label each tick with the wall-clock hour at the end of its bucket so the
+  // rightmost tick reads the current local hour.
+  const nowHour = new Date().getHours();
+  const lastBucket = hours - 1;
   const xTicks = [];
-  for (let i = 0; i <= hours; i += 4) {
-    xTicks.push({ label: `${String(i).padStart(2,"0")}:00`, x: padL + (i / hours) * innerW });
+  for (let i = 0; i <= lastBucket; i += 4) {
+    xTicks.push({
+      label: `${String((nowHour + 1 + i) % 24).padStart(2,"0")}:00`,
+      x: padL + (i / lastBucket) * innerW,
+    });
+  }
+  if (xTicks[xTicks.length - 1].x < padL + innerW) {
+    xTicks.push({
+      label: `${String((nowHour + 1 + lastBucket) % 24).padStart(2,"0")}:00`,
+      x: padL + innerW,
+    });
   }
 
   const refLen = series[0].data.length;
@@ -210,7 +223,7 @@ const TrendChart = ({ series, height = 200, yMin, yMax, hours = 24, unit = "°C"
                       fill="oklch(0.10 0.005 250)" stroke="var(--line-2)"/>
                 <text x="10" y="15" fill="oklch(0.78 0.008 250)" fontSize="10"
                       fontFamily="var(--font-mono)">
-                  {`${String(hover).padStart(2,"0")}:00`}
+                  {`${String((nowHour + 1 + hover) % 24).padStart(2,"0")}:00`}
                 </text>
                 {series.map((s, si) => (
                   <g key={si} transform={`translate(10, ${28 + si * 14})`}>

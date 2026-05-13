@@ -16,7 +16,7 @@ const EnergyChart = ({ today, nowIndex, height = 200 }) => {
     ? Math.ceil(Math.max(...today.filter(v => v != null)) * 10) / 10 + 0.1
     : 1;
 
-  const xFor = i => padL + (i / 23) * innerW;
+  const xFor = i => padL + (i / 24) * innerW;
   const yFor = v => padT + innerH - ((v - yMin) / (yMax - yMin)) * innerH;
 
   const buildPath = (arr) => {

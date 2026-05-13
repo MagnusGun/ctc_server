@@ -76,6 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Mutex poison handling in `heatpump/stats.rs` (`mark_poll_failed`, `update_state`, `get_summary`, `get_history`) now matches the storage convention (`unwrap_or_else(|e| e.into_inner())`); a poisoned mutex no longer panics the poller
 - `snapshot_current_day` routes corrupt-clock days (year < 0) to a `19700101` sentinel instead of collapsing onto an `MMDD`-shaped key that successive failures would overwrite
 - `activity::iso()` epoch fallback logs a warning before substituting 1970, so silently-malformed timestamps surface in logs
+- EnergyChart NOW marker uses the same `/24` denominator as the axis ticks (was `/23` against a `/24` axis, drifted ~1 h from wall clock)
+- HeatingTrend and TrendChart anchor the rightmost x-axis tick (and hover tooltip) to the current local hour for the rolling 24 h window — labels were previously a fixed `00:00…23:00` sequence unrelated to the data
+- StartsDaily / StartsVsTemp parse `daily[].date` via the existing `parseLocalDate` helper instead of `new Date(d.date)`, so day labels stay consistent with the calendar heatmap across negative-UTC-offset browsers
 
 ### Removed
 - **Tibber as a price source** (elpris is now the only price source; Tibber WebSocket consumption stream retained)

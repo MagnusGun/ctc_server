@@ -278,7 +278,11 @@ const HeatingTrend = ({ data }) => {
     return <EmptyChart/>;
   }
   const w = 1200, h = 220, pad = 36;
-  const labels = Array.from({ length: 24 }, (_, i) => `${i.toString().padStart(2,"0")}:00`);
+  // Label each bucket with the wall-clock hour at its end so the rightmost
+  // tick reads the current local hour.
+  const nowHour = new Date().getHours();
+  const labels = Array.from({ length: 24 }, (_, i) =>
+    `${((nowHour + 1 + i) % 24).toString().padStart(2,"0")}:00`);
   // Filter nulls (gap hours where the sensor was offline or cache missed)
   // out of axis computation; the chart paths render those buckets as gaps.
   const finite = [...data.flow, ...data.ret].filter(v => v != null);
