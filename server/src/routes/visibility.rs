@@ -111,6 +111,10 @@ async fn get_visibility(
             error!("get_visibility: Unexpected RawRegisters response");
             Err(ApiError::InternalError)
         }
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("get_visibility: Unexpected Stats response");
+            Err(ApiError::InternalError)
+        }
         Ok(Ok(Err(e))) => {
             error!("get_visibility: Modbus error - {}", e);
             Err(ApiError::from(e))
@@ -186,6 +190,10 @@ async fn get_all_visibility(State(state): State<VisibilityState>) -> Result<Stri
         }
         Ok(Ok(Ok(ModbusResponse::Value(_)))) => {
             error!("get_all_visibility: Unexpected Value response");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("get_all_visibility: Unexpected Stats response");
             Err(ApiError::InternalError)
         }
         Ok(Ok(Err(e))) => {
@@ -321,6 +329,10 @@ async fn get_parameter_visibility(
         }
         Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
             error!("get_parameter_visibility: Unexpected RawRegisters response");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("get_parameter_visibility: Unexpected Stats response");
             Err(ApiError::InternalError)
         }
         Ok(Ok(Err(e))) => {
@@ -491,9 +503,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         let regs = v["registers"].as_array().expect("registers array");
         assert_eq!(regs.len(), 3);
-        let expected = [(62500u64, 65535u64, "0xFFFF"),
-                        (62501,     0,     "0x0000"),
-                        (62502,     5,     "0x0005")];
+        let expected = [
+            (62500u64, 65535u64, "0xFFFF"),
+            (62501, 0, "0x0000"),
+            (62502, 5, "0x0005"),
+        ];
         for (i, (reg, val, hex)) in expected.iter().enumerate() {
             assert_eq!(regs[i]["register"].as_u64(), Some(*reg));
             assert_eq!(regs[i]["value"].as_u64(), Some(*val));

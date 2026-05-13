@@ -3,6 +3,9 @@ pub mod actor;
 pub mod bms_parameters;
 pub mod operations;
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 // Re-export actor types for easier access
 pub use actor::{CtcActorBuilder, ModbusResponse, ModbusSender, ParameterOperation};
 
@@ -10,6 +13,50 @@ pub use actor::{CtcActorBuilder, ModbusResponse, ModbusSender, ParameterOperatio
 // read_parameter_value is part of the public API but currently unused internally
 #[allow(unused_imports)]
 pub use operations::{read_parameter, read_parameter_value, write_parameter};
+
+/// Process-lifetime supervisor counters that survive actor respawn.
+///
+/// The actor's in-memory telemetry (histograms, per-register counters,
+/// rate window) resets each time the supervisor rebuilds the actor.
+/// These atomics live above the actor in an `Arc<SupervisorStats>` so the
+/// stats endpoint can report rebuild frequency without losing data on
+/// every respawn.
+///
+/// All counters are `Relaxed`: each field is read independently by the
+/// stats snapshot and there is no inter-field invariant to preserve.
+#[derive(Debug, Default)]
+pub struct SupervisorStats {
+    /// Number of times `spawn_supervised`'s loop has rebuilt the actor
+    /// after a panic or clean exit. The first successful build does NOT
+    /// count — only subsequent rebuilds do.
+    pub respawns: AtomicU32,
+    /// Number of times `CtcActorBuilder::build()` returned `Err`
+    /// (serial port missing, in use, permission denied, etc.).
+    pub port_open_failures: AtomicU32,
+    /// Epoch second of the most recent rebuild. `0` means never.
+    pub last_respawn_epoch_secs: AtomicU64,
+}
+
+impl SupervisorStats {
+    /// Record one failed `CtcActorBuilder::build()` call. Called by the
+    /// supervisor's `Err` arm; tests exercise the helper directly because
+    /// `spawn_supervised` itself can't run without a real serial port.
+    pub fn record_build_failure(&self) {
+        self.port_open_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one actor `run()` exit (clean or via panic). Bumps
+    /// `respawns` and stamps `last_respawn_epoch_secs` with the current
+    /// wall-clock second.
+    pub fn record_respawn(&self) {
+        self.respawns.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_respawn_epoch_secs.store(now, Ordering::Relaxed);
+    }
+}
 
 // region: --- Modbus Parameter Struct
 // Define the access type.

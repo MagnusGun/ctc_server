@@ -6,9 +6,13 @@
 
 use crate::error::ModbusError;
 use crate::modbus::bms_parameters::{ALARM_REF_MIN, INFO_REF_MAX};
-use crate::modbus::{Access, CTCModbusParameter};
+use crate::modbus::{Access, CTCModbusParameter, SupervisorStats};
+use hdrhistogram::Histogram;
+use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep, timeout};
 use tokio_modbus::client::Writer;
@@ -24,6 +28,11 @@ pub enum ModbusResponse {
     Value(f32),
     /// Raw register data (for `ReadRawRegisters`)
     RawRegisters { start: u16, values: Vec<u16> },
+    /// Snapshot of the actor's telemetry counters. Boxed because the
+    /// payload (`Vec`s of recent retries + per-register entries, plus
+    /// percentile snapshots) would otherwise inflate every other variant's
+    /// enum size.
+    Stats(Box<ModbusStats>),
 }
 
 pub type ModbusResult = Result<ModbusResponse, ModbusError>;
@@ -66,6 +75,294 @@ pub enum ParameterOperation {
         register: u16,
         value: u16,
     },
+    /// Snapshot the actor's telemetry counters.
+    /// Returns `ModbusResponse::Stats` with a fully-owned snapshot.
+    GetStats,
+}
+
+/// Whether a wire operation read from or wrote to the bus.
+///
+/// Threaded through `with_retry!` so per-register and per-histogram
+/// bookkeeping can route to the right counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireOpKind {
+    Read,
+    Write,
+}
+
+/// Client-op variant counters. One field per `ParameterOperation` variant.
+///
+/// Bumped in the dispatch loop AFTER the disconnected-client early-return
+/// so a request that's been hung up on does not skew the per-variant counts.
+#[derive(Debug, Default, Clone, Serialize)]
+pub(crate) struct OpCounts {
+    pub read: u64,
+    pub write: u64,
+    pub read_visibility: u64,
+    pub read_all_visibility: u64,
+    pub read_raw_registers: u64,
+    pub write_raw_register: u64,
+    pub get_stats: u64,
+}
+
+impl OpCounts {
+    fn bump(&mut self, op: &ParameterOperation) {
+        match op {
+            ParameterOperation::Read(_) => self.read += 1,
+            ParameterOperation::Write(_, _) => self.write += 1,
+            ParameterOperation::ReadVisibility(_) => self.read_visibility += 1,
+            ParameterOperation::ReadAllVisibility => self.read_all_visibility += 1,
+            ParameterOperation::ReadRawRegisters { .. } => self.read_raw_registers += 1,
+            ParameterOperation::WriteRawRegister { .. } => self.write_raw_register += 1,
+            ParameterOperation::GetStats => self.get_stats += 1,
+        }
+    }
+}
+
+/// Per-register counters tracking traffic patterns by Modbus address.
+///
+/// Updated inside `with_retry!` keyed on the macro's `$register` argument,
+/// so both visibility-scan reads (start register), min/max/step reads
+/// (`param.reg_max`), parameter reads/writes (`param.id`), and raw bulk
+/// reads (start register) all land in the right entry.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+struct RegisterCounters {
+    pub reads: u64,
+    pub writes: u64,
+    pub retry_attempts: u64,
+    pub final_failures: u64,
+}
+
+/// Outcome of a single wire attempt.
+///
+/// `Exception(String)` carries the rendered error so the response shape
+/// can show callers which Modbus exception fired without leaking the full
+/// `ModbusError` enum.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "detail")]
+pub(crate) enum AttemptOutcome {
+    Success,
+    Timeout,
+    Exception(String),
+}
+
+/// Final outcome of a retry-emitting request.
+///
+/// Pure first-shot successes do not emit retry events at all, so this enum
+/// only describes requests that hit at least one retry.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FinalOutcome {
+    Succeeded { attempts_used: u32 },
+    FinalFailure { reason: String },
+}
+
+/// One attempt within a retry-emitting request.
+///
+/// `ms_since_prev_wire_op` is captured BEFORE this attempt's wire call —
+/// for the first attempt of a request, that's "how long was the bus quiet
+/// before this request started"; for retries it's "gap since the previous
+/// attempt of this same request finished." For the first attempt ever the
+/// previous-op timestamp is `None`, mapped to `0` per the response schema.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AttemptDetail {
+    pub ms_since_prev_wire_op: u32,
+    pub ms_since_request_first_attempt: u32,
+    pub elapsed_ms: u32,
+    pub outcome: AttemptOutcome,
+}
+
+/// A retry-emitting request, captured for the recent-retries ring.
+///
+/// Pushed exactly once per request that took at least one retry — whether
+/// it eventually succeeded or final-failed.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RetryEvent {
+    pub when_epoch_secs: u64,
+    pub register: u16,
+    pub op_name: &'static str,
+    pub attempts: Vec<AttemptDetail>,
+    pub final_outcome: FinalOutcome,
+    pub total_struggle_ms: u32,
+}
+
+/// FIFO ring of the most recent retry-emitting requests. Cap-100 by design.
+#[derive(Debug, Default)]
+struct RetryRing {
+    inner: VecDeque<RetryEvent>,
+}
+
+impl RetryRing {
+    const CAP: usize = 100;
+
+    pub fn push(&mut self, event: RetryEvent) {
+        if self.inner.len() == Self::CAP {
+            self.inner.pop_front();
+        }
+        self.inner.push_back(event);
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &RetryEvent> {
+        self.inner.iter()
+    }
+}
+
+/// Sliding window of recent wire-op timestamps, used to compute rates over
+/// 10 s / 60 s / 5 min windows.
+///
+/// `push` evicts entries older than 5 min (the longest configured window)
+/// so the deque stays roughly proportional to actual bus traffic, not to
+/// process uptime.
+#[derive(Debug, Default)]
+struct RateWindow {
+    inner: VecDeque<Instant>,
+}
+
+impl RateWindow {
+    const MAX_AGE: Duration = Duration::from_secs(300);
+
+    pub fn push(&mut self, now: Instant) {
+        // Evict anything outside the longest window. Use checked_duration_since
+        // to avoid panicking if the monotonic clock had a shenanigan.
+        while let Some(front) = self.inner.front() {
+            if now.checked_duration_since(*front).unwrap_or(Duration::ZERO) > Self::MAX_AGE {
+                self.inner.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.inner.push_back(now);
+    }
+
+    pub fn count_within(&self, window: Duration) -> usize {
+        let now = Instant::now();
+        self.inner
+            .iter()
+            .filter(|t| now.checked_duration_since(**t).unwrap_or(Duration::ZERO) <= window)
+            .count()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+/// Snapshot of an HDR histogram's percentiles + mean + max + count.
+///
+/// All durations in milliseconds. Computed inside the actor on demand so
+/// the response is fully owned (`Send + 'static`) and the actor's
+/// histograms stay private.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HistogramSnapshot {
+    pub count: u64,
+    pub p50: u64,
+    pub p90: u64,
+    pub p99: u64,
+    pub p99_9: u64,
+    pub max: u64,
+    pub mean: f64,
+}
+
+impl HistogramSnapshot {
+    fn from_histo(h: &Histogram<u64>) -> Self {
+        Self {
+            count: h.len(),
+            p50: h.value_at_percentile(50.0),
+            p90: h.value_at_percentile(90.0),
+            p99: h.value_at_percentile(99.0),
+            p99_9: h.value_at_percentile(99.9),
+            max: h.max(),
+            mean: h.mean(),
+        }
+    }
+}
+
+/// One `registers[]` entry in the stats response.
+///
+/// Flat shape so the JSON has stable key names rather than nested map
+/// objects.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RegisterCountsEntry {
+    pub address: u16,
+    pub reads: u64,
+    pub writes: u64,
+    pub retry_attempts: u64,
+    pub final_failures: u64,
+}
+
+/// Snapshot of supervisor-level counters (across actor respawns).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SupervisorStatsSnapshot {
+    pub respawns: u32,
+    pub port_open_failures: u32,
+    pub last_respawn_epoch_secs: Option<u64>,
+    pub actor_uptime_secs: u64,
+}
+
+/// Snapshot of client-side aggregate counters.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ClientOpStats {
+    pub total: u64,
+    pub by_kind: OpCounts,
+}
+
+/// Snapshot of wire-side aggregate counters + rate windows.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WireOpStats {
+    pub total: u64,
+    pub timeouts: u64,
+    pub retry_attempts: u64,
+    pub final_failures: u64,
+    pub consecutive_failures: u32,
+    pub max_consecutive_failures: u32,
+    pub ms_since_last_success: Option<u64>,
+    pub ms_since_last_wire_op: Option<u64>,
+    pub per_sec_last_10s: f64,
+    pub per_sec_last_60s: f64,
+    pub per_sec_last_5min: f64,
+}
+
+/// Full stats payload returned by `ParameterOperation::GetStats`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ModbusStats {
+    pub actor_started_at_secs: u64,
+    pub client_ops: ClientOpStats,
+    pub wire_ops: WireOpStats,
+    pub supervisor: SupervisorStatsSnapshot,
+    pub read_durations_ms: HistogramSnapshot,
+    pub write_durations_ms: HistogramSnapshot,
+    pub registers: Vec<RegisterCountsEntry>,
+    pub recent_retries: Vec<RetryEvent>,
+}
+
+/// Wall-clock seconds since `UNIX_EPOCH`, saturating on pre-epoch clock
+/// readings (which would be a system misconfiguration, not a normal case).
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Saturating cast of a `Duration` to a `u32` count of milliseconds.
+///
+/// Used pervasively by the retry-event bookkeeping in `with_retry!`. A
+/// duration longer than ~49 days would saturate at `u32::MAX`; we never see
+/// anything close to that on a wire op (`operation_timeout` truncates at 1 s).
+pub(crate) fn ms_u32(d: Duration) -> u32 {
+    u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
 }
 
 pub struct CtcActor {
@@ -87,12 +384,38 @@ pub struct CtcActor {
     last_wire_op: Option<Instant>,
     // Tracking fields
     consecutive_failures: u32,
+    /// Highest `consecutive_failures` ever observed on this actor instance.
+    /// Resets on respawn.
+    max_consecutive_failures_seen: u32,
     last_success: Option<Instant>,
     total_operations: u64,
     total_failures: u64,
     // Visibility cache: registers 62500-62548, lazy-loaded on first access
     visibility_cache: Option<[u16; VISIBILITY_REG_COUNT]>,
+
+    // Telemetry — all fields below reset on actor respawn. The shared
+    // `sup_stats` does not; it tracks the respawns themselves.
+    actor_started_at: Instant,
+    read_histo: Histogram<u64>,
+    write_histo: Histogram<u64>,
+    op_counts: OpCounts,
+    per_register: HashMap<u16, RegisterCounters>,
+    retry_ring: RetryRing,
+    rate_window: RateWindow,
+    /// Every attempt that hit the bus, retries included.
+    total_wire_ops: u64,
+    /// Wire attempts that hit the `operation_timeout`.
+    total_wire_timeouts: u64,
+    /// Wire attempts past the first (i.e. retries that ran).
+    total_wire_retry_attempts: u64,
+    sup_stats: Arc<SupervisorStats>,
 }
+
+/// Cap on the number of distinct register addresses tracked in
+/// `per_register`. The CTC parameter set is well under 100 distinct
+/// addresses; hitting this cap means we have a bug emitting fresh
+/// addresses on the hot path.
+const PER_REGISTER_CAP: usize = 256;
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -112,6 +435,7 @@ pub struct CtcActorBuilder {
     backoff_multiplier: f64,
     max_consecutive_failures: u32,
     inter_request_gap: Duration,
+    sup_stats: Arc<SupervisorStats>,
 }
 
 #[allow(dead_code)]
@@ -134,7 +458,17 @@ impl CtcActorBuilder {
             backoff_multiplier: 2.0,                   // Will be overridden by config
             max_consecutive_failures: 5,               // Will be overridden by config
             inter_request_gap: Duration::from_millis(10), // Will be overridden by config
+            sup_stats: Arc::new(SupervisorStats::default()),
         }
+    }
+
+    /// Replace the supervisor stats Arc. Callers should hand the same
+    /// `Arc<SupervisorStats>` to both this builder and any reader that
+    /// wants to observe the counters — the builder clones it into the
+    /// actor on `build()`.
+    pub fn sup_stats(mut self, sup_stats: Arc<SupervisorStats>) -> Self {
+        self.sup_stats = sup_stats;
+        self
     }
 
     pub fn baud_rate(mut self, baud_rate: u32) -> Self {
@@ -217,6 +551,15 @@ impl CtcActorBuilder {
         // Create the Modbus RTU context
         let ctx = rtu::attach_slave(port, Slave(self.slave_id));
 
+        // HDR bounds: 1 ms .. 60 s with 3 significant figures of precision.
+        // The bounds are compile-time constants and `new_with_bounds` only
+        // fails on bad inputs (lo<=0, hi<=lo, sig_fig out of 0..=5), so the
+        // `expect` is justified.
+        let read_histo = Histogram::<u64>::new_with_bounds(1, 60_000, 3)
+            .expect("HDR bounds known valid at compile time");
+        let write_histo = Histogram::<u64>::new_with_bounds(1, 60_000, 3)
+            .expect("HDR bounds known valid at compile time");
+
         Ok(CtcActor {
             context: ctx,
             operation_timeout: self.operation_timeout,
@@ -227,10 +570,22 @@ impl CtcActorBuilder {
             inter_request_gap: self.inter_request_gap,
             last_wire_op: None,
             consecutive_failures: 0,
+            max_consecutive_failures_seen: 0,
             last_success: None,
             total_operations: 0,
             total_failures: 0,
             visibility_cache: None,
+            actor_started_at: Instant::now(),
+            read_histo,
+            write_histo,
+            op_counts: OpCounts::default(),
+            per_register: HashMap::new(),
+            retry_ring: RetryRing::default(),
+            rate_window: RateWindow::default(),
+            total_wire_ops: 0,
+            total_wire_timeouts: 0,
+            total_wire_retry_attempts: 0,
+            sup_stats: Arc::clone(&self.sup_stats),
         })
     }
 
@@ -241,6 +596,12 @@ impl CtcActorBuilder {
     /// when the underlying actor task exits or panics. On exit (clean or via
     /// panic) the supervisor sleeps briefly, rebuilds the actor (which reopens
     /// the serial port), and resumes processing requests.
+    ///
+    /// Records supervisor events into the `Arc<SupervisorStats>` stored on
+    /// the builder: a failed `build()` bumps `port_open_failures`; a `run()`
+    /// exit (clean or via panic) bumps `respawns` and records the wall-clock
+    /// timestamp. The FIRST successful `build()` does NOT count as a respawn
+    /// — that's the first start, not a rebuild.
     pub fn spawn_supervised(self, receiver: mpsc::Receiver<ModbusRequest>) {
         use futures_util::FutureExt;
         use std::panic::AssertUnwindSafe;
@@ -255,6 +616,10 @@ impl CtcActorBuilder {
                         let result = AssertUnwindSafe(actor.run(&mut receiver))
                             .catch_unwind()
                             .await;
+                        // Whether the loop exited cleanly or via panic, the
+                        // supervisor is about to rebuild — that's a respawn
+                        // regardless of whether the next `build()` succeeds.
+                        self.sup_stats.record_respawn();
                         match result {
                             Ok(()) => {
                                 error!(
@@ -271,6 +636,7 @@ impl CtcActorBuilder {
                         }
                     }
                     Err(e) => {
+                        self.sup_stats.record_build_failure();
                         error!(
                             "ctc_actor::supervisor: Failed to build actor: {e}; retrying in {:?}",
                             RESPAWN_DELAY
@@ -287,6 +653,9 @@ impl CtcActorBuilder {
 ///
 /// # Type constraints
 /// - `$operation` must be an async expression yielding `Result<T, ModbusError>`
+/// - `$kind` must be a `WireOpKind` expression (Read or Write); routes the
+///   per-register `reads`/`writes` counter and selects which histogram
+///   records the success-path latency.
 /// - Returns `Result<T, ModbusError>`
 ///
 /// # Important
@@ -294,13 +663,60 @@ impl CtcActorBuilder {
 ///   each iteration. Never poll the same future twice.
 /// - On final failure, returns the stored `ModbusError` (not stringified), allowing
 ///   structured logging before conversion to `ApiError`.
+///
+/// # Telemetry contract
+/// - Emits one `RetryEvent` to the retry ring per request that needed at
+///   least one retry. Pure first-shot successes emit nothing.
+/// - Per-register `reads` or `writes` counter bumps on EVERY attempt
+///   (regardless of outcome). Per-register `retry_attempts` bumps on
+///   each failed attempt (including a failed attempt 0). Per-register
+///   `final_failures` bumps once per request whose final outcome is a
+///   failure — either retry exhaustion OR a non-transient error that
+///   short-circuited the retry loop on attempt 0.
+/// - Aggregate `total_wire_ops` bumps on every attempt;
+///   `total_wire_timeouts` on `Err(_elapsed)` timeouts;
+///   `total_wire_retry_attempts` on attempts past the first (i.e. only
+///   retries that actually ran — so this is NOT directly comparable to
+///   `sum(registers[].retry_attempts)`).
+/// - HDR histogram records only on `Ok(Ok(_))` — failed attempts'
+///   "elapsed" reflects the `operation_timeout`, not real bus latency.
+/// - `rate_window.push(Instant::now())` on every attempt, retries
+///   included.
 macro_rules! with_retry {
-    ($self:expr, $op_name:expr, $register:expr, $operation:expr) => {{
+    ($self:expr, $op_name:expr, $register:expr, $kind:expr, $operation:expr) => {{
+        use crate::modbus::actor::{
+            AttemptDetail, AttemptOutcome, FinalOutcome, PER_REGISTER_CAP, RetryEvent, WireOpKind,
+            ms_u32, now_epoch_secs,
+        };
+
         let mut last_error: Option<ModbusError> = None;
+
+        // Sampled once per request so the eventual RetryEvent's
+        // `when_epoch_secs` and `total_struggle_ms` describe the same instant.
+        let request_when_epoch = now_epoch_secs();
+        let request_started_at = Instant::now();
+        let mut attempts: Vec<AttemptDetail> = Vec::with_capacity(
+            usize::try_from($self.max_retries)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1),
+        );
+
+        // Builds the RetryEvent for either a success-after-retry or final
+        // failure. Captures only Copy values — no `$self` borrow — so the
+        // caller is free to mutate the actor while constructing the event.
+        let make_event = |attempts: Vec<AttemptDetail>, final_outcome: FinalOutcome| RetryEvent {
+            when_epoch_secs: request_when_epoch,
+            register: $register,
+            op_name: $op_name,
+            attempts,
+            final_outcome,
+            total_struggle_ms: ms_u32(request_started_at.elapsed()),
+        };
 
         let result: Result<_, ModbusError> = 'retry: {
             for attempt in 0..=$self.max_retries {
                 if attempt > 0 {
+                    $self.total_wire_retry_attempts += 1;
                     let delay = $self.calculate_retry_delay(attempt);
                     trace!(
                         "Retry attempt {}/{} for {} (register {}), delay: {}ms",
@@ -313,35 +729,110 @@ macro_rules! with_retry {
                     sleep(delay).await;
                 }
 
-                // Enforce the inter-request gap: a CTC firmware needs settle
-                // time between back-to-back wire transactions. The first
-                // operation pays nothing; subsequent ones only pay the
-                // remainder of the gap.
-                CtcActor::wait_for_inter_request_gap(
-                    $self.inter_request_gap,
-                    $self.last_wire_op,
-                )
-                .await;
+                CtcActor::wait_for_inter_request_gap($self.inter_request_gap, $self.last_wire_op)
+                    .await;
 
-                // IMPORTANT: $operation is evaluated here, inside the loop,
-                // creating a fresh future each iteration
+                // Re-read each iteration so a retry sees the just-completed
+                // previous attempt's end-time, not the request's entry-time.
+                let prev_wire_op = $self.last_wire_op;
+                let attempt_start = Instant::now();
+
+                // $operation MUST be evaluated inside the loop to build a
+                // fresh future each iteration.
                 let future = $operation;
-
                 let result = timeout($self.operation_timeout, future).await;
-                $self.last_wire_op = Some(Instant::now());
+
+                // One clock read for last_wire_op, rate_window, and
+                // wire_elapsed — they describe a single event.
+                let wire_end = Instant::now();
+                let wire_elapsed = wire_end.duration_since(attempt_start);
+                $self.last_wire_op = Some(wire_end);
+                $self.total_wire_ops += 1;
+                $self.rate_window.push(wire_end);
+
+                // Cap-guarded insert-or-bump on the per-register map.
+                {
+                    let key: u16 = $register;
+                    if $self.per_register.contains_key(&key)
+                        || $self.per_register.len() < PER_REGISTER_CAP
+                    {
+                        let c = $self.per_register.entry(key).or_default();
+                        match $kind {
+                            WireOpKind::Read => c.reads += 1,
+                            WireOpKind::Write => c.writes += 1,
+                        }
+                    } else {
+                        warn!(
+                            "ctc_actor::with_retry: per_register cap ({}) reached; \
+                             dropping new register {}",
+                            PER_REGISTER_CAP, key
+                        );
+                    }
+                }
+
+                let gap_ms: u32 = prev_wire_op
+                    .map(|t| {
+                        ms_u32(
+                            attempt_start
+                                .checked_duration_since(t)
+                                .unwrap_or(Duration::ZERO),
+                        )
+                    })
+                    .unwrap_or(0);
+                let since_first_ms: u32 = ms_u32(
+                    attempt_start
+                        .checked_duration_since(request_started_at)
+                        .unwrap_or(Duration::ZERO),
+                );
+                let elapsed_ms: u32 = ms_u32(wire_elapsed);
+
+                // Captures Copy values only, so this doesn't borrow
+                // `attempts` and the caller can still push into it.
+                let make_attempt = |outcome: AttemptOutcome| AttemptDetail {
+                    ms_since_prev_wire_op: gap_ms,
+                    ms_since_request_first_attempt: since_first_ms,
+                    elapsed_ms,
+                    outcome,
+                };
+
                 match result {
                     Ok(Ok(value)) => {
                         $self.record_success();
+                        // .ok() swallows the OOR error — a 60+ second op
+                        // would saturate, but operation_timeout truncates
+                        // well before that in practice.
+                        let elapsed_u64 =
+                            u64::try_from(wire_elapsed.as_millis()).unwrap_or(u64::MAX);
+                        match $kind {
+                            WireOpKind::Read => {
+                                $self.read_histo.record(elapsed_u64).ok();
+                            }
+                            WireOpKind::Write => {
+                                $self.write_histo.record(elapsed_u64).ok();
+                            }
+                        }
+                        attempts.push(make_attempt(AttemptOutcome::Success));
                         trace!(
                             "{} succeeded on attempt {} (register {})",
                             $op_name,
                             attempt + 1,
                             $register
                         );
+                        // Past attempt 0 means the request needed a retry
+                        // to succeed — emit one event.
+                        if attempt > 0 {
+                            $self.retry_ring.push(make_event(
+                                attempts,
+                                FinalOutcome::Succeeded {
+                                    attempts_used: attempt + 1,
+                                },
+                            ));
+                        }
                         break 'retry Ok(value);
                     }
                     Ok(Err(e)) => {
                         let transient = e.is_transient();
+                        let exc_text = format!("{e}");
                         warn!(
                             "{} failed on attempt {}/{}: {} (register {})",
                             $op_name,
@@ -350,13 +841,17 @@ macro_rules! with_retry {
                             e,
                             $register
                         );
+                        attempts.push(make_attempt(AttemptOutcome::Exception(exc_text)));
+                        if let Some(c) = $self.per_register.get_mut(&$register) {
+                            c.retry_attempts += 1;
+                        }
                         last_error = Some(e);
                         if !transient {
-                            // Permanent error: skip remaining retries.
                             break;
                         }
                     }
                     Err(_elapsed) => {
+                        $self.total_wire_timeouts += 1;
                         let timeout_err = ModbusError::Timeout {
                             register: $register,
                             operation: format!(
@@ -371,13 +866,19 @@ macro_rules! with_retry {
                             $self.max_retries + 1,
                             $register
                         );
+                        attempts.push(make_attempt(AttemptOutcome::Timeout));
+                        if let Some(c) = $self.per_register.get_mut(&$register) {
+                            c.retry_attempts += 1;
+                        }
                         last_error = Some(timeout_err);
                     }
                 }
             }
 
-            // All retries exhausted - call record_failure() exactly once
             $self.record_failure();
+            if let Some(c) = $self.per_register.get_mut(&$register) {
+                c.final_failures += 1;
+            }
 
             let final_error = last_error.unwrap_or_else(|| ModbusError::ProtocolError {
                 reason: format!("{}: no error captured during retries", $op_name),
@@ -391,7 +892,14 @@ macro_rules! with_retry {
                 final_error
             );
 
-            // Return the structured error (not stringified) for logging
+            $self.retry_ring.push(make_event(
+                attempts,
+                FinalOutcome::FinalFailure {
+                    reason: format!("{final_error}"),
+                },
+            ));
+
+            // Return the structured error (not stringified) for logging.
             Err(final_error)
         };
 
@@ -494,6 +1002,9 @@ impl CtcActor {
     fn record_failure(&mut self) {
         self.consecutive_failures += 1;
         self.total_failures += 1;
+        if self.consecutive_failures > self.max_consecutive_failures_seen {
+            self.max_consecutive_failures_seen = self.consecutive_failures;
+        }
 
         if self.consecutive_failures >= self.max_consecutive_failures {
             error!(
@@ -515,21 +1026,27 @@ impl CtcActor {
         );
 
         #[allow(clippy::cast_possible_truncation)]
-        let values: Vec<u16> = with_retry!(self, "scan_visibility", VISIBILITY_REG_START, async {
-            self.context
-                .read_holding_registers(VISIBILITY_REG_START, VISIBILITY_REG_COUNT as u16)
-                .await
-                .map_err(|e| ModbusError::ReadError {
-                    register: VISIBILITY_REG_START,
-                    reason: e.to_string(),
-                })
-                .and_then(|result| {
-                    result.map_err(|e| ModbusError::ReadError {
+        let values: Vec<u16> = with_retry!(
+            self,
+            "scan_visibility",
+            VISIBILITY_REG_START,
+            WireOpKind::Read,
+            async {
+                self.context
+                    .read_holding_registers(VISIBILITY_REG_START, VISIBILITY_REG_COUNT as u16)
+                    .await
+                    .map_err(|e| ModbusError::ReadError {
                         register: VISIBILITY_REG_START,
-                        reason: format!("Modbus exception: {e}"),
+                        reason: e.to_string(),
                     })
-                })
-        })?;
+                    .and_then(|result| {
+                        result.map_err(|e| ModbusError::ReadError {
+                            register: VISIBILITY_REG_START,
+                            reason: format!("Modbus exception: {e}"),
+                        })
+                    })
+            }
+        )?;
 
         // EXPLICIT length check before try_into() for clear error path
         if values.len() != VISIBILITY_REG_COUNT {
@@ -580,8 +1097,13 @@ impl CtcActor {
     /// actually written, avoiding floating-point mismatches when the user's
     /// scaled value doesn't align with the register's factor.
     async fn read_parameter_raw(&mut self, param: &CTCModbusParameter) -> Result<u16, ModbusError> {
-        with_retry!(self, "read_holding_registers", param.id, async {
-            self.context
+        with_retry!(
+            self,
+            "read_holding_registers",
+            param.id,
+            WireOpKind::Read,
+            async {
+                self.context
                 .read_holding_registers(param.id, 1)
                 .await
                 .map_err(|e| ModbusError::ProtocolError {
@@ -606,7 +1128,8 @@ impl CtcActor {
                             })
                         })
                 })
-        })
+            }
+        )
     }
 
     async fn read_min_max_step(
@@ -622,36 +1145,45 @@ impl CtcActor {
 
         let param_id = param.id;
 
-        with_retry!(self, "read_validation_parameters", reg_max, async {
-            self.context
-                .read_holding_registers(reg_max, 3)
-                .await
-                .map_err(|e| ModbusError::ProtocolError {
-                    reason: format!(
-                        "Error reading validation parameters at register {reg_max}: {e}"
-                    ),
-                })
-                .and_then(|raw_values| {
-                    raw_values
-                        .map_err(|e| ModbusError::ValidationReadError {
-                            register: param_id,
-                            reason: format!("{e}"),
-                        })
-                        .and_then(|raw_values| {
-                            if raw_values.len() < 3 {
-                                return Err(ModbusError::ValidationReadError {
-                                    register: param_id,
-                                    reason: format!("Expected 3 values, got {}", raw_values.len()),
-                                });
-                            }
-                            trace!(
-                                "ctc_actor::read_min_max: Raw values max/min {:?}",
-                                raw_values
-                            );
-                            Ok((raw_values[0], raw_values[1], raw_values[2]))
-                        })
-                })
-        })
+        with_retry!(
+            self,
+            "read_validation_parameters",
+            reg_max,
+            WireOpKind::Read,
+            async {
+                self.context
+                    .read_holding_registers(reg_max, 3)
+                    .await
+                    .map_err(|e| ModbusError::ProtocolError {
+                        reason: format!(
+                            "Error reading validation parameters at register {reg_max}: {e}"
+                        ),
+                    })
+                    .and_then(|raw_values| {
+                        raw_values
+                            .map_err(|e| ModbusError::ValidationReadError {
+                                register: param_id,
+                                reason: format!("{e}"),
+                            })
+                            .and_then(|raw_values| {
+                                if raw_values.len() < 3 {
+                                    return Err(ModbusError::ValidationReadError {
+                                        register: param_id,
+                                        reason: format!(
+                                            "Expected 3 values, got {}",
+                                            raw_values.len()
+                                        ),
+                                    });
+                                }
+                                trace!(
+                                    "ctc_actor::read_min_max: Raw values max/min {:?}",
+                                    raw_values
+                                );
+                                Ok((raw_values[0], raw_values[1], raw_values[2]))
+                            })
+                    })
+            }
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -766,26 +1298,32 @@ impl CtcActor {
             param.id
         );
 
-        with_retry!(self, "write_single_register", param.id, async {
-            self.context
-                .write_single_register(param.id, raw_value)
-                .await
-                .map_err(|e| {
-                    error!("ctc_actor::write_parameter: Modbus write FAILED: {}", e);
-                    ModbusError::WriteError {
-                        register: param.id,
-                        value,
-                        reason: format!("{e}"),
-                    }
-                })
-                .and_then(|result| {
-                    result.map_err(|e| ModbusError::WriteError {
-                        register: param.id,
-                        value,
-                        reason: format!("Modbus exception: {e}"),
+        with_retry!(
+            self,
+            "write_single_register",
+            param.id,
+            WireOpKind::Write,
+            async {
+                self.context
+                    .write_single_register(param.id, raw_value)
+                    .await
+                    .map_err(|e| {
+                        error!("ctc_actor::write_parameter: Modbus write FAILED: {}", e);
+                        ModbusError::WriteError {
+                            register: param.id,
+                            value,
+                            reason: format!("{e}"),
+                        }
                     })
-                })
-        })
+                    .and_then(|result| {
+                        result.map_err(|e| ModbusError::WriteError {
+                            register: param.id,
+                            value,
+                            reason: format!("Modbus exception: {e}"),
+                        })
+                    })
+            }
+        )
     }
 
     /// Handle a read operation
@@ -1107,7 +1645,7 @@ impl CtcActor {
             start, count
         );
 
-        let result = with_retry!(self, "read_raw_registers", start, async {
+        let result = with_retry!(self, "read_raw_registers", start, WireOpKind::Read, async {
             self.context
                 .read_holding_registers(start, count)
                 .await
@@ -1162,23 +1700,29 @@ impl CtcActor {
             register, value
         );
 
-        let result = with_retry!(self, "write_raw_register", register, async {
-            self.context
-                .write_single_register(register, value)
-                .await
-                .map_err(|e| ModbusError::WriteError {
-                    register,
-                    value: f32::from(value),
-                    reason: e.to_string(),
-                })
-                .and_then(|r| {
-                    r.map_err(|e| ModbusError::WriteError {
+        let result = with_retry!(
+            self,
+            "write_raw_register",
+            register,
+            WireOpKind::Write,
+            async {
+                self.context
+                    .write_single_register(register, value)
+                    .await
+                    .map_err(|e| ModbusError::WriteError {
                         register,
                         value: f32::from(value),
-                        reason: format!("Modbus exception: {e}"),
+                        reason: e.to_string(),
                     })
-                })
-        });
+                    .and_then(|r| {
+                        r.map_err(|e| ModbusError::WriteError {
+                            register,
+                            value: f32::from(value),
+                            reason: format!("Modbus exception: {e}"),
+                        })
+                    })
+            }
+        );
 
         match result {
             Ok(()) => {
@@ -1203,6 +1747,110 @@ impl CtcActor {
         }
     }
 
+    /// Build a fully-owned snapshot of every telemetry counter the actor
+    /// holds, plus the supervisor counters it shares via `Arc`. Synchronous
+    /// (no `.await`) so the dispatch loop can serve it without parking.
+    fn snapshot_stats(&self) -> ModbusStats {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let now = Instant::now();
+        // Saturating cast: the only realistic way as_millis() exceeds u64 is
+        // a clock that's been monotonically running for ~584M years.
+        let ms_to_u64 = |t: Instant| -> u64 {
+            let ms = now
+                .checked_duration_since(t)
+                .unwrap_or(Duration::ZERO)
+                .as_millis();
+            u64::try_from(ms).unwrap_or(u64::MAX)
+        };
+        let ms_since_last_success = self.last_success.map(ms_to_u64);
+        let ms_since_last_wire_op = self.last_wire_op.map(ms_to_u64);
+
+        #[allow(clippy::cast_precision_loss)]
+        let per_sec = |secs: u64| -> f64 {
+            let n = self.rate_window.count_within(Duration::from_secs(secs));
+            (n as f64) / (secs as f64)
+        };
+
+        let mut registers: Vec<RegisterCountsEntry> = self
+            .per_register
+            .iter()
+            .map(|(addr, c)| RegisterCountsEntry {
+                address: *addr,
+                reads: c.reads,
+                writes: c.writes,
+                retry_attempts: c.retry_attempts,
+                final_failures: c.final_failures,
+            })
+            .collect();
+        // Sort by retry_attempts desc, then reads+writes desc. Trouble
+        // registers float to the top of the response.
+        registers.sort_by(|a, b| {
+            b.retry_attempts
+                .cmp(&a.retry_attempts)
+                .then((b.reads + b.writes).cmp(&(a.reads + a.writes)))
+                .then(a.address.cmp(&b.address))
+        });
+
+        let last_respawn_raw = self.sup_stats.last_respawn_epoch_secs.load(Relaxed);
+        let last_respawn_epoch_secs = if last_respawn_raw == 0 {
+            None
+        } else {
+            Some(last_respawn_raw)
+        };
+        // Sample monotonic uptime once so `actor_uptime_secs` and the
+        // wall-clock `actor_started_at_secs` agree (otherwise two reads
+        // across a second boundary could disagree by 1).
+        let uptime_secs = self.actor_started_at.elapsed().as_secs();
+        let supervisor = SupervisorStatsSnapshot {
+            respawns: self.sup_stats.respawns.load(Relaxed),
+            port_open_failures: self.sup_stats.port_open_failures.load(Relaxed),
+            last_respawn_epoch_secs,
+            actor_uptime_secs: uptime_secs,
+        };
+
+        // actor_started_at_secs is a wall-clock anchor; derive it from
+        // the current wall clock minus the monotonic uptime sampled above.
+        let actor_started_at_secs = now_epoch_secs().saturating_sub(uptime_secs);
+
+        ModbusStats {
+            actor_started_at_secs,
+            client_ops: ClientOpStats {
+                total: self.total_operations,
+                by_kind: self.op_counts.clone(),
+            },
+            wire_ops: WireOpStats {
+                total: self.total_wire_ops,
+                timeouts: self.total_wire_timeouts,
+                retry_attempts: self.total_wire_retry_attempts,
+                final_failures: self.total_failures,
+                consecutive_failures: self.consecutive_failures,
+                max_consecutive_failures: self.max_consecutive_failures_seen,
+                ms_since_last_success,
+                ms_since_last_wire_op,
+                per_sec_last_10s: per_sec(10),
+                per_sec_last_60s: per_sec(60),
+                per_sec_last_5min: per_sec(300),
+            },
+            supervisor,
+            read_durations_ms: HistogramSnapshot::from_histo(&self.read_histo),
+            write_durations_ms: HistogramSnapshot::from_histo(&self.write_histo),
+            registers,
+            recent_retries: self.retry_ring.iter().cloned().collect(),
+        }
+    }
+
+    /// Handle a stats snapshot request. Synchronous internally — does not
+    /// touch the bus.
+    fn handle_get_stats(&self, respond_to: ResponseChannel) {
+        let stats = self.snapshot_stats();
+        respond_to
+            .send(Ok(ModbusResponse::Stats(Box::new(stats))))
+            .unwrap_or_else(|_| {
+                debug!("ctc_actor::run: Client disconnected before stats response sent");
+            });
+    }
+
     /// Main actor loop that processes incoming parameter operations.
     /// Handles both read and write operations for Modbus parameters.
     pub async fn run(&mut self, receiver: &mut mpsc::Receiver<ModbusRequest>) {
@@ -1219,6 +1867,10 @@ impl CtcActor {
                         self.total_operations += 1;
                         continue;
                     }
+                    // Per-variant client-op accounting. Counted after the
+                    // disconnected-client early-return so a hung-up caller
+                    // doesn't skew the per-variant counts.
+                    self.op_counts.bump(&operation);
                     match operation {
                         ParameterOperation::Read(param) => {
                             self.handle_read_operation(&param, respond_to).await;
@@ -1237,6 +1889,9 @@ impl CtcActor {
                         },
                         ParameterOperation::WriteRawRegister { register, value } => {
                             self.handle_write_raw_register(register, value, respond_to).await;
+                        },
+                        ParameterOperation::GetStats => {
+                            self.handle_get_stats(respond_to);
                         },
                     }
                 }
@@ -1420,5 +2075,419 @@ mod tests {
         let cache = [0u16; VISIBILITY_REG_COUNT];
         let err = check_visibility_against(Some(&cache), &param).unwrap_err();
         assert!(matches!(err, ModbusError::InvalidVisibilityRegister(_)));
+    }
+
+    // ===== Telemetry primitive tests =====
+
+    /// HDR histogram sanity: known input distribution produces percentiles
+    /// within the documented ±tolerance at 3 sig figs.
+    #[test]
+    fn hdr_histogram_percentile_sanity() {
+        let mut h = Histogram::<u64>::new_with_bounds(1, 60_000, 3).unwrap();
+        for _ in 0..1000 {
+            h.record(100).unwrap();
+        }
+        for _ in 0..10 {
+            h.record(500).unwrap();
+        }
+        // p50 ≈ 100, p99 within the long-tail bucket, max == 500 exactly.
+        assert!(
+            h.value_at_percentile(50.0).abs_diff(100) <= 2,
+            "p50 expected ~100, got {}",
+            h.value_at_percentile(50.0)
+        );
+        // 1000 samples at 100 + 10 samples at 500 = 1010 total. p99 is the
+        // 1000th sample, still in the 100 group; p99.9 (the ~1009th sample)
+        // lands in the tail. Assert p99.9 sits in the tail bucket — this
+        // verifies HDR is actually tracking outliers rather than collapsing
+        // them into p50. At 3 sig figs over 1..60_000 the 500-bucket
+        // resolves nearly exactly.
+        let p99 = h.value_at_percentile(99.0);
+        let p99_9 = h.value_at_percentile(99.9);
+        assert_eq!(p99, 100, "p99 of 1000@100+10@500 is still at 100");
+        assert!(
+            (400..=600).contains(&p99_9),
+            "p99.9 should land in the tail bucket near 500, got {p99_9}"
+        );
+        assert_eq!(h.max(), 500, "max should be the largest recorded sample");
+        assert_eq!(h.len(), 1010, "count should match total records");
+    }
+
+    type OpCountGetter = fn(&OpCounts) -> u64;
+
+    /// `OpCounts::bump` exhaustively touches the right field for every
+    /// `ParameterOperation` variant, and only that field.
+    #[test]
+    fn op_counts_bump_per_variant() {
+        let dummy = CTCModbusParameter {
+            id: 1,
+            signed: false,
+            access: Access::R,
+            reg_max: None,
+            reg_min: None,
+            reg_step: None,
+            visible: 0,
+            bit: 0,
+            factor: 1.0,
+            description: "",
+        };
+
+        let cases: Vec<(ParameterOperation, OpCountGetter)> = vec![
+            (ParameterOperation::Read(dummy), |c| c.read),
+            (ParameterOperation::Write(dummy, 1.0), |c| c.write),
+            (
+                ParameterOperation::ReadVisibility(VISIBILITY_REG_START),
+                |c| c.read_visibility,
+            ),
+            (ParameterOperation::ReadAllVisibility, |c| {
+                c.read_all_visibility
+            }),
+            (
+                ParameterOperation::ReadRawRegisters { start: 0, count: 1 },
+                |c| c.read_raw_registers,
+            ),
+            (
+                ParameterOperation::WriteRawRegister {
+                    register: 0,
+                    value: 0,
+                },
+                |c| c.write_raw_register,
+            ),
+            (ParameterOperation::GetStats, |c| c.get_stats),
+        ];
+
+        for (op, getter) in cases {
+            let mut counts = OpCounts::default();
+            counts.bump(&op);
+            assert_eq!(getter(&counts), 1, "wrong field bumped for {op:?}");
+            // Every other field stays 0.
+            let total = counts.read
+                + counts.write
+                + counts.read_visibility
+                + counts.read_all_visibility
+                + counts.read_raw_registers
+                + counts.write_raw_register
+                + counts.get_stats;
+            assert_eq!(total, 1, "bumped more than one field for {op:?}");
+        }
+    }
+
+    /// `RetryRing::push` is FIFO and caps at 100.
+    #[test]
+    fn retry_ring_fifo_and_caps_at_100() {
+        let mut ring = RetryRing::default();
+        for i in 0..100u16 {
+            ring.push(make_retry_event(i));
+        }
+        assert_eq!(ring.len(), 100);
+        // Push one more; oldest should drop and newest appear at the back.
+        ring.push(make_retry_event(100));
+        assert_eq!(ring.len(), 100);
+        let registers: Vec<u16> = ring.iter().map(|e| e.register).collect();
+        assert_eq!(
+            *registers.first().unwrap(),
+            1,
+            "oldest entry should be evicted"
+        );
+        assert_eq!(
+            *registers.last().unwrap(),
+            100,
+            "newest entry should be at back"
+        );
+    }
+
+    fn make_retry_event(register: u16) -> RetryEvent {
+        RetryEvent {
+            when_epoch_secs: 0,
+            register,
+            op_name: "test",
+            attempts: Vec::new(),
+            final_outcome: FinalOutcome::Succeeded { attempts_used: 1 },
+            total_struggle_ms: 0,
+        }
+    }
+
+    /// `per_register` cap-256 guard: 256 distinct keys fit, the 257th is
+    /// dropped (with a warn), but bumps to an already-present key still
+    /// work past the cap.
+    #[test]
+    fn per_register_cap_at_256() {
+        let mut map: HashMap<u16, RegisterCounters> = HashMap::new();
+        // Use the same insert-or-bump path the macro uses.
+        for i in 0..256u16 {
+            let len_before = map.len();
+            let already = map.contains_key(&i);
+            if already || len_before < PER_REGISTER_CAP {
+                map.entry(i).or_default().reads += 1;
+            }
+        }
+        assert_eq!(map.len(), 256);
+
+        // 257th distinct address — dropped.
+        let i = 256u16;
+        let len_before = map.len();
+        let already = map.contains_key(&i);
+        if already || len_before < PER_REGISTER_CAP {
+            map.entry(i).or_default().reads += 1;
+        }
+        assert_eq!(map.len(), 256, "new address must be dropped at cap");
+        assert!(!map.contains_key(&i));
+
+        // Bumping an already-present key still works.
+        let already = map.contains_key(&0);
+        let len_before = map.len();
+        if already || len_before < PER_REGISTER_CAP {
+            map.entry(0u16).or_default().reads += 1;
+        }
+        assert_eq!(map.get(&0).unwrap().reads, 2);
+    }
+
+    /// `RateWindow` counts entries within the requested window and evicts
+    /// entries older than the 5-min ceiling on push.
+    #[test]
+    fn rate_window_count_and_eviction() {
+        let mut win = RateWindow::default();
+        let now = Instant::now();
+        // Manually inject timestamps spread across the recent past.
+        // 10 entries within the last 5 s, 30 entries within the last 60 s
+        // (cumulative), 100 entries within the last 5 min (cumulative).
+        for i in 0_u64..10 {
+            win.inner.push_back(now - Duration::from_millis(500 * i));
+        }
+        for i in 0_u64..20 {
+            win.inner.push_back(now - Duration::from_secs(10 + i));
+        }
+        for i in 0_u64..70 {
+            win.inner.push_back(now - Duration::from_secs(60 + 3 * i));
+        }
+
+        // Counts grow with window size, monotone.
+        let c10 = win.count_within(Duration::from_secs(10));
+        let c60 = win.count_within(Duration::from_secs(60));
+        let c300 = win.count_within(Duration::from_secs(300));
+        assert!(c10 <= c60, "count_within must be monotone (10s <= 60s)");
+        assert!(c60 <= c300, "count_within must be monotone (60s <= 300s)");
+        assert!(c10 >= 10, "10s window should see the ten ≤5s entries");
+        // 100 entries injected, all within the past 300 s — the full window
+        // should see all of them.
+        assert_eq!(c300, 100, "5min window should see every injected entry");
+
+        // Eviction: push a timestamp 6 min ahead and confirm all old
+        // entries fall off. (Using "now + 6min" via push to drive eviction
+        // against the ceiling.)
+        let future = now + Duration::from_secs(360);
+        win.push(future);
+        // After eviction, only entries from `future` minus 5 min onward
+        // remain. The injected entries (clustered around `now`) are all
+        // older than 5 min relative to `future`.
+        assert_eq!(
+            win.len(),
+            1,
+            "all stale entries should have been evicted by push"
+        );
+    }
+
+    /// Sanity: when nothing fails, the macro emits no retry event. We test
+    /// this by exercising the macro against a stub actor whose op always
+    /// returns Ok on the first attempt.
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_retry_no_event_on_first_shot_success() {
+        let mut a = StubActor::new(2);
+        // `$operation` evaluates to a future yielding Result<T, ModbusError>.
+        let r: Result<u16, ModbusError> =
+            with_retry!(a, "stub_read", 42u16, WireOpKind::Read, async {
+                Ok::<u16, ModbusError>(7)
+            });
+        assert!(matches!(r, Ok(7)));
+        assert!(
+            a.retry_ring.is_empty(),
+            "no retry event on first-shot success"
+        );
+        assert_eq!(a.total_wire_ops, 1);
+        assert_eq!(a.total_wire_timeouts, 0);
+        assert_eq!(a.total_wire_retry_attempts, 0);
+        assert_eq!(a.read_histo.len(), 1);
+    }
+
+    /// Retry-then-success emits exactly one event with `attempts_used=2`
+    /// and outcomes Exception-then-Success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_retry_event_succeeded_after_one_retry() {
+        let mut a = StubActor::new(2);
+        // Cell so the closure can mutate per-attempt state.
+        let call = std::cell::Cell::new(0u32);
+        let r: Result<u16, ModbusError> =
+            with_retry!(a, "stub_read", 42u16, WireOpKind::Read, async {
+                call.set(call.get() + 1);
+                if call.get() == 1 {
+                    Err::<u16, ModbusError>(ModbusError::ReadError {
+                        register: 42,
+                        reason: "first attempt boom".to_string(),
+                    })
+                } else {
+                    Ok::<u16, ModbusError>(7)
+                }
+            });
+        assert!(matches!(r, Ok(7)));
+        assert_eq!(a.retry_ring.len(), 1, "exactly one retry event expected");
+        let evt = a.retry_ring.iter().next().unwrap();
+        assert_eq!(evt.attempts.len(), 2, "two attempts captured");
+        match &evt.final_outcome {
+            FinalOutcome::Succeeded { attempts_used } => assert_eq!(*attempts_used, 2),
+            FinalOutcome::FinalFailure { reason } => {
+                panic!("expected Succeeded, got FinalFailure({reason})")
+            }
+        }
+        // First attempt's outcome is Exception (a transient ReadError); the
+        // second is Success.
+        assert!(matches!(
+            evt.attempts[0].outcome,
+            AttemptOutcome::Exception(_)
+        ));
+        assert!(matches!(evt.attempts[1].outcome, AttemptOutcome::Success));
+        assert_eq!(a.total_wire_ops, 2);
+        assert_eq!(a.total_wire_retry_attempts, 1);
+    }
+
+    /// Retry exhaustion emits exactly one event with `FinalFailure` and
+    /// `attempts.len() == max_retries + 1`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_retry_event_final_failure_after_exhaustion() {
+        let mut a = StubActor::new(2); // max_retries=2 → up to 3 attempts
+        let r: Result<u16, ModbusError> =
+            with_retry!(a, "stub_read", 42u16, WireOpKind::Read, async {
+                Err::<u16, ModbusError>(ModbusError::ReadError {
+                    register: 42,
+                    reason: "persistent".to_string(),
+                })
+            });
+        assert!(r.is_err());
+        assert_eq!(a.retry_ring.len(), 1);
+        let evt = a.retry_ring.iter().next().unwrap();
+        assert_eq!(evt.attempts.len(), 3, "max_retries=2 means 3 attempts");
+        assert!(matches!(
+            evt.final_outcome,
+            FinalOutcome::FinalFailure { .. }
+        ));
+        let counts = a.per_register.get(&42u16).copied().unwrap_or_default();
+        assert_eq!(counts.final_failures, 1);
+        assert_eq!(
+            counts.retry_attempts, 3,
+            "every failed attempt bumps retry_attempts"
+        );
+    }
+
+    /// Exercises `SupervisorStats::record_build_failure` and
+    /// `record_respawn` — the same helpers `spawn_supervised` calls in
+    /// production. `spawn_supervised` itself can't run in unit tests
+    /// (its `build()` opens a real serial port), but as long as
+    /// production funnels through these named helpers, the helpers'
+    /// contract is the contract.
+    #[test]
+    fn supervisor_stats_helpers_record_build_failures_and_respawns() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = SupervisorStats::default();
+
+        stats.record_build_failure();
+        stats.record_build_failure();
+        stats.record_respawn();
+
+        assert_eq!(
+            stats.port_open_failures.load(Relaxed),
+            2,
+            "record_build_failure must bump port_open_failures by 1 per call"
+        );
+        assert_eq!(
+            stats.respawns.load(Relaxed),
+            1,
+            "record_respawn must bump respawns by 1"
+        );
+        assert!(
+            stats.last_respawn_epoch_secs.load(Relaxed) > 0,
+            "record_respawn must stamp last_respawn_epoch_secs"
+        );
+        // Build failures alone must not move respawn fields.
+        let only_failures = SupervisorStats::default();
+        only_failures.record_build_failure();
+        assert_eq!(only_failures.respawns.load(Relaxed), 0);
+        assert_eq!(only_failures.last_respawn_epoch_secs.load(Relaxed), 0);
+    }
+
+    // ----- StubActor: duck-types the fields/methods `with_retry!` touches -----
+
+    /// Test-only stand-in for `CtcActor`. Carries every field the macro
+    /// reads, plus `record_success` / `record_failure` / `calculate_retry_delay`
+    /// with the same signatures. The macro is generic over `$self` so it
+    /// will happily expand against this type.
+    struct StubActor {
+        operation_timeout: Duration,
+        max_retries: u32,
+        initial_retry_delay: Duration,
+        backoff_multiplier: f64,
+        inter_request_gap: Duration,
+        last_wire_op: Option<Instant>,
+        consecutive_failures: u32,
+        max_consecutive_failures_seen: u32,
+        max_consecutive_failures: u32,
+        last_success: Option<Instant>,
+        total_operations: u64,
+        total_failures: u64,
+        read_histo: Histogram<u64>,
+        write_histo: Histogram<u64>,
+        per_register: HashMap<u16, RegisterCounters>,
+        retry_ring: RetryRing,
+        rate_window: RateWindow,
+        total_wire_ops: u64,
+        total_wire_timeouts: u64,
+        total_wire_retry_attempts: u64,
+    }
+
+    impl StubActor {
+        fn new(max_retries: u32) -> Self {
+            Self {
+                operation_timeout: Duration::from_secs(5),
+                max_retries,
+                initial_retry_delay: Duration::from_millis(1),
+                backoff_multiplier: 1.0,
+                inter_request_gap: Duration::ZERO,
+                last_wire_op: None,
+                consecutive_failures: 0,
+                max_consecutive_failures_seen: 0,
+                max_consecutive_failures: u32::MAX,
+                last_success: None,
+                total_operations: 0,
+                total_failures: 0,
+                read_histo: Histogram::<u64>::new_with_bounds(1, 60_000, 3).unwrap(),
+                write_histo: Histogram::<u64>::new_with_bounds(1, 60_000, 3).unwrap(),
+                per_register: HashMap::new(),
+                retry_ring: RetryRing::default(),
+                rate_window: RateWindow::default(),
+                total_wire_ops: 0,
+                total_wire_timeouts: 0,
+                total_wire_retry_attempts: 0,
+            }
+        }
+
+        fn calculate_retry_delay(&self, attempt: u32) -> Duration {
+            if attempt == 0 {
+                Duration::ZERO
+            } else {
+                self.initial_retry_delay
+            }
+        }
+
+        fn record_success(&mut self) {
+            self.consecutive_failures = 0;
+            self.last_success = Some(Instant::now());
+            self.total_operations += 1;
+        }
+
+        fn record_failure(&mut self) {
+            self.consecutive_failures += 1;
+            self.total_failures += 1;
+            if self.consecutive_failures > self.max_consecutive_failures_seen {
+                self.max_consecutive_failures_seen = self.consecutive_failures;
+            }
+        }
     }
 }

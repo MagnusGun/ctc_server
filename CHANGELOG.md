@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — feature/modbus_telemetry
+
+### Added
+- **Modbus telemetry endpoint** (`GET /api/v1/modbus/stats`): single JSON document exposing HDR-histogram percentiles (p50 / p90 / p99 / p99.9 / max / mean / count) for read and write durations, wire-op rates over rolling 10 s / 60 s / 5 min windows, per-register counters (reads / writes / retry_attempts / final_failures) sorted with trouble registers on top, and a cap-100 FIFO ring of recent retry-emitting requests with per-attempt `ms_since_prev_wire_op` and `ms_since_request_first_attempt` fields. Goal is bus tuning (`operation_timeout_secs`, `inter_request_gap_ms`), not monitoring.
+- **`SupervisorStats`** (`modbus/mod.rs`): atomic counters shared between the supervisor task and the actor, surviving every actor respawn. Surfaces `respawns`, `port_open_failures`, `last_respawn_epoch_secs`, and `actor_uptime_secs`. Producer-side calls funnel through named helpers (`record_build_failure`, `record_respawn`).
+- **`hdrhistogram` crate** added to `server/Cargo.toml` for the duration histograms.
+- Tests: HDR percentile sanity (asserts p99.9 lands in the tail), `OpCounts::bump` per-variant exhaustive coverage, `RetryRing` FIFO + cap-100, `per_register` cap-256 with in-place bump past cap, `RateWindow` count + eviction with full-window equality, supervisor-stats helpers, and three retry-event grain tests covering first-shot success / success-after-retry / final-failure-after-exhaustion. Pure first-shot successes intentionally emit no event; failing requests emit exactly one event with the full attempt-by-attempt detail.
+
+### Changed
+- **`with_retry!` macro** (`modbus/actor.rs`): grew a `$kind: WireOpKind` argument so per-register reads/writes and the right histogram are routed without per-call-site duplication. Six call sites updated. Macro body samples `Instant::now()` once post-wire and reuses the value for `last_wire_op`, `rate_window.push`, and `wire_elapsed`. Per-attempt detail collected via `make_attempt` / `make_event` closures (Copy-only captures) so the three failure arms don't duplicate struct literals.
+- **`ModbusResponse`** gained a `Stats(Box<ModbusStats>)` variant. The box keeps the enum's max variant size unchanged (~32 B); inline `ModbusStats` would balloon it ~6×. Every existing exhaustive match on `ModbusResponse` (alarms, visibility, operations helpers) grew a `Stats(_)` arm that logs and returns `InternalError` — unreachable in practice for those routes since they never send `GetStats`.
+
 ## [Unreleased] — feature/cozy_robin
 
 ### Added

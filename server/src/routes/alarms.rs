@@ -171,6 +171,10 @@ async fn get_alarm_status(State(state): State<AlarmState>) -> Result<String, Api
             error!("get_alarm_status: Unexpected RawRegisters response");
             Err(ApiError::InternalError)
         }
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("get_alarm_status: Unexpected Stats response");
+            Err(ApiError::InternalError)
+        }
         Ok(Ok(Err(e))) => {
             error!("get_alarm_status: Modbus error - {}", e);
             Err(ApiError::from(e))
@@ -254,6 +258,10 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
             }
             Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
                 error!("get_alarms: Unexpected RawRegisters response for count");
+                return Err(ApiError::InternalError);
+            }
+            Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+                error!("get_alarms: Unexpected Stats response for count");
                 return Err(ApiError::InternalError);
             }
             Ok(Ok(Err(e))) => {
@@ -582,6 +590,10 @@ async fn get_or_fetch_alarm_text(
             error!("get_or_fetch_alarm_text: Unexpected Value response for text buffer");
             Err(ApiError::InternalError)
         }
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("get_or_fetch_alarm_text: Unexpected Stats response for text buffer");
+            Err(ApiError::InternalError)
+        }
         Ok(Ok(Err(e))) => {
             error!(
                 "get_or_fetch_alarm_text: Failed to read text buffer - {}",
@@ -624,6 +636,10 @@ async fn read_raw_registers(
         Ok(Ok(Ok(ModbusResponse::RawRegisters { values, .. }))) => Ok(values),
         Ok(Ok(Ok(ModbusResponse::Value(_)))) => {
             error!("read_raw_registers: Unexpected Value response");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("read_raw_registers: Unexpected Stats response");
             Err(ApiError::InternalError)
         }
         Ok(Ok(Err(e))) => {

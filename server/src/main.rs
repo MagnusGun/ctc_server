@@ -11,14 +11,15 @@ mod supervisor;
 
 use crate::config::Config;
 use crate::energy::{GridState, PriceState};
-use crate::modbus::CtcActorBuilder;
 use crate::modbus::actor::ModbusRequest;
+use crate::modbus::{CtcActorBuilder, SupervisorStats};
 use crate::smartgrid::SmartGridMode;
 use crate::smartgrid::actor as smartgrid_actor;
 use axum::{Router, response::Redirect, routing::get};
 use std::{
     env,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use tower_http::services::ServeDir;
@@ -83,6 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, rx) = tokio::sync::mpsc::channel::<ModbusRequest>(config.modbus.channel_buffer_size);
 
+    // Process-lifetime supervisor counters. The actor's in-memory stats
+    // (histograms, per-register counters, rate window) reset on every
+    // respawn; these atomics survive because they live above the actor.
+    let sup_stats = Arc::new(SupervisorStats::default());
+
     CtcActorBuilder::new(tty_path)
         .baud_rate(config.serial.baud_rate)
         .data_bits(config.serial.get_data_bits()?)
@@ -97,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .backoff_multiplier(config.modbus.backoff_multiplier)
         .max_consecutive_failures(config.modbus.max_consecutive_failures)
         .inter_request_gap(Duration::from_millis(config.modbus.inter_request_gap_ms))
+        .sup_stats(Arc::clone(&sup_stats))
         .spawn_supervised(rx);
 
     // Open the sensor cache store. Path is configurable via
@@ -391,6 +398,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.modbus.request_timeout_secs,
         ))
         .merge(routes::visibility::routes(
+            tx.clone(),
+            config.modbus.request_timeout_secs,
+        ))
+        .merge(routes::modbus::routes(
             tx.clone(),
             config.modbus.request_timeout_secs,
         ))

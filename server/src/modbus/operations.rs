@@ -8,6 +8,7 @@ use tokio::time::timeout;
 use tracing::{error, trace};
 
 use crate::error::ApiError;
+use crate::modbus::actor::ModbusStats;
 use crate::modbus::{CTCModbusParameter, ModbusResponse, ModbusSender, ParameterOperation};
 
 /// Helper function to read a parameter and return just the value (not JSON)
@@ -35,6 +36,10 @@ pub async fn read_parameter_value(
         }
         Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
             error!("Unexpected RawRegisters response in {log_context}");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("Unexpected Stats response in {log_context}");
             Err(ApiError::InternalError)
         }
         Ok(Ok(Err(e))) => {
@@ -91,6 +96,10 @@ pub async fn read_parameter(
         }
         Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
             error!("Unexpected RawRegisters response in {log_context}");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("Unexpected Stats response in {log_context}");
             Err(ApiError::InternalError)
         }
         Ok(Ok(Err(e))) => {
@@ -165,6 +174,10 @@ pub async fn write_parameter(
 
     // Wait for response on this request's channel with timeout
     match timeout(request_timeout, response_rx).await {
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("{log_context}: write_parameter - Unexpected Stats response from actor");
+            Err(ApiError::InternalError)
+        }
         Ok(Ok(Ok(_))) => {
             trace!("{log_context}: write_parameter - Response received: SUCCESS");
             format_value_json(json_key, value)
@@ -184,6 +197,47 @@ pub async fn write_parameter(
                 "Request timeout in {log_context} after {:?}",
                 request_timeout
             );
+            Err(ApiError::Timeout)
+        }
+    }
+}
+
+/// Request a fresh stats snapshot from the actor.
+///
+/// Synchronous from the actor's perspective (no bus I/O) but routed
+/// through the same mpsc/oneshot channel as every other operation so it
+/// serializes with in-flight work. The boxed `ModbusStats` keeps the
+/// `ModbusResponse` variants from ballooning in size.
+pub async fn request_stats(
+    tx: &ModbusSender,
+    request_timeout: Duration,
+) -> Result<Box<ModbusStats>, ApiError> {
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    tx.send((ParameterOperation::GetStats, response_tx))
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable)?;
+
+    match timeout(request_timeout, response_rx).await {
+        Ok(Ok(Ok(ModbusResponse::Stats(stats)))) => Ok(stats),
+        Ok(Ok(Ok(ModbusResponse::Value(_)))) => {
+            error!("request_stats: Unexpected Value response from actor");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
+            error!("request_stats: Unexpected RawRegisters response from actor");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Err(e))) => {
+            error!("request_stats: Modbus error - {e}");
+            Err(ApiError::from(e))
+        }
+        Ok(Err(e)) => {
+            error!("request_stats: Failed to receive response - {e}");
+            Err(ApiError::ServiceUnavailable)
+        }
+        Err(_) => {
+            error!("request_stats: Timeout after {request_timeout:?}");
             Err(ApiError::Timeout)
         }
     }
