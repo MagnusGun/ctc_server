@@ -1,4 +1,13 @@
-/* Energy spot price chart — today's curve, now-line, current bar highlight */
+/* Energy spot price chart — today's curve, now-line, current bar highlight. */
+
+const LEVEL_VAR = {
+  very_cheap:     "var(--price-very-cheap)",
+  cheap:          "var(--price-cheap)",
+  normal:         "var(--price-normal)",
+  expensive:      "var(--price-expensive)",
+  very_expensive: "var(--price-very-expensive)",
+};
+const levelColor = lvl => LEVEL_VAR[lvl] ?? "var(--text-3)";
 
 const EnergyChart = ({ today, nowIndex, height = 200 }) => {
   const [hover, setHover] = React.useState(null);
@@ -8,41 +17,34 @@ const EnergyChart = ({ today, nowIndex, height = 200 }) => {
   const innerW = w - padL - padR;
   const innerH = h - padT - padB;
 
-  // Render an empty-state placeholder when the price feed hasn't filled in.
-  const hasData = Array.isArray(today) && today.some(v => v != null && v > 0);
+  const slots = Array.isArray(today) ? today : [];
+  const N = slots.length;
+  const hasData = slots.some(p => p?.spot_sek != null && p.spot_sek > 0);
 
   const yMin = 0;
   const yMax = hasData
-    ? Math.ceil(Math.max(...today.filter(v => v != null)) * 10) / 10 + 0.1
+    ? Math.ceil(Math.max(...slots.map(p => p?.spot_sek).filter(v => v != null)) * 10) / 10 + 0.1
     : 1;
 
-  const xFor = i => padL + (i / 24) * innerW;
+  const xFor = i => padL + (N > 0 ? (i / N) * innerW : 0);
   const yFor = v => padT + innerH - ((v - yMin) / (yMax - yMin)) * innerH;
 
-  const buildPath = (arr) => {
+  const buildArea = () => {
     let d = "";
-    arr.forEach((v, i) => {
+    let firstIdx = -1, lastIdx = -1;
+    slots.forEach((p, i) => {
+      const v = p?.spot_sek;
       if (v == null) return;
+      if (firstIdx < 0) firstIdx = i;
+      lastIdx = i;
       d += (d ? "L" : "M") + xFor(i) + "," + yFor(v) + " ";
     });
-    return d;
-  };
-
-  const buildArea = (arr) => {
-    const top = buildPath(arr);
-    if (!top) return "";
-    // Find first/last non-null index for the area baseline.
-    const firstIdx = arr.findIndex(v => v != null);
-    let lastIdx = -1;
-    for (let i = arr.length - 1; i >= 0; i--) {
-      if (arr[i] != null) { lastIdx = i; break; }
-    }
-    return top
+    if (!d) return "";
+    return d
       + ` L ${xFor(lastIdx)},${yFor(yMin)}`
       + ` L ${xFor(firstIdx)},${yFor(yMin)} Z`;
   };
 
-  // Y axis ticks
   const ticks = [];
   const tickCount = 4;
   for (let i = 0; i <= tickCount; i++) {
@@ -59,20 +61,20 @@ const EnergyChart = ({ today, nowIndex, height = 200 }) => {
     });
   }
 
-  const nowX = xFor(nowIndex);
   const nowIdxFloor = Math.floor(nowIndex);
-  const nowVal = hasData ? today[nowIdxFloor] : null;
+  const nowSlot = hasData && nowIdxFloor < N ? slots[nowIdxFloor] : null;
+  const nowVal = nowSlot?.spot_sek ?? null;
+  const nowX = xFor(nowIndex);
 
   return (
     <svg className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
       <defs>
         <linearGradient id="todayFill" x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%"   stopColor="var(--accent)" stopOpacity="0.28"/>
-          <stop offset="100%" stopColor="var(--accent)" stopOpacity="0"/>
+          <stop offset="0%"   stopColor="var(--text-3)" stopOpacity="0.18"/>
+          <stop offset="100%" stopColor="var(--text-3)" stopOpacity="0"/>
         </linearGradient>
       </defs>
 
-      {/* gridlines */}
       {ticks.map((t, i) => (
         <g key={`gy${i}`}>
           <line className="grid-line" x1={padL} x2={w - padR} y1={t.y} y2={t.y} />
@@ -82,25 +84,28 @@ const EnergyChart = ({ today, nowIndex, height = 200 }) => {
         </g>
       ))}
 
-      {/* x labels */}
       {xTicks.map((t, i) => (
         <text key={`xt${i}`} className="axis-label" x={t.x} y={h - 8} textAnchor="middle">
           {t.label}
         </text>
       ))}
 
-      {/* today */}
       {hasData && (
         <>
-          <path d={buildArea(today)} fill="url(#todayFill)" />
-          <path d={buildPath(today)} fill="none" stroke="var(--accent)" strokeWidth="1.8" />
-          {today.map((v, i) => (
-            v != null && (
-              <circle key={`d${i}`} cx={xFor(i)} cy={yFor(v)} r={i === nowIdxFloor ? 4 : 2}
-                      fill={i === nowIdxFloor ? "var(--accent)" : "var(--bg)"}
-                      stroke="var(--accent)" strokeWidth="1.4"/>
-            )
-          ))}
+          <path d={buildArea()} fill="url(#todayFill)" />
+          {slots.slice(0, -1).map((p, i) => {
+            const a = p?.spot_sek;
+            const b = slots[i + 1]?.spot_sek;
+            if (a == null || b == null) return null;
+            return (
+              <line key={`s${i}`}
+                    x1={xFor(i)}     y1={yFor(a)}
+                    x2={xFor(i + 1)} y2={yFor(b)}
+                    stroke={levelColor(p.level)}
+                    strokeWidth="2"
+                    strokeLinecap="round"/>
+            );
+          })}
         </>
       )}
 
@@ -109,6 +114,9 @@ const EnergyChart = ({ today, nowIndex, height = 200 }) => {
         <>
           <line className="now-line" x1={nowX} x2={nowX} y1={padT} y2={h - padB} />
           <text className="now-label" x={nowX} y={padT - 4} textAnchor="middle">NOW</text>
+          <circle cx={xFor(nowIdxFloor)} cy={yFor(nowVal)} r="4"
+                  fill={levelColor(nowSlot.level)}
+                  stroke="var(--bg)" strokeWidth="1.5"/>
         </>
       )}
 
@@ -119,27 +127,31 @@ const EnergyChart = ({ today, nowIndex, height = 200 }) => {
         </text>
       )}
 
-      {/* hover capture */}
       <rect x={padL} y={padT} width={innerW} height={innerH}
         fill="transparent"
         onMouseLeave={() => setHover(null)}
         onMouseMove={(e) => {
+          if (N === 0) return;
           const rect = e.currentTarget.getBoundingClientRect();
           const ratio = (e.clientX - rect.left) / rect.width;
-          const i = Math.max(0, Math.min(23, Math.round(ratio * 23)));
-          setHover(i);
+          const i = Math.max(0, Math.min(N - 1, Math.round(ratio * (N - 1))));
+          if (i !== hover) setHover(i);
         }}/>
 
-      {hasData && hover != null && today[hover] != null && (
+      {hasData && hover != null && slots[hover]?.spot_sek != null && (
         <g pointerEvents="none">
           <line x1={xFor(hover)} x2={xFor(hover)} y1={padT} y2={h-padB}
                 stroke="var(--text-3)" strokeDasharray="2 3" strokeWidth="1"/>
-          <circle cx={xFor(hover)} cy={yFor(today[hover])} r="5"
-                  fill="var(--accent)" stroke="var(--bg)" strokeWidth="2"/>
+          <circle cx={xFor(hover)} cy={yFor(slots[hover].spot_sek)} r="5"
+                  fill={levelColor(slots[hover].level)}
+                  stroke="var(--bg)" strokeWidth="2"/>
           {(() => {
+            const p = slots[hover];
             const tx = xFor(hover);
-            const ty = yFor(today[hover]) - 14;
-            const lbl = `${String(hover).padStart(2,"0")}:00 — ${today[hover].toFixed(2)} kr/kWh`;
+            const ty = yFor(p.spot_sek) - 14;
+            const timeRange = `${window.formatHM(p.starts_at)}–${window.formatHM(p.ends_at)}`;
+            const levelTxt = window.PRICE_LEVEL_LABELS?.[p.level] ?? "";
+            const lbl = `${timeRange} · ${p.spot_sek.toFixed(2)} kr/kWh${levelTxt ? " · " + levelTxt : ""}`;
             const tw = lbl.length * 6.2 + 16;
             const left = tx - tw/2 < padL ? padL : (tx + tw/2 > w - padR ? w - padR - tw : tx - tw/2);
             return (

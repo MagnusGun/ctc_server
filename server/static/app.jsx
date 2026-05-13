@@ -74,6 +74,7 @@ const PRICE_LEVEL_LABELS = {
   expensive:      "Expensive",
   very_expensive: "Very Expensive",
 };
+window.PRICE_LEVEL_LABELS = PRICE_LEVEL_LABELS;
 
 // Backend SmartGrid mode strings ↔ UI keys. The UI uses "powersave" where the
 // backend says "blocking"; the other three names match.
@@ -89,8 +90,7 @@ const UI_TO_BACKEND_MODE = Object.fromEntries(
 
 /* ---------- Spot-price helpers ----------
  * The backend serves PricePoint[] at 15-minute resolution (96 slots/day since
- * elprisetjustnu.se switched to quarter-hourly data in Oct 2025). Helpers below
- * let us look up the slot covering "now" and aggregate to hourly for the chart.
+ * elprisetjustnu.se switched to quarter-hourly data in Oct 2025).
  */
 const findPriceSlotAt = (prices, when) => {
   if (!Array.isArray(prices) || prices.length === 0) return -1;
@@ -103,25 +103,13 @@ const findPriceSlotAt = (prices, when) => {
   return -1;
 };
 
-const hourlyMeanPrices = (prices) => {
-  const buckets = Array.from({ length: 24 }, () => ({ sum: 0, n: 0 }));
-  for (const p of prices || []) {
-    const ms = Date.parse(p?.starts_at);
-    if (Number.isNaN(ms) || p?.spot_sek == null) continue;
-    const h = new Date(ms).getHours();
-    if (h < 0 || h > 23) continue;
-    buckets[h].sum += p.spot_sek;
-    buckets[h].n += 1;
-  }
-  return buckets.map(b => (b.n > 0 ? b.sum / b.n : null));
-};
-
 const formatHM = (iso) => {
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) return "—";
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
+window.formatHM = formatHM;
 
 /* ---------- App ---------- */
 
@@ -241,8 +229,8 @@ function App() {
   const clockStr = now.toLocaleTimeString("sv-SE", { hour12: false });
   const dateStr = now.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
 
-  // Now index for chart — interpolated from real time
-  const nowIdx = now.getHours() + now.getMinutes() / 60;
+  // Now index for chart — fractional 0..96 (one unit = 15 min).
+  const nowIdx = (now.getHours() * 60 + now.getMinutes()) / 15;
 
   // System messages — fed by /api/v1/alarms.
   // Backend shape: { alarms: AlarmMessage[], infos: AlarmMessage[] }.
@@ -681,11 +669,7 @@ function App() {
             const currentQuarterKwh = gridResp?.current_quarter_kwh;
             const peakAvg = gridResp?.monthly_peak_avg_kwh;
 
-            // Map backend today.prices (PricePoint[], 15-min resolution / 96
-            // slots) to a 24-element hourly-mean array for the chart, and find
-            // the slot covering "now" for the price-now display.
             const todayPrices = pricesResp?.today?.prices || [];
-            const todayArr = hourlyMeanPrices(todayPrices);
 
             const stats = pricesResp?.today?.spot_statistics;
             const cur   = pricesResp?.current;
@@ -740,7 +724,7 @@ function App() {
                   <span className="nowprice">{`${clockStr.slice(0,5)} · ${nowPrice != null ? nowPrice.toFixed(2) : "—"} kr/kWh`}</span>
                 </div>
                 <EnergyChart
-                  today={todayArr}
+                  today={todayPrices}
                   nowIndex={nowIdx}
                 />
               </>

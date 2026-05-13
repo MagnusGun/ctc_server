@@ -31,6 +31,13 @@
   --cold:    oklch(0.78 0.12 230);
   --info:    oklch(0.78 0.10 250);
 
+  /* Spot-price level palette (very_cheap → very_expensive) */
+  --price-very-cheap:     oklch(0.65 0.16 240);
+  --price-cheap:          oklch(0.80 0.12 220);
+  --price-normal:         oklch(0.78 0.14 165);
+  --price-expensive:      oklch(0.82 0.14 75);
+  --price-very-expensive: oklch(0.72 0.18 35);
+
   /* Density */
   --gap:    16px;
   --pad:    20px;
