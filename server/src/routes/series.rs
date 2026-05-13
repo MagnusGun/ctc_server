@@ -1,8 +1,10 @@
 //! Trend series endpoint.
 //!
 //! `GET /api/v1/heatpump/series?sensor=<slug>&hours=<N>` returns an array of
-//! `{t, v}` pairs from the in-memory ring inside [`Store`]. Used by the
-//! dashboard's trend modal (Step 8) and the stats-modal charts (Step 10).
+//! `{t, v}` pairs from the in-memory ring inside [`Store`], bucketed into
+//! per-minute means. Used by the dashboard's trend modal (Step 8) and the
+//! stats-modal charts (Step 10). The minute granularity matches the on-disk
+//! persistence resolution, so the series is uniform across a server restart.
 
 use crate::error::ApiError;
 use crate::routes::series_window;
@@ -50,7 +52,7 @@ async fn get_series(
     let (from, _, to) = series_window(hours)?;
 
     let points = store
-        .series_range(sensor, from, to)
+        .bucket_minutes(sensor, from, to)
         .into_iter()
         .map(|(t, v)| SeriesPoint { t, v })
         .collect();
@@ -91,10 +93,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_recorded_samples() {
+    async fn returns_recorded_samples_as_minute_mean() {
         let (_dir, store) = tmp_store();
+        // Two samples in the same minute should collapse to a single
+        // point whose value is the mean.
         let now = SystemTime::now();
-        store.record_sample(Sensor::Room, now, 21.5).unwrap();
+        store.record_sample(Sensor::Room, now, 21.0).unwrap();
+        store.record_sample(Sensor::Room, now, 22.0).unwrap();
         let q = Query(SeriesQuery {
             sensor: "room".into(),
             hours: Some(1),

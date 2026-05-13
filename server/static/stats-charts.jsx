@@ -278,18 +278,25 @@ const HeatingTrend = ({ data, height = 220 }) => {
     return <EmptyChart/>;
   }
   const w = 1200, h = height, pad = 36;
-  // Label each bucket with the wall-clock hour at its end so the rightmost
-  // tick reads the current local hour.
-  const nowHour = new Date().getHours();
-  const labels = Array.from({ length: 24 }, (_, i) =>
-    `${((nowHour + 1 + i) % 24).toString().padStart(2,"0")}:00`);
-  // Filter nulls (gap hours where the sensor was offline or cache missed)
-  // out of axis computation; the chart paths render those buckets as gaps.
+  // Slots are minute-resolution (length 1440 for 24h). X-axis tick labels
+  // are wall-clock hours derived from each slot's actual end-of-slot time;
+  // the hover label uses minute resolution since the data is dense enough
+  // to show it meaningfully.
+  const slotsTotal = data.flow.length;
+  const lastIdx = slotsTotal - 1;
+  // One tick every 6 hours = every (6 * 60 * slotsTotal / 1440) slots.
+  // Equivalent to indices [0, slotsTotal/4, slotsTotal/2, 3*slotsTotal/4, last].
+  const tickIndices = [0, 6, 12, 18, 24].map(h6 =>
+    Math.min(lastIdx, Math.round(h6 * 60 * slotsTotal / 1440)));
+  const tickLabels = tickIndices.map(i =>
+    window.formatSlotHour(window.minuteSlotTime(i, slotsTotal)));
+  // Filter nulls (gap minutes where the sensor was offline or cache missed)
+  // out of axis computation; the chart paths render those slots as gaps.
   const finite = [...data.flow, ...data.ret].filter(v => v != null);
   const yMin = finite.length ? Math.floor(Math.min(...finite) - 1) : 0;
   const flowFinite = data.flow.filter(v => v != null);
   const yMax = flowFinite.length ? Math.ceil(Math.max(...flowFinite) + 1) : yMin + 1;
-  const x = i => pad + (i / 23) * (w - pad * 1.5);
+  const x = i => pad + (i / lastIdx) * (w - pad * 1.5);
   const y = v => h - pad - ((v - yMin) / (yMax - yMin)) * (h - pad * 1.5);
   // Path for a series that may contain nulls. Each null breaks the line
   // so gaps stay visibly empty instead of zero-diving.
@@ -343,8 +350,8 @@ const HeatingTrend = ({ data, height = 220 }) => {
            onMouseMove={e => {
              const r = e.currentTarget.getBoundingClientRect();
              const px = ((e.clientX - r.left) / r.width) * w;
-             const i = Math.round(((px - pad) / (w - pad * 1.5)) * 23);
-             setHov(Math.max(0, Math.min(23, i)));
+             const i = Math.round(((px - pad) / (w - pad * 1.5)) * lastIdx);
+             setHov(Math.max(0, Math.min(lastIdx, i)));
            }}>
         {/* gridlines */}
         {Array.from({length: 5}).map((_, j) => {
@@ -356,8 +363,8 @@ const HeatingTrend = ({ data, height = 220 }) => {
             </g>
           );
         })}
-        {[0,6,12,18,23].map(i => (
-          <text key={i} x={x(i)} y={h - pad + 14} textAnchor="middle" fontSize="10" fill="var(--text-3)" fontFamily="var(--font-mono)">{labels[i]}</text>
+        {tickIndices.map((i, k) => (
+          <text key={i} x={x(i)} y={h - pad + 14} textAnchor="middle" fontSize="10" fill="var(--text-3)" fontFamily="var(--font-mono)">{tickLabels[k]}</text>
         ))}
         {/* ΔT band */}
         <path d={bandPath} fill="var(--accent)" opacity="0.14"/>
@@ -386,7 +393,8 @@ const HeatingTrend = ({ data, height = 220 }) => {
             ? (() => {
                 const f = data.flow[hov], r = data.ret[hov];
                 const delta = (f != null && r != null) ? f - r : null;
-                return `${labels[hov]} — Flow ${formatDeg(f)} · Return ${formatDeg(r)} · ΔT ${formatDeg(delta)}`;
+                const label = window.formatSlotHourMinute(window.minuteSlotTime(hov, slotsTotal));
+                return `${label} — Flow ${formatDeg(f)} · Return ${formatDeg(r)} · ΔT ${formatDeg(delta)}`;
               })()
             : `Avg ΔT ${formatDeg(avgDelta)} over 24 h`}
         </div>

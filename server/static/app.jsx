@@ -151,13 +151,14 @@ function App() {
   const [stepEvents]   = useStepResponse(6);
   const stepData = useMemo(() => window.transformStepEvents(stepEvents), [stepEvents]);
 
-  // Build 24h sparkline arrays from the raw /heatpump/series fetches. Null
-  // until the series lands; bucketHourly leaves null gaps for empty hours.
+  // Build 24h sparkline arrays from the /heatpump/series fetches (already
+  // bucketed to 1-minute means server-side). Null until the series lands;
+  // bucketMinutely leaves null gaps for empty minutes.
   const sparks = useMemo(() => ({
-    room:   roomSeries     ? window.bucketHourly(roomSeries, 24)     : null,
-    out:    hpOutdoor      ? window.bucketHourly(hpOutdoor, 24)      : null,
-    upper:  dhwUpperSeries ? window.bucketHourly(dhwUpperSeries, 24) : null,
-    lower:  lowerSeries    ? window.bucketHourly(lowerSeries, 24)    : null,
+    room:   roomSeries     ? window.bucketMinutely(roomSeries)     : null,
+    out:    hpOutdoor      ? window.bucketMinutely(hpOutdoor)      : null,
+    upper:  dhwUpperSeries ? window.bucketMinutely(dhwUpperSeries) : null,
+    lower:  lowerSeries    ? window.bucketMinutely(lowerSeries)    : null,
   }), [roomSeries, hpOutdoor, dhwUpperSeries, lowerSeries]);
 
   // Stats data shapes derived from history + series fetches. `null` until
@@ -282,7 +283,7 @@ function App() {
           // Preserve nulls so the chart renders gaps and min/avg/max
           // calculations can filter them out instead of treating absent
           // samples as 0 °C dives.
-          data: window.bucketHourly(results[i], 24),
+          data: window.bucketMinutely(results[i]),
         })));
       })
       .catch((e) => {
@@ -474,9 +475,9 @@ function App() {
               actions={
                 <button className="sb-link" onClick={() => setStatsTab("heating")} aria-label="Open heating charts">
                   <MultiSparkline series={[
-                    { data: hpFlow    ? window.bucketHourly(hpFlow,    24) : null, color: "var(--hot)"   },
-                    { data: hpReturn  ? window.bucketHourly(hpReturn,  24) : null, color: "var(--cold)"  },
-                    { data: hpOutdoor ? window.bucketHourly(hpOutdoor, 24) : null, color: "var(--text-3)"},
+                    { data: hpFlow    ? window.bucketMinutely(hpFlow)    : null, color: "var(--hot)"   },
+                    { data: hpReturn  ? window.bucketMinutely(hpReturn)  : null, color: "var(--cold)"  },
+                    { data: hpOutdoor ? window.bucketMinutely(hpOutdoor) : null, color: "var(--text-3)"},
                   ]}/>
                 </button>
               }>

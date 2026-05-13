@@ -130,25 +130,26 @@ const TrendChart = ({ series, height = 200, yMin, yMax, hours = 24, unit = "°C"
     const v = min + (max - min) * (i / 4);
     ticks.push({ v, y: yFor(v) });
   }
-  // Label each tick with the wall-clock hour at the end of its bucket so the
-  // rightmost tick reads the current local hour.
-  const nowHour = new Date().getHours();
-  const lastBucket = hours - 1;
+  // X-axis labels are wall-clock hours derived from each slot's actual
+  // timestamp (slots end at "now"). Slot count drives tick spacing so the
+  // labels stay hourly whether the chart is 24 buckets or 1440.
+  const refLen = series[0].data.length;
+  const lastBucket = refLen - 1;
+  const tickEveryHours = 4;
+  const tickEvery = Math.max(1, Math.round(tickEveryHours * 60 * refLen / (hours * 60)));
   const xTicks = [];
-  for (let i = 0; i <= lastBucket; i += 4) {
+  for (let i = 0; i <= lastBucket; i += tickEvery) {
     xTicks.push({
-      label: `${String((nowHour + 1 + i) % 24).padStart(2,"0")}:00`,
+      label: window.formatSlotHour(window.minuteSlotTime(i, refLen)),
       x: padL + (i / lastBucket) * innerW,
     });
   }
   if (xTicks[xTicks.length - 1].x < padL + innerW) {
     xTicks.push({
-      label: `${String((nowHour + 1 + lastBucket) % 24).padStart(2,"0")}:00`,
+      label: window.formatSlotHour(window.minuteSlotTime(lastBucket, refLen)),
       x: padL + innerW,
     });
   }
-
-  const refLen = series[0].data.length;
 
   return (
     <svg className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
@@ -223,7 +224,7 @@ const TrendChart = ({ series, height = 200, yMin, yMax, hours = 24, unit = "°C"
                       fill="oklch(0.10 0.005 250)" stroke="var(--line-2)"/>
                 <text x="10" y="15" fill="oklch(0.78 0.008 250)" fontSize="10"
                       fontFamily="var(--font-mono)">
-                  {`${String((nowHour + 1 + hover) % 24).padStart(2,"0")}:00`}
+                  {window.formatSlotHourMinute(window.minuteSlotTime(hover, refLen))}
                 </text>
                 {series.map((s, si) => (
                   <g key={si} transform={`translate(10, ${28 + si * 14})`}>

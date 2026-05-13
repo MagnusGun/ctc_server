@@ -5,20 +5,25 @@
 //! `flush()` (and on graceful shutdown), so we never wear flash on per-poll
 //! commits.
 //!
-//! Three logical stores:
+//! Five logical stores:
 //!
-//! * `CYCLES`   — `unix_secs -> JSON(CycleBlob)` completed compressor cycles
-//! * `DAILY`    — `yyyymmdd -> JSON(DailyBlob)` per-day aggregates
-//! * `TRACKING` — `"accumulators" -> JSON(Accumulators)` lifetime counters
+//! * `CYCLES`         — `(unix_secs, seq) -> JSON(CycleBlob)` completed cycles
+//! * `DAILY`          — `yyyymmdd -> JSON(DailyBlob)` per-day aggregates
+//! * `TRACKING`       — `"accumulators" -> JSON(Accumulators)` lifetime counters
+//! * `STEP_EVENTS`    — `unix_secs -> JSON(StepEventBlob)` flow-step captures
+//! * `SERIES_MINUTES` — `(sensor_id, minute_unix) -> f32` per-minute means
 //!
-//! JSON costs more bytes than a binary codec, but the volumes here are tiny
-//! (one accumulator row, a handful of cycles per hour, ≤365 daily rows) and
-//! `serde_json` is already a workspace dep with no extra audit warnings.
+//! JSON costs more bytes than a binary codec, but the volumes are tiny for
+//! the JSON-encoded tables (one accumulator row, a handful of cycles per
+//! hour, ≤365 daily rows). `SERIES_MINUTES` stores a single scalar per row
+//! and is hot enough that we use raw `f32` little-endian bytes instead.
 //!
-//! Raw sensor samples live only in a per-sensor 24h in-memory ring; the
-//! trend modal serves from that ring and a restart drops it. Persisting
-//! samples to disk would generate ~329k row inserts per flush for no
-//! product benefit.
+//! Sensor samples flow into two places at once: a per-sensor 24h in-memory
+//! 5-second ring (live values for the trend modal) and a per-minute mean
+//! accumulator that `flush()` finalizes to `SERIES_MINUTES`. On `open()`
+//! the 1-minute table is hydrated back into the ring so the dashboard's
+//! graphs render the pre-restart history immediately instead of starting
+//! over.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -39,12 +44,20 @@ const DAILY: TableDefinition<u32, &[u8]> = TableDefinition::new("daily");
 const TRACKING: TableDefinition<&str, &[u8]> = TableDefinition::new("tracking");
 const META: TableDefinition<&str, u32> = TableDefinition::new("meta");
 const STEP_EVENTS: TableDefinition<i64, &[u8]> = TableDefinition::new("step_events");
+// v3: per-minute means of polled sensor samples. Key is (sensor_id,
+// minute_unix); value is the 4-byte little-endian bytes of an f32 mean.
+// Hydrated into the in-memory ring on `open` so the dashboard's 24h graphs
+// survive a restart.
+const SERIES_MINUTES: TableDefinition<(u16, i64), [u8; 4]> =
+    TableDefinition::new("series_minutes_v3");
 
 /// Cap on disk + in-memory step-response events. The chart renders the last
 /// 6 by default, so 50 leaves headroom and bounds the table size.
 const MAX_STEP_EVENTS: usize = 50;
 
-const SCHEMA_VERSION: u32 = 2;
+// v3 = added SERIES_MINUTES. Empty on upgrade; no data migration required —
+// the table is just created on first open under the new version.
+const SCHEMA_VERSION: u32 = 3;
 const TRACKING_KEY: &str = "accumulators";
 const SCHEMA_KEY: &str = "schema_version";
 
@@ -173,6 +186,12 @@ struct MemState {
     /// Step-response events hydrated from disk on `open` for the API to serve.
     /// Newest-first; capped at `MAX_STEP_EVENTS`.
     step_events_cache: Vec<StepEventBlob>,
+    /// Open per-minute accumulators keyed by `(sensor_id, minute_unix)`.
+    /// `record_sample` adds `(value, 1)` to the bucket for the current minute;
+    /// `flush` finalizes every bucket whose minute is strictly older than the
+    /// current minute, writes `mean = sum / count` to `SERIES_MINUTES`, and
+    /// drops it from the map. Open buckets persist across flushes.
+    pending_minutes: HashMap<(u16, i64), (f64, u32)>,
     /// Anything to write?
     dirty: bool,
     /// Monotonic counter bumped by every record_*/set_*/upsert_*. `flush`
@@ -258,6 +277,15 @@ impl From<redb::DatabaseError> for StorageError {
 
 type Result<T> = std::result::Result<T, StorageError>;
 
+/// Per-minute mean from an open `(sum, count)` accumulator. `count` must be
+/// non-zero; the `as f32` cast is bounded — sensor values fit well inside
+/// `f32` and the divide keeps magnitude in range.
+#[allow(clippy::cast_possible_truncation)]
+fn minute_mean(sum: f64, count: u32) -> f32 {
+    debug_assert!(count > 0, "minute_mean called on empty bucket");
+    (sum / f64::from(count)) as f32
+}
+
 fn unix_secs(t: SystemTime) -> Result<i64> {
     // i64 is fine well past the year 2200.
     let s = t
@@ -329,6 +357,28 @@ impl Store {
             }
         }
 
+        // Hydrate the per-sensor 24h ring from persisted 1-minute means so
+        // the dashboard's trend modal renders pre-restart history immediately.
+        // Table iteration is `(sensor_id, minute)` ascending, so each sensor's
+        // deque ends up sorted with no extra step.
+        let now = unix_secs(SystemTime::now())?;
+        let cutoff = now - SERIES_RETENTION_SECS;
+        if let Ok(t) = r.open_table(SERIES_MINUTES) {
+            for entry in t.iter()? {
+                let (k, v) = entry?;
+                let (sid, minute) = k.value();
+                if minute < cutoff {
+                    continue;
+                }
+                let mean = f32::from_le_bytes(v.value());
+                state
+                    .series
+                    .entry(sid)
+                    .or_default()
+                    .push_back((minute, mean));
+            }
+        }
+
         Ok(Self {
             db: Arc::new(db),
             state: Arc::new(Mutex::new(state)),
@@ -336,7 +386,9 @@ impl Store {
         })
     }
 
-    /// Record a single sensor sample. RAM-only; flushed hourly.
+    /// Record a single sensor sample. Lands in two places: the in-memory 24h
+    /// 5-second ring (live dashboard values) and the open per-minute mean
+    /// accumulator that `flush` finalizes to `SERIES_MINUTES` on disk.
     ///
     /// Non-finite values (`NaN`, `±Inf`) are dropped silently — they corrupt
     /// downstream serialization (invalid JSON) and chart math (`Math.min(NaN)`
@@ -349,6 +401,7 @@ impl Store {
             return Ok(());
         }
         let s = unix_secs(t)?;
+        let minute = s - s.rem_euclid(60);
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let buf = st.series.entry(sensor.as_u16()).or_default();
         buf.push_back((s, value));
@@ -356,10 +409,16 @@ impl Store {
         while buf.front().is_some_and(|(t, _)| *t < cutoff) {
             buf.pop_front();
         }
-        // Series are RAM-only — no disk-bound state changes, so don't mark
-        // dirty. Marking here would force the hourly flush to rewrite
-        // accumulators/cycles/daily on every poll even when nothing else
-        // changed.
+        let entry = st
+            .pending_minutes
+            .entry((sensor.as_u16(), minute))
+            .or_insert((0.0, 0));
+        entry.0 += f64::from(value);
+        entry.1 = entry.1.saturating_add(1);
+        // pending_minutes is disk-bound state — every sample must mark dirty
+        // so the eventual flush picks it up, even though most samples land in
+        // an open bucket that the next flush will still skip.
+        st.mark_dirty();
         Ok(())
     }
 
@@ -380,6 +439,41 @@ impl Store {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Aggregate the in-memory ring for `sensor` into per-minute means over
+    /// `[from, to)`. Returns one point per minute that had at least one
+    /// sample, keyed by the minute's floored unix timestamp, in ascending
+    /// order. Empty minutes are skipped — the chart renders gaps as gaps.
+    ///
+    /// Used by the dashboard's `/api/v1/heatpump/series` route. The 5-second
+    /// ring is the canonical source: persisted minute means are hydrated
+    /// into it on `open`, and live polling appends sub-minute samples on
+    /// top, so a single pass through the ring produces a uniform 1-minute
+    /// series across the restart boundary.
+    #[must_use]
+    pub fn bucket_minutes(&self, sensor: Sensor, from: i64, to: i64) -> Vec<(i64, f32)> {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(buf) = st.series.get(&sensor.as_u16()) else {
+            return Vec::new();
+        };
+        // Accumulate (sum, count) per minute. BTreeMap keeps the ascending
+        // order without a separate sort.
+        let mut acc: std::collections::BTreeMap<i64, (f64, u32)> =
+            std::collections::BTreeMap::new();
+        for (t, v) in buf {
+            if *t < from || *t >= to {
+                continue;
+            }
+            let minute = t - t.rem_euclid(60);
+            let entry = acc.entry(minute).or_insert((0.0, 0));
+            entry.0 += f64::from(*v);
+            entry.1 = entry.1.saturating_add(1);
+        }
+        acc.into_iter()
+            .filter(|(_, (_, count))| *count > 0)
+            .map(|(minute, (sum, count))| (minute, minute_mean(sum, count)))
+            .collect()
     }
 
     /// Most recent sample for `sensor`, if any. O(1).
@@ -531,7 +625,11 @@ impl Store {
     /// when nothing is dirty — costs only a mutex acquire.
     #[allow(clippy::many_single_char_names)]
     pub fn flush(&self) -> Result<()> {
-        let (accumulators, cycles, daily, step_events, gen_at_snapshot) = {
+        let now = unix_secs(SystemTime::now())?;
+        let current_minute = now - now.rem_euclid(60);
+        let series_cutoff = now - self.series_retention_secs;
+
+        let (accumulators, cycles, daily, step_events, finalized_minutes, gen_at_snapshot) = {
             let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if !st.dirty {
                 return Ok(());
@@ -539,10 +637,23 @@ impl Store {
             let cycles = std::mem::take(&mut st.pending_cycles);
             let daily = std::mem::take(&mut st.pending_daily);
             let step_events = std::mem::take(&mut st.pending_step_events);
+            // Finalize every per-minute bucket whose minute is strictly older
+            // than the current minute. Open buckets (`minute >= current_minute`)
+            // stay in pending and may keep absorbing samples until the next
+            // flush.
+            let mut finalized: Vec<((u16, i64), f32)> = Vec::new();
+            st.pending_minutes.retain(|key, (sum, count)| {
+                if key.1 < current_minute && *count > 0 {
+                    finalized.push((*key, minute_mean(*sum, *count)));
+                    false
+                } else {
+                    true
+                }
+            });
             let acc = st.accumulators.clone();
             let current_gen = st.dirty_gen;
             // Keep memory dirty=false only after the commit succeeds.
-            (acc, cycles, daily, step_events, current_gen)
+            (acc, cycles, daily, step_events, finalized, current_gen)
         };
 
         let w = self.db.begin_write()?;
@@ -579,6 +690,22 @@ impl Store {
             let mut t = w.open_table(TRACKING)?;
             let buf = serde_json::to_vec(&accumulators)?;
             t.insert(TRACKING_KEY, buf.as_slice())?;
+
+            let mut m = w.open_table(SERIES_MINUTES)?;
+            for (key, mean) in &finalized_minutes {
+                m.insert(*key, &mean.to_le_bytes())?;
+            }
+            // Prune rows older than `series_cutoff` so the table never outgrows
+            // the configured retention. Collect victims first — redb forbids
+            // mutating during iteration.
+            let victims: Vec<(u16, i64)> = m
+                .iter()?
+                .filter_map(|entry| entry.ok().map(|(k, _)| k.value()))
+                .filter(|(_, minute)| *minute < series_cutoff)
+                .collect();
+            for k in victims {
+                m.remove(k)?;
+            }
         }
         w.commit()?;
 

@@ -67,28 +67,45 @@ async function getActivitySegments() {
     return segments;
 }
 
-/* Bucket raw [{t, v}] samples into `buckets` hourly windows ending now.
-   Each bucket = mean of samples whose timestamps fall inside it. Empty
-   buckets stay null so the chart can render gaps where data is missing
-   instead of a fake flat line. */
-function bucketHourly(points, buckets = 24) {
-    if (!points || points.length === 0) {
-        return Array(buckets).fill(null);
-    }
+/* 24 hours of minute-resolution slots — the dashboard's default trend
+   window. Matches the server's SERIES_MINUTES retention. */
+const MINUTE_SLOTS_24H = 24 * 60;
+
+/* Align server-side 1-minute means into a fixed-length array of minute
+   slots ending at the current minute. Server already buckets points to
+   `t = floor(t/60)*60`; here we slot them into a dense `slots`-long array
+   so the chart can render a continuous line over the full 24h window
+   with null gaps where the sensor was offline. */
+function bucketMinutely(points, slots = MINUTE_SLOTS_24H) {
     const now = Math.floor(Date.now() / 1000);
-    const windowStart = now - buckets * 3600;
-    const sum = new Array(buckets).fill(0);
-    const count = new Array(buckets).fill(0);
+    const currentMinute = now - (now % 60);
+    const out = Array(slots).fill(null);
+    if (!points || points.length === 0) return out;
     for (const { t, v } of points) {
-        // Samples at t === now land at idx === buckets; clamp into the last
-        // bucket so the freshest reading isn't dropped.
-        let idx = Math.floor((t - windowStart) / 3600);
-        if (idx === buckets) idx = buckets - 1;
-        if (idx < 0 || idx >= buckets) continue;
-        sum[idx] += v;
-        count[idx] += 1;
+        const minute = t - (t % 60);
+        // Slot 0 = (slots-1) minutes ago; slot (slots-1) = current minute.
+        const offset = (currentMinute - minute) / 60;
+        const idx = slots - 1 - offset;
+        if (idx < 0 || idx >= slots) continue;
+        out[idx] = v;
     }
-    return sum.map((s, i) => (count[i] > 0 ? s / count[i] : null));
+    return out;
+}
+
+/* Wall-clock end-of-slot time (epoch ms) for a minute-slot array of
+   length `slotsTotal` ending at the current minute. Slot (slotsTotal-1)
+   is "now". */
+function minuteSlotTime(slotIndex, slotsTotal) {
+    return Date.now() - (slotsTotal - 1 - slotIndex) * 60_000;
+}
+
+function formatSlotHour(ms) {
+    return `${String(new Date(ms).getHours()).padStart(2, "0")}:00`;
+}
+
+function formatSlotHourMinute(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 const useActivity       = () => usePolledFetch(getActivitySegments, POLL_LIVE);
@@ -259,14 +276,14 @@ function buildStatsData(history, flowSeries, retSeries) {
         startsByHour[d.getHours()] += 1;
     }
 
-    // 7. Heating trend — 24 hourly buckets of flow + return from the
-    // series store. `null` until both fetches land. Per-bucket nulls
-    // (sensor offline or cache miss) flow through as `null` so the chart
-    // can render gaps rather than misleading zero-dives.
+    // 7. Heating trend — 1-minute slots of flow + return from the series
+    // store, length 1440 (24h). `null` until both fetches land. Per-slot
+    // nulls (sensor offline or cache miss) flow through as `null` so the
+    // chart can render gaps rather than misleading zero-dives.
     let heating = null;
     if (flowSeries && retSeries) {
-        const flow = window.bucketHourly(flowSeries, 24);
-        const ret  = window.bucketHourly(retSeries,  24);
+        const flow = window.bucketMinutely(flowSeries);
+        const ret  = window.bucketMinutely(retSeries);
         heating = { flow, ret, events: [] };
     }
 
@@ -313,7 +330,10 @@ const useIsNarrow = () => useMediaQuery("(max-width: 480px)");
 
 window.POLL_LIVE = POLL_LIVE;
 window.POLL_PRICES = POLL_PRICES;
-window.bucketHourly = bucketHourly;
+window.bucketMinutely = bucketMinutely;
+window.minuteSlotTime = minuteSlotTime;
+window.formatSlotHour = formatSlotHour;
+window.formatSlotHourMinute = formatSlotHourMinute;
 window.buildStatsData = buildStatsData;
 window.useSeries = useSeries;
 window.useHeatPumpHistory = useHeatPumpHistory;
