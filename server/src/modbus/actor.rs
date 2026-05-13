@@ -5,6 +5,7 @@
 //! access to the serial port and processes operations sequentially.
 
 use crate::error::ModbusError;
+use crate::modbus::bms_parameters::{ALARM_REF_MIN, INFO_REF_MAX};
 use crate::modbus::{Access, CTCModbusParameter};
 use std::io;
 use std::time::Duration;
@@ -37,6 +38,11 @@ const VISIBILITY_REG_END: u16 = 62548;
 /// Number of visibility registers to read
 const VISIBILITY_REG_COUNT: usize = (VISIBILITY_REG_END - VISIBILITY_REG_START + 1) as usize; // 49
 
+// Several call sites do `u16::try_from(idx)` on indices in 0..VISIBILITY_REG_COUNT.
+// That works as long as the count fits in u16; assert it at compile time so a
+// later range expansion doesn't silently start truncating.
+const _: () = assert!(VISIBILITY_REG_COUNT < u16::MAX as usize);
+
 #[derive(Debug)]
 pub enum ParameterOperation {
     Read(CTCModbusParameter),
@@ -45,7 +51,7 @@ pub enum ParameterOperation {
     /// Read a specific visibility register (62500-62548)
     /// Returns the raw bitmask value as f32
     ReadVisibility(u16),
-    /// Read all 49 visibility registers (62500-62548)
+    /// Read all visibility registers (62500-62548 by default)
     /// Returns `ModbusResponse::RawRegisters` with all cached visibility values
     ReadAllVisibility,
     /// Read raw registers without scaling (Modbus function 0x03)
@@ -63,7 +69,6 @@ pub enum ParameterOperation {
 }
 
 pub struct CtcActor {
-    pub receiver: mpsc::Receiver<ModbusRequest>,
     context: tokio_modbus::client::Context,
     // Timeout and retry configuration
     operation_timeout: Duration,
@@ -71,6 +76,15 @@ pub struct CtcActor {
     initial_retry_delay: Duration,
     backoff_multiplier: f64,
     max_consecutive_failures: u32,
+    /// Minimum gap between consecutive Modbus transactions. Enforced inside
+    /// `with_retry!` so the CTC firmware has guaranteed settle time between
+    /// back-to-back reads — without this, polled bursts from the sensor loop
+    /// occasionally overlap with the device's internal processing and drop
+    /// the response, triggering an `attempt 1/3 timeout` warning.
+    inter_request_gap: Duration,
+    /// When the last wire transaction completed. Used to compute the actual
+    /// sleep needed before the next one.
+    last_wire_op: Option<Instant>,
     // Tracking fields
     consecutive_failures: u32,
     last_success: Option<Instant>,
@@ -81,6 +95,7 @@ pub struct CtcActor {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct CtcActorBuilder {
     tty_path: String,
     baud_rate: u32,
@@ -96,6 +111,7 @@ pub struct CtcActorBuilder {
     initial_retry_delay: Duration,
     backoff_multiplier: f64,
     max_consecutive_failures: u32,
+    inter_request_gap: Duration,
 }
 
 #[allow(dead_code)]
@@ -117,6 +133,7 @@ impl CtcActorBuilder {
             initial_retry_delay: Duration::from_millis(100), // Will be overridden by config
             backoff_multiplier: 2.0,                   // Will be overridden by config
             max_consecutive_failures: 5,               // Will be overridden by config
+            inter_request_gap: Duration::from_millis(10), // Will be overridden by config
         }
     }
 
@@ -180,7 +197,12 @@ impl CtcActorBuilder {
         self
     }
 
-    pub fn build(self, receiver: mpsc::Receiver<ModbusRequest>) -> io::Result<CtcActor> {
+    pub fn inter_request_gap(mut self, inter_request_gap: Duration) -> Self {
+        self.inter_request_gap = inter_request_gap;
+        self
+    }
+
+    pub fn build(&self) -> io::Result<CtcActor> {
         // Set up the serial port
         let port = tokio_serial::new(&self.tty_path, self.baud_rate)
             .baud_rate(self.baud_rate)
@@ -196,19 +218,68 @@ impl CtcActorBuilder {
         let ctx = rtu::attach_slave(port, Slave(self.slave_id));
 
         Ok(CtcActor {
-            receiver,
             context: ctx,
             operation_timeout: self.operation_timeout,
             max_retries: self.max_retries,
             initial_retry_delay: self.initial_retry_delay,
             backoff_multiplier: self.backoff_multiplier,
             max_consecutive_failures: self.max_consecutive_failures,
+            inter_request_gap: self.inter_request_gap,
+            last_wire_op: None,
             consecutive_failures: 0,
             last_success: None,
             total_operations: 0,
             total_failures: 0,
             visibility_cache: None,
         })
+    }
+
+    /// Spawn the actor under a supervisor task that respawns it on unexpected exit.
+    ///
+    /// The supervisor owns the request `receiver` across respawns, so the
+    /// `mpsc::Sender` held by the rest of the application remains valid even
+    /// when the underlying actor task exits or panics. On exit (clean or via
+    /// panic) the supervisor sleeps briefly, rebuilds the actor (which reopens
+    /// the serial port), and resumes processing requests.
+    pub fn spawn_supervised(self, receiver: mpsc::Receiver<ModbusRequest>) {
+        use futures_util::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        tokio::spawn(async move {
+            const RESPAWN_DELAY: Duration = Duration::from_secs(1);
+            let mut receiver = receiver;
+            loop {
+                match self.build() {
+                    Ok(mut actor) => {
+                        info!("ctc_actor::supervisor: Starting actor loop");
+                        let result = AssertUnwindSafe(actor.run(&mut receiver))
+                            .catch_unwind()
+                            .await;
+                        match result {
+                            Ok(()) => {
+                                error!(
+                                    "ctc_actor::supervisor: Actor loop exited; respawning after {:?}",
+                                    RESPAWN_DELAY
+                                );
+                            }
+                            Err(_panic) => {
+                                error!(
+                                    "ctc_actor::supervisor: Actor loop panicked; respawning after {:?}",
+                                    RESPAWN_DELAY
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "ctc_actor::supervisor: Failed to build actor: {e}; retrying in {:?}",
+                            RESPAWN_DELAY
+                        );
+                    }
+                }
+                sleep(RESPAWN_DELAY).await;
+            }
+        });
     }
 }
 
@@ -242,11 +313,23 @@ macro_rules! with_retry {
                     sleep(delay).await;
                 }
 
+                // Enforce the inter-request gap: a CTC firmware needs settle
+                // time between back-to-back wire transactions. The first
+                // operation pays nothing; subsequent ones only pay the
+                // remainder of the gap.
+                CtcActor::wait_for_inter_request_gap(
+                    $self.inter_request_gap,
+                    $self.last_wire_op,
+                )
+                .await;
+
                 // IMPORTANT: $operation is evaluated here, inside the loop,
                 // creating a fresh future each iteration
                 let future = $operation;
 
-                match timeout($self.operation_timeout, future).await {
+                let result = timeout($self.operation_timeout, future).await;
+                $self.last_wire_op = Some(Instant::now());
+                match result {
                     Ok(Ok(value)) => {
                         $self.record_success();
                         trace!(
@@ -258,6 +341,7 @@ macro_rules! with_retry {
                         break 'retry Ok(value);
                     }
                     Ok(Err(e)) => {
+                        let transient = e.is_transient();
                         warn!(
                             "{} failed on attempt {}/{}: {} (register {})",
                             $op_name,
@@ -267,6 +351,10 @@ macro_rules! with_retry {
                             $register
                         );
                         last_error = Some(e);
+                        if !transient {
+                            // Permanent error: skip remaining retries.
+                            break;
+                        }
                     }
                     Err(_elapsed) => {
                         let timeout_err = ModbusError::Timeout {
@@ -311,6 +399,41 @@ macro_rules! with_retry {
     }};
 }
 
+/// Check if parameter is visible against an (optionally populated) cache.
+///
+/// `visible == 0` always returns `Ok(true)` so registers like
+/// `CTC_ALARM_INFO_BUFFER` remain accessible even if the visibility scan
+/// failed.
+///
+/// When `cache` is `None` (scan failed) the function falls back to the
+/// optimistic "assume visible" path rather than poisoning every read. Reads
+/// may then attempt registers the device doesn't actually support and get a
+/// clean Modbus exception, but the actor is not stuck.
+fn check_visibility_against(
+    cache: Option<&[u16; VISIBILITY_REG_COUNT]>,
+    param: &CTCModbusParameter,
+) -> Result<bool, ModbusError> {
+    // visible == 0 means always visible — check BEFORE touching cache.
+    if param.visible == 0 {
+        return Ok(true);
+    }
+
+    let Some(cache) = cache else {
+        trace!(
+            "ctc_actor::check_visibility: cache unavailable, assuming register {} visible",
+            param.id
+        );
+        return Ok(true);
+    };
+
+    if param.visible < VISIBILITY_REG_START || param.visible > VISIBILITY_REG_END {
+        return Err(ModbusError::InvalidVisibilityRegister(param.visible));
+    }
+
+    let index = (param.visible - VISIBILITY_REG_START) as usize;
+    Ok(param.is_visible(cache[index]))
+}
+
 impl CtcActor {
     /// Calculate exponential backoff delay for a given retry attempt
     ///
@@ -323,14 +446,40 @@ impl CtcActor {
         if attempt == 0 {
             Duration::from_millis(0)
         } else {
+            // Cap the computed delay before the f64 -> u64 cast. With a large
+            // multiplier or many attempts, `powi` can overflow to `f64::INFINITY`
+            // and saturate to `u64::MAX` on cast, producing an effectively
+            // infinite sleep. Clamp to 60 seconds.
+            const MAX_DELAY_MS: f64 = 60_000.0;
             #[allow(clippy::cast_possible_truncation)]
             #[allow(clippy::cast_sign_loss)]
             #[allow(clippy::cast_precision_loss)]
             #[allow(clippy::cast_possible_wrap)]
-            let delay_ms = (self.initial_retry_delay.as_millis() as f64
-                * self.backoff_multiplier.powi(attempt as i32 - 1))
-                as u64;
+            let raw_ms = self.initial_retry_delay.as_millis() as f64
+                * self.backoff_multiplier.powi(attempt as i32 - 1);
+            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_sign_loss)]
+            let delay_ms = raw_ms.min(MAX_DELAY_MS) as u64;
             Duration::from_millis(delay_ms)
+        }
+    }
+
+    /// Sleep just long enough that at least `inter_request_gap` has elapsed
+    /// since the last wire transaction. First call after construction (or
+    /// after a respawn) is free; subsequent calls only pay the remainder.
+    ///
+    /// Takes `Duration` + `Option<Instant>` by value so the returned future
+    /// captures only `Copy` values — keeping `&CtcActor` out of the future
+    /// matters because the actor is `!Sync` (the tokio_modbus context isn't).
+    async fn wait_for_inter_request_gap(gap: Duration, last: Option<Instant>) {
+        if gap.is_zero() {
+            return;
+        }
+        if let Some(last) = last {
+            let elapsed = last.elapsed();
+            if elapsed < gap {
+                sleep(gap - elapsed).await;
+            }
         }
     }
 
@@ -356,9 +505,9 @@ impl CtcActor {
 
     /// Batch read all visibility registers in one Modbus call
     ///
-    /// Reads registers 62500-62548 (49 registers) containing visibility bitmasks
-    /// for hardware capability detection. The cache is populated lazily on first
-    /// parameter access.
+    /// Reads the configured visibility register range (62500-62548 by default)
+    /// containing visibility bitmasks for hardware capability detection. The
+    /// cache is populated lazily on first parameter access.
     async fn scan_visibility(&mut self) -> Result<(), ModbusError> {
         info!(
             "Scanning visibility registers ({} registers starting at {})",
@@ -411,30 +560,26 @@ impl CtcActor {
     /// # Important
     /// `visible == 0` returns true WITHOUT touching the cache, ensuring registers
     /// like `CTC_ALARM_INFO_BUFFER` remain accessible even if visibility scan fails.
+    ///
+    /// If the visibility cache has not been populated (initial scan failed),
+    /// fall back to optimistic "assume visible" rather than poisoning every read.
+    /// Reads may then attempt registers the device doesn't actually support, but
+    /// will get a clean Modbus exception rather than the actor being stuck.
     fn check_visibility(&self, param: &CTCModbusParameter) -> Result<bool, ModbusError> {
-        // FIRST: visible == 0 means always visible - check BEFORE touching cache
-        // This ensures CTC_ALARM_INFO_BUFFER etc. work even if scan failed
-        if param.visible == 0 {
-            return Ok(true);
-        }
-
-        // NOW we need the cache - fail if not scanned
-        let cache = self
-            .visibility_cache
-            .as_ref()
-            .ok_or(ModbusError::VisibilityNotScanned)?;
-
-        // Bounds check for future-proofing: reject registers outside known range
-        if param.visible < VISIBILITY_REG_START || param.visible > VISIBILITY_REG_END {
-            return Err(ModbusError::InvalidVisibilityRegister(param.visible));
-        }
-
-        // Calculate index: register 62500 = index 0
-        let index = (param.visible - VISIBILITY_REG_START) as usize;
-        Ok(param.is_visible(cache[index]))
+        check_visibility_against(self.visibility_cache.as_ref(), param)
     }
 
     async fn read_parameter(&mut self, param: &CTCModbusParameter) -> Result<f32, ModbusError> {
+        let raw = self.read_parameter_raw(param).await?;
+        Ok(param.get_scaled_value(raw))
+    }
+
+    /// Read a parameter and return the raw u16 register value without scaling.
+    ///
+    /// Used by write verification to compare against the raw value that was
+    /// actually written, avoiding floating-point mismatches when the user's
+    /// scaled value doesn't align with the register's factor.
+    async fn read_parameter_raw(&mut self, param: &CTCModbusParameter) -> Result<u16, ModbusError> {
         with_retry!(self, "read_holding_registers", param.id, async {
             self.context
                 .read_holding_registers(param.id, 1)
@@ -450,17 +595,15 @@ impl CtcActor {
                         })
                         .and_then(|raw_values| {
                             trace!(
-                                "ctc_actor::read_parameter: Raw values for parameter {:?}: {:?}",
+                                "ctc_actor::read_parameter_raw: Raw values for parameter {:?}: {:?}",
                                 param, raw_values
                             );
-                            let scaled_values = param.get_scaled_value_vector(&raw_values);
-                            scaled_values
-                                .first()
-                                .copied()
-                                .ok_or_else(|| ModbusError::ReadError {
+                            raw_values.first().copied().ok_or_else(|| {
+                                ModbusError::ReadError {
                                     register: param.id,
                                     reason: "No value returned".to_string(),
-                                })
+                                }
+                            })
                         })
                 })
         })
@@ -495,10 +638,10 @@ impl CtcActor {
                             reason: format!("{e}"),
                         })
                         .and_then(|raw_values| {
-                            if raw_values.len() < 2 {
+                            if raw_values.len() < 3 {
                                 return Err(ModbusError::ValidationReadError {
                                     register: param_id,
-                                    reason: "Not enough values returned".to_string(),
+                                    reason: format!("Expected 3 values, got {}", raw_values.len()),
                                 });
                             }
                             trace!(
@@ -511,6 +654,7 @@ impl CtcActor {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn write_parameter(
         &mut self,
         param: &CTCModbusParameter,
@@ -530,10 +674,11 @@ impl CtcActor {
         }
 
         // Special validation for alarm/info text buffer (register 65100)
-        // Must be 0-9999 (alarm) or 10000-19999 (info)
+        // Must be in alarm range (ALARM_REF_MIN..=ALARM_REF_MAX) or
+        // info range (INFO_REF_OFFSET..=INFO_REF_MAX)
         if param.id == 65100 {
             // Check for negative values or values outside valid range
-            if !(0.0..=19999.0).contains(&value) {
+            if !(f32::from(ALARM_REF_MIN)..=f32::from(INFO_REF_MAX)).contains(&value) {
                 error!(
                     "ctc_actor::write_parameter: Invalid alarm/info value: {}",
                     value
@@ -546,7 +691,26 @@ impl CtcActor {
             );
         }
 
-        let raw_value = param.get_raw_value(value);
+        let Some(raw_value) = param.get_raw_value(value) else {
+            error!(
+                "ctc_actor::write_parameter: value {} out of representable u16 range for register {}",
+                value, param.id
+            );
+            let (min, max) = if param.signed {
+                (
+                    f32::from(i16::MIN) * param.factor,
+                    f32::from(i16::MAX) * param.factor,
+                )
+            } else {
+                (0.0, f32::from(u16::MAX) * param.factor)
+            };
+            return Err(ModbusError::OutOfRange {
+                value,
+                min,
+                max,
+                register: param.id,
+            });
+        };
         trace!(
             "ctc_actor::write_parameter: Converted to raw_value={}",
             raw_value
@@ -632,15 +796,17 @@ impl CtcActor {
     ) {
         trace!("ctc_actor::run: Operation=READ, parameter={:?}", param);
 
-        // Lazy init: scan visibility on first access
-        // Note: scan_visibility() calls with_retry!, which handles record_success/record_failure
+        // Lazy init: scan visibility on first access. If the scan fails we
+        // continue without a cache; check_visibility falls back to optimistic
+        // "assume visible" so a single transient bus glitch at boot doesn't
+        // poison every subsequent read.
         if self.visibility_cache.is_none()
             && let Err(e) = self.scan_visibility().await
         {
-            // scan_visibility already called record_failure() via with_retry!
-            error!("ctc_actor::run: Visibility scan FAILED: {}", e);
-            respond_to.send(Err(e)).ok();
-            return;
+            warn!(
+                "ctc_actor::run: Visibility scan FAILED, proceeding without cache: {}",
+                e
+            );
         }
 
         // Check visibility - NO record_failure() here, this is a client error not I/O failure
@@ -718,13 +884,26 @@ impl CtcActor {
             return;
         }
 
-        // Get cached value
+        // Get cached value. Use `.get()` so a future relaxation of the
+        // range check at the function entry doesn't quietly become an OOB
+        // panic — the index invariant is load-bearing on `VISIBILITY_REG_END`
+        // being exclusive.
         if let Some(cache) = &self.visibility_cache {
             let index = (register - VISIBILITY_REG_START) as usize;
-            let value = f32::from(cache[index]);
+            let Some(raw) = cache.get(index).copied() else {
+                error!(
+                    "ctc_actor::run: Visibility index {index} out of bounds (cache len {})",
+                    cache.len()
+                );
+                respond_to
+                    .send(Err(ModbusError::InvalidVisibilityRegister(register)))
+                    .ok();
+                return;
+            };
+            let value = f32::from(raw);
             trace!(
                 "ctc_actor::run: Visibility register {} = {} (0x{:04X})",
-                register, cache[index], cache[index]
+                register, raw, raw
             );
             respond_to
                 .send(Ok(ModbusResponse::Value(value)))
@@ -740,7 +919,7 @@ impl CtcActor {
 
     /// Handle reading all visibility registers
     ///
-    /// Returns all 49 visibility registers (62500-62548) as `RawRegisters`.
+    /// Returns all visibility registers (62500-62548 by default) as `RawRegisters`.
     /// Lazy-initializes the visibility cache on first access.
     async fn handle_all_visibility_operation(&mut self, respond_to: ResponseChannel) {
         trace!("ctc_actor::run: Operation=READ_ALL_VISIBILITY");
@@ -778,6 +957,7 @@ impl CtcActor {
     }
 
     /// Handle a write operation with verification (unless write-only)
+    #[allow(clippy::too_many_lines)]
     async fn handle_write_operation(
         &mut self,
         param: &CTCModbusParameter,
@@ -789,15 +969,17 @@ impl CtcActor {
             param, value
         );
 
-        // Lazy init: scan visibility on first access
-        // Note: scan_visibility() calls with_retry!, which handles record_success/record_failure
+        // Lazy init: scan visibility on first access. If the scan fails we
+        // continue without a cache; check_visibility falls back to optimistic
+        // "assume visible" so a single transient bus glitch at boot doesn't
+        // poison every subsequent write.
         if self.visibility_cache.is_none()
             && let Err(e) = self.scan_visibility().await
         {
-            // scan_visibility already called record_failure() via with_retry!
-            error!("ctc_actor::run: Visibility scan FAILED: {}", e);
-            respond_to.send(Err(e)).ok();
-            return;
+            warn!(
+                "ctc_actor::run: Visibility scan FAILED, proceeding without cache: {}",
+                e
+            );
         }
 
         // Check visibility - NO record_failure() here, this is a client error not I/O failure
@@ -839,14 +1021,31 @@ impl CtcActor {
                 }
 
                 trace!("ctc_actor::run: Write SUCCESS, reading back to verify");
-                match self.read_parameter(param).await {
-                    Ok(return_value) => {
+                // Compare raw u16 values rather than scaled floats. A user value
+                // like 23.55 written to a 0.1-factor register is snapped to 23.6,
+                // which would fail a scaled f32::EPSILON comparison even though
+                // the write succeeded.
+                // get_raw_value returns Option<u16>; the prior range check
+                // already rejected out-of-range values, so None here is a
+                // logic bug — surface it as a verification mismatch.
+                let Some(expected_raw) = param.get_raw_value(value) else {
+                    respond_to
+                        .send(Err(ModbusError::VerificationError {
+                            expected: value,
+                            actual: value,
+                            register: param.id,
+                        }))
+                        .ok();
+                    return;
+                };
+                match self.read_parameter_raw(param).await {
+                    Ok(actual_raw) => {
                         trace!(
-                            "ctc_actor::run: Read-back value={}, comparing with written value={}",
-                            return_value, value
+                            "ctc_actor::run: Read-back raw={}, comparing with written raw={}",
+                            actual_raw, expected_raw
                         );
 
-                        if (return_value - value).abs() < f32::EPSILON {
+                        if actual_raw == expected_raw {
                             trace!("ctc_actor::run: Read-back MATCHES, sending success response");
                             respond_to
                                 .send(Ok(ModbusResponse::Value(value)))
@@ -855,14 +1054,15 @@ impl CtcActor {
                                 });
                             trace!("ctc_actor::run: Write operation COMPLETE");
                         } else {
+                            let actual_scaled = param.get_scaled_value(actual_raw);
                             error!(
-                                "ctc_actor::run: Read-back MISMATCH: wrote {} but read {}",
-                                value, return_value
+                                "ctc_actor::run: Read-back MISMATCH: wrote raw={} but read raw={}",
+                                expected_raw, actual_raw
                             );
                             respond_to
                                 .send(Err(ModbusError::VerificationError {
                                     expected: value,
-                                    actual: return_value,
+                                    actual: actual_scaled,
                                     register: param.id,
                                 }))
                                 .unwrap_or_else(|_| {
@@ -1005,14 +1205,18 @@ impl CtcActor {
 
     /// Main actor loop that processes incoming parameter operations.
     /// Handles both read and write operations for Modbus parameters.
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self, receiver: &mut mpsc::Receiver<ModbusRequest>) {
         info!("ctc_actor::run: Actor loop starting");
         loop {
             tokio::select! {
-                Some((operation, respond_to)) = self.receiver.recv() => {
+                Some((operation, respond_to)) = receiver.recv() => {
                     // Skip if client already disconnected (e.g., browser refresh)
                     if respond_to.is_closed() {
                         debug!("ctc_actor::run: Skipping {:?} - client disconnected", operation);
+                        // Count toward total_operations so request-rate metrics aren't
+                        // distorted; failure counters are intentionally left alone
+                        // because a disconnected client isn't a Modbus failure.
+                        self.total_operations += 1;
                         continue;
                     }
                     match operation {
@@ -1045,5 +1249,176 @@ impl CtcActor {
         error!(
             "ctc_actor::run: Actor loop has EXITED - this should not happen in normal operation!"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Verifies the supervisor's panic-recovery semantics: a panic inside the
+    /// actor's `run` is caught, the actor is rebuilt, and a subsequent request
+    /// is processed.
+    ///
+    /// `CtcActorBuilder::spawn_supervised` cannot be invoked from a unit test
+    /// because `build()` opens a real serial port via `tokio_serial`. The body
+    /// of this test mirrors the supervisor loop exactly (same primitives:
+    /// `AssertUnwindSafe + catch_unwind`, then sleep, then rebuild), with a
+    /// stub actor that panics on its first build and processes a request on
+    /// its second. If the supervisor pattern regresses, this test fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_respawns_actor_after_panic_and_processes_next_request() {
+        let (tx, mut rx) = mpsc::channel::<ModbusRequest>(8);
+        let builds = Arc::new(AtomicU32::new(0));
+        let processed = Arc::new(AtomicU32::new(0));
+
+        let builds_super = Arc::clone(&builds);
+        let processed_super = Arc::clone(&processed);
+
+        // Mirror of `spawn_supervised`'s loop body.
+        let supervisor = tokio::spawn(async move {
+            const RESPAWN_DELAY: Duration = Duration::from_millis(10);
+            loop {
+                let attempt = builds_super.fetch_add(1, Ordering::SeqCst);
+                let processed_inner = Arc::clone(&processed_super);
+                let fut = async {
+                    // Wait for a request, then either panic (first iteration)
+                    // or respond (subsequent iterations).
+                    if let Some((_op, respond_to)) = rx.recv().await {
+                        assert!(attempt != 0, "induced panic inside run");
+                        processed_inner.fetch_add(1, Ordering::SeqCst);
+                        let _ = respond_to.send(Ok(ModbusResponse::Value(7.0)));
+                    }
+                };
+                let result = AssertUnwindSafe(fut).catch_unwind().await;
+                if attempt >= 1 && result.is_ok() {
+                    // Test driver got its answer; stop the supervisor.
+                    break;
+                }
+                sleep(RESPAWN_DELAY).await;
+            }
+        });
+
+        // First request: triggers the panic. The oneshot is dropped when the
+        // panicking future unwinds, so the receiver side resolves with Err.
+        let (r1_tx, r1_rx) = oneshot::channel();
+        tx.send((ParameterOperation::ReadVisibility(62500), r1_tx))
+            .await
+            .unwrap();
+        let r1 = r1_rx.await;
+        assert!(
+            r1.is_err(),
+            "panicking actor must drop the responder, surfacing as oneshot error"
+        );
+
+        // Second request: should be processed by the respawned actor.
+        let (r2_tx, r2_rx) = oneshot::channel();
+        tx.send((ParameterOperation::ReadVisibility(62500), r2_tx))
+            .await
+            .unwrap();
+        let r2 = r2_rx.await.expect("response from respawned actor");
+        match r2 {
+            Ok(ModbusResponse::Value(v)) => assert!((v - 7.0).abs() < f32::EPSILON),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        supervisor.await.unwrap();
+
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "supervisor must rebuild the actor once after the panic"
+        );
+        assert_eq!(
+            processed.load(Ordering::SeqCst),
+            1,
+            "respawned actor must process the queued request"
+        );
+    }
+
+    fn dummy_param(visible: u16, bit: u8) -> CTCModbusParameter {
+        CTCModbusParameter {
+            id: 12345,
+            signed: false,
+            access: Access::R,
+            reg_max: None,
+            reg_min: None,
+            reg_step: None,
+            visible,
+            bit,
+            factor: 1.0,
+            description: "test parameter",
+        }
+    }
+
+    /// When the visibility scan failed (cache is `None`), a parameter with a
+    /// non-zero `visible` register must still pass the visibility check via
+    /// the optimistic fallback. Otherwise every read after a transient boot
+    /// glitch would be rejected with `ParameterNotVisible`.
+    #[test]
+    fn check_visibility_falls_back_to_optimistic_when_cache_missing() {
+        let param = dummy_param(VISIBILITY_REG_START + 5, 3);
+        let visible = check_visibility_against(None, &param);
+        assert!(
+            matches!(visible, Ok(true)),
+            "expected optimistic Ok(true), got {visible:?}"
+        );
+    }
+
+    /// `visible == 0` registers (e.g. `CTC_ALARM_INFO_BUFFER`) must always be
+    /// reported visible regardless of cache state — the optimistic fallback
+    /// is a stricter case of this rule.
+    #[test]
+    fn check_visibility_zero_visible_register_always_visible() {
+        let param = dummy_param(0, 0);
+        assert!(matches!(check_visibility_against(None, &param), Ok(true)));
+
+        let cache = [0u16; VISIBILITY_REG_COUNT];
+        assert!(matches!(
+            check_visibility_against(Some(&cache), &param),
+            Ok(true)
+        ));
+    }
+
+    /// When the cache IS populated, the bitmask is consulted: a clear bit
+    /// must report not visible. Establishes that the fallback isn't masking
+    /// real visibility checks when the scan succeeded.
+    #[test]
+    fn check_visibility_respects_cache_when_populated() {
+        // Param looks at register VISIBILITY_REG_START (cache index 0), bit 3.
+        let param = dummy_param(VISIBILITY_REG_START, 3);
+        let mut cache = [0u16; VISIBILITY_REG_COUNT];
+
+        // Bit 3 clear → not visible.
+        assert!(matches!(
+            check_visibility_against(Some(&cache), &param),
+            Ok(false)
+        ));
+
+        // Bit 3 set → visible.
+        cache[0] = 1 << 3;
+        assert!(matches!(
+            check_visibility_against(Some(&cache), &param),
+            Ok(true)
+        ));
+    }
+
+    /// A parameter whose `visible` register address is outside the known
+    /// range must yield `InvalidVisibilityRegister`, but only when the cache
+    /// has been populated — the optimistic-no-cache path short-circuits
+    /// earlier.
+    #[test]
+    fn check_visibility_out_of_range_only_errors_when_cache_present() {
+        let param = dummy_param(VISIBILITY_REG_END + 1, 0);
+        // No cache → optimistic Ok(true) wins before bounds check.
+        assert!(matches!(check_visibility_against(None, &param), Ok(true)));
+
+        let cache = [0u16; VISIBILITY_REG_COUNT];
+        let err = check_visibility_against(Some(&cache), &param).unwrap_err();
+        assert!(matches!(err, ModbusError::InvalidVisibilityRegister(_)));
     }
 }

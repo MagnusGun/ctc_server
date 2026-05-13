@@ -8,5 +8,6 @@
 
 pub mod poller;
 pub mod stats;
+pub mod step_detector;
 
 pub use stats::HeatPumpStats;

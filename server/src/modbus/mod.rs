@@ -112,22 +112,27 @@ impl CTCModbusParameter {
 
     /// Converts a scaled value back to its raw register value.
     ///
-    /// # Arguments
-    /// * `value` - The scaled value to convert
-    ///
-    /// # Returns
-    /// A vector containing the raw register value
+    /// Returns `None` if the value falls outside the register's natural 16-bit
+    /// range; a saturating `as` cast would otherwise silently clamp it.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
-    pub fn get_raw_value(&self, value: f32) -> u16 {
+    pub fn get_raw_value(&self, value: f32) -> Option<u16> {
         let raw_value = (value / self.factor).round();
+        if !raw_value.is_finite() {
+            return None;
+        }
 
         if self.signed {
-            // First convert to i16, then cast to u16 to preserve bit pattern
-            raw_value as i16 as u16
+            if raw_value < f32::from(i16::MIN) || raw_value > f32::from(i16::MAX) {
+                return None;
+            }
+            Some(raw_value as i16 as u16)
         } else {
-            raw_value as u16
+            if raw_value < 0.0 || raw_value > f32::from(u16::MAX) {
+                return None;
+            }
+            Some(raw_value as u16)
         }
     }
 }
@@ -236,7 +241,7 @@ impl std::fmt::Display for HeatSystemStatus {
 mod tests {
     use crate::modbus::{
         HeatSystemStatus, HotWaterMode,
-        bms_parameters::{HEATSYSTEM_ROOM_SETTEMP, HEATSYSTEM_STATUS},
+        bms_parameters::{CTC_ALARM_INFO_COUNT, HEATSYSTEM_ROOM_SETTEMP, HEATSYSTEM_STATUS},
     };
 
     // Helper function for float comparison with epsilon
@@ -249,14 +254,34 @@ mod tests {
     fn test_get_raw_value_pos() {
         let value: f32 = 10.5;
         let raw_value = HEATSYSTEM_ROOM_SETTEMP.get_raw_value(value);
-        assert_eq!(raw_value, 105);
+        assert_eq!(raw_value, Some(105));
     }
 
     #[test]
     fn test_get_raw_value_neg() {
         let value: f32 = -10.5;
         let raw_value = HEATSYSTEM_ROOM_SETTEMP.get_raw_value(value);
-        assert_eq!(raw_value, 65431);
+        assert_eq!(raw_value, Some(65431));
+    }
+
+    #[test]
+    fn test_get_raw_value_out_of_range_signed() {
+        // factor 0.1, signed: i16 range is [-32768, 32767] → scaled [-3276.8, 3276.7]
+        assert_eq!(HEATSYSTEM_ROOM_SETTEMP.get_raw_value(3300.0), None);
+        assert_eq!(HEATSYSTEM_ROOM_SETTEMP.get_raw_value(-3300.0), None);
+    }
+
+    #[test]
+    fn test_get_raw_value_out_of_range_unsigned() {
+        // CTC_ALARM_INFO_COUNT is unsigned, factor 1.0: u16 range is [0, 65535]
+        assert_eq!(CTC_ALARM_INFO_COUNT.get_raw_value(-1.0), None);
+        assert_eq!(CTC_ALARM_INFO_COUNT.get_raw_value(70000.0), None);
+    }
+
+    #[test]
+    fn test_get_raw_value_nan() {
+        assert_eq!(HEATSYSTEM_ROOM_SETTEMP.get_raw_value(f32::NAN), None);
+        assert_eq!(HEATSYSTEM_ROOM_SETTEMP.get_raw_value(f32::INFINITY), None);
     }
     // endregion: --- Test for conversion of positive and negative values to raw values (signed BMS parameters)
 
@@ -294,14 +319,14 @@ mod tests {
     fn test_to_scaled_value_vector_0_1() {
         let value = 22.1;
         let scaled_value = HEATSYSTEM_ROOM_SETTEMP.get_raw_value(value);
-        assert_eq!(scaled_value, 221);
+        assert_eq!(scaled_value, Some(221));
     }
 
     #[test]
     fn test_to_scaled_value_vector_1_0() {
         let value = 22_f32;
         let scaled_value = HEATSYSTEM_STATUS.get_raw_value(value);
-        assert_eq!(scaled_value, 22);
+        assert_eq!(scaled_value, Some(22));
     }
 
     #[test]

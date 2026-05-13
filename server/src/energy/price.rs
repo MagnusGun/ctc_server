@@ -1,8 +1,6 @@
 //! Electricity price state management
 //!
-//! Manages price data from dual sources:
-//! - elprisetjustnu.se: Raw spot prices (Nord Pool)
-//! - Tibber: Total prices with markup and price levels
+//! Manages spot price data from elprisetjustnu.se (Nord Pool).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -23,15 +21,11 @@ struct PriceStateInner {
     today: Vec<PricePoint>,
     /// Tomorrow's prices (up to 96 entries, available after ~13:00 CET)
     tomorrow: Vec<PricePoint>,
-    /// Last update timestamp
-    last_updated: Option<SystemTime>,
     /// Price zone (SE1, SE2, SE3, SE4)
     price_zone: String,
-    /// Whether Tibber data is available
-    tibber_available: bool,
 }
 
-/// A single price point with data from both sources
+/// A single spot price point
 #[derive(Clone, Debug, Serialize)]
 pub struct PricePoint {
     /// Start time of price period (ISO 8601)
@@ -47,21 +41,8 @@ pub struct PricePoint {
     /// EUR->SEK exchange rate
     pub exchange_rate: f64,
 
-    // From Tibber (if available)
-    /// Tibber total price SEK/kWh (what you pay)
-    pub tibber_total: Option<f64>,
-    /// Tibber energy component SEK/kWh
-    pub tibber_energy: Option<f64>,
-    /// Tibber tax component SEK/kWh
-    pub tibber_tax: Option<f64>,
-    /// Price level from Tibber
+    /// Price level (computed from spot percentiles)
     pub level: Option<PriceLevel>,
-
-    // Calculated comparison
-    /// Tibber markup: `tibber_total` - `spot_sek`
-    pub markup: Option<f64>,
-    /// Markup as percentage: (markup / `spot_sek`) * 100
-    pub markup_percent: Option<f64>,
 }
 
 /// Price level classification
@@ -84,21 +65,6 @@ pub struct PriceStatistics {
     pub median: f64,
 }
 
-/// Analysis of Tibber markup over spot price
-#[derive(Clone, Debug, Serialize)]
-pub struct MarkupAnalysis {
-    /// Average markup in SEK/kWh
-    pub avg_markup_sek: f64,
-    /// Average markup as percentage
-    pub avg_markup_percent: f64,
-    /// True if markup appears to be a fixed fee (low variance)
-    pub is_fixed_fee: bool,
-    /// True if markup appears to be percentage-based (high variance)
-    pub is_percentage: bool,
-    /// Estimated extra monthly cost at 1000 kWh/month
-    pub estimated_monthly_cost: f64,
-}
-
 impl PriceState {
     /// Create a new price state
     pub fn new(price_zone: String) -> Self {
@@ -107,14 +73,12 @@ impl PriceState {
                 current: None,
                 today: Vec::new(),
                 tomorrow: Vec::new(),
-                last_updated: None,
                 price_zone,
-                tibber_available: false,
             })),
         }
     }
 
-    /// Update prices from both sources
+    /// Update prices
     pub fn update_prices(&self, today: Vec<PricePoint>, tomorrow: Vec<PricePoint>) {
         let mut inner = self.inner.lock().unwrap();
 
@@ -134,23 +98,20 @@ impl PriceState {
         inner.current = current.cloned();
         inner.today = today;
         inner.tomorrow = tomorrow;
-        inner.last_updated = Some(SystemTime::now());
-        inner.tibber_available = inner
-            .today
-            .first()
-            .is_some_and(|p| p.tibber_total.is_some());
     }
 
-    /// Get the current price point
+    /// Get the current price point.
     ///
-    /// Recalculates on each request to ensure freshness as price periods change
-    /// every 15 minutes but the fetch loop runs less frequently.
+    /// Returns the slot whose `[starts_at, ends_at)` covers the current time
+    /// from either `today` or `tomorrow`. We search both because the next
+    /// fetch may not have rotated yet just after midnight — but only when the
+    /// tomorrow slot is in the future relative to today's last entry, so we
+    /// don't mask the fact that `today` is genuinely stale.
     pub fn get_current(&self) -> Option<PricePoint> {
         let inner = self.inner.lock().unwrap();
         let now = chrono::Utc::now();
 
-        // First check today's prices
-        if let Some(price) = inner.today.iter().find(|p| {
+        let covers_now = |p: &&PricePoint| -> bool {
             if let (Ok(start), Ok(end)) = (
                 chrono::DateTime::parse_from_rfc3339(&p.starts_at),
                 chrono::DateTime::parse_from_rfc3339(&p.ends_at),
@@ -159,25 +120,25 @@ impl PriceState {
             } else {
                 false
             }
-        }) {
+        };
+
+        if let Some(price) = inner.today.iter().find(covers_now) {
             return Some(price.clone());
         }
 
-        // Fall back to tomorrow's prices (after midnight before new fetch)
-        inner
-            .tomorrow
-            .iter()
-            .find(|p| {
-                if let (Ok(start), Ok(end)) = (
-                    chrono::DateTime::parse_from_rfc3339(&p.starts_at),
-                    chrono::DateTime::parse_from_rfc3339(&p.ends_at),
-                ) {
-                    now >= start && now < end
-                } else {
-                    false
-                }
-            })
-            .cloned()
+        // Today doesn't cover `now`. If today is empty or its range is in the
+        // past, the fetch loop hasn't rotated yet — fall back to tomorrow.
+        // If today's range is in the future, there is no current price
+        // (clock skew or near-midnight window) — return None.
+        let today_in_past = inner
+            .today
+            .last()
+            .and_then(|p| chrono::DateTime::parse_from_rfc3339(&p.ends_at).ok())
+            .is_some_and(|end| now >= end);
+        if inner.today.is_empty() || today_in_past {
+            return inner.tomorrow.iter().find(covers_now).cloned();
+        }
+        None
     }
 
     /// Get today's prices
@@ -192,44 +153,16 @@ impl PriceState {
         inner.tomorrow.clone()
     }
 
-    /// Check if tomorrow's prices are available
-    pub fn tomorrow_available(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        !inner.tomorrow.is_empty()
-    }
-
-    /// Check if Tibber data is available
-    pub fn tibber_available(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.tibber_available
-    }
-
     /// Get the price zone
     pub fn price_zone(&self) -> String {
         let inner = self.inner.lock().unwrap();
         inner.price_zone.clone()
     }
 
-    /// Get last update time
-    pub fn last_updated(&self) -> Option<SystemTime> {
-        let inner = self.inner.lock().unwrap();
-        inner.last_updated
-    }
-
     /// Calculate statistics for spot prices
     #[must_use]
     pub fn get_spot_statistics(prices: &[PricePoint]) -> Option<PriceStatistics> {
         calculate_statistics(prices, |p| p.spot_sek)
-    }
-
-    /// Calculate statistics for Tibber prices
-    #[must_use]
-    pub fn get_tibber_statistics(prices: &[PricePoint]) -> Option<PriceStatistics> {
-        let tibber_prices: Vec<f64> = prices.iter().filter_map(|p| p.tibber_total).collect();
-        if tibber_prices.is_empty() {
-            return None;
-        }
-        calculate_statistics_from_values(&tibber_prices)
     }
 
     /// Get optimal (cheapest) hours in the next 24h
@@ -329,53 +262,6 @@ impl PriceState {
             })
             .cloned()
     }
-
-    /// Analyze Tibber markup over spot price
-    #[allow(clippy::cast_precision_loss)]
-    pub fn analyze_markup(&self) -> Option<MarkupAnalysis> {
-        let inner = self.inner.lock().unwrap();
-
-        let markups: Vec<f64> = inner
-            .today
-            .iter()
-            .chain(inner.tomorrow.iter())
-            .filter_map(|p| p.markup)
-            .collect();
-
-        if markups.is_empty() {
-            return None;
-        }
-
-        let markup_percents: Vec<f64> = inner
-            .today
-            .iter()
-            .chain(inner.tomorrow.iter())
-            .filter_map(|p| p.markup_percent)
-            .collect();
-
-        let avg_markup_sek = markups.iter().sum::<f64>() / markups.len() as f64;
-        let avg_markup_percent = if markup_percents.is_empty() {
-            0.0
-        } else {
-            markup_percents.iter().sum::<f64>() / markup_percents.len() as f64
-        };
-
-        // Calculate variance to determine if fixed fee or percentage
-        let variance = calculate_variance(&markups);
-        let is_fixed_fee = variance < 0.001; // Very low variance = fixed fee
-        let is_percentage = variance > 0.01; // Higher variance = percentage-based
-
-        // Estimate monthly cost at 1000 kWh/month
-        let estimated_monthly_cost = avg_markup_sek * 1000.0;
-
-        Some(MarkupAnalysis {
-            avg_markup_sek,
-            avg_markup_percent,
-            is_fixed_fee,
-            is_percentage,
-            estimated_monthly_cost,
-        })
-    }
 }
 
 /// Calculate statistics from price points using a selector function
@@ -420,49 +306,8 @@ fn calculate_statistics_from_values(values: &[f64]) -> Option<PriceStatistics> {
     })
 }
 
-/// Calculate variance of a list of values
-#[allow(clippy::cast_precision_loss)]
-fn calculate_variance(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let sum_sq_diff: f64 = values.iter().map(|v| (v - mean).powi(2)).sum();
-    sum_sq_diff / values.len() as f64
-}
-
-impl PriceLevel {
-    /// Parse price level from Tibber API string
-    pub fn from_tibber_str(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
-            "VERY_CHEAP" => Some(Self::VeryCheap),
-            "CHEAP" => Some(Self::Cheap),
-            "NORMAL" => Some(Self::Normal),
-            "EXPENSIVE" => Some(Self::Expensive),
-            "VERY_EXPENSIVE" => Some(Self::VeryExpensive),
-            _ => None,
-        }
-    }
-
-    /// Calculate price level based on percentile within a price range
-    pub fn from_percentile(percentile: f64) -> Self {
-        if percentile < 0.25 {
-            Self::VeryCheap
-        } else if percentile < 0.40 {
-            Self::Cheap
-        } else if percentile < 0.60 {
-            Self::Normal
-        } else if percentile < 0.75 {
-            Self::Expensive
-        } else {
-            Self::VeryExpensive
-        }
-    }
-}
-
 impl PricePoint {
-    /// Create a new price point from spot data only
+    /// Create a new price point from spot data
     pub fn from_spot(
         starts_at: String,
         ends_at: String,
@@ -476,43 +321,8 @@ impl PricePoint {
             spot_sek,
             spot_eur,
             exchange_rate,
-            tibber_total: None,
-            tibber_energy: None,
-            tibber_tax: None,
             level: None,
-            markup: None,
-            markup_percent: None,
         }
-    }
-
-    /// Merge Tibber data into this price point
-    pub fn with_tibber(
-        mut self,
-        total: f64,
-        energy: f64,
-        tax: f64,
-        level: Option<PriceLevel>,
-    ) -> Self {
-        self.tibber_total = Some(total);
-        self.tibber_energy = Some(energy);
-        self.tibber_tax = Some(tax);
-        self.level = level;
-
-        // Calculate markup
-        self.markup = Some(total - self.spot_sek);
-        if self.spot_sek.abs() > f64::EPSILON {
-            self.markup_percent = Some((total - self.spot_sek) / self.spot_sek * 100.0);
-        }
-
-        self
-    }
-
-    /// Set calculated price level (when Tibber level not available)
-    pub fn with_calculated_level(mut self, level: PriceLevel) -> Self {
-        if self.level.is_none() {
-            self.level = Some(level);
-        }
-        self
     }
 }
 
@@ -530,7 +340,7 @@ mod tests {
         assert_eq!(state.price_zone(), "SE3");
         assert!(state.get_current().is_none());
         assert!(state.get_today().is_empty());
-        assert!(!state.tomorrow_available());
+        assert!(state.get_tomorrow().is_empty());
     }
 
     #[test]
@@ -545,47 +355,75 @@ mod tests {
 
         assert_float_eq(point.spot_sek, 0.72, "spot_sek");
         assert_float_eq(point.spot_eur, 0.065, "spot_eur");
-        assert!(point.tibber_total.is_none());
-        assert!(point.markup.is_none());
+        assert!(point.level.is_none());
     }
 
     #[test]
-    fn test_price_point_with_tibber() {
-        let point = PricePoint::from_spot(
-            "2026-01-04T14:00:00+01:00".to_string(),
-            "2026-01-04T14:15:00+01:00".to_string(),
-            0.72,
-            0.065,
-            11.08,
-        )
-        .with_tibber(0.85, 0.56, 0.17, Some(PriceLevel::Normal));
+    fn concurrent_reads_during_writes_stay_consistent() {
+        // Smoke test: spam writers and readers in parallel against the same
+        // PriceState. The Mutex makes torn reads impossible by construction,
+        // so the assertion is that every snapshot we observe is one we wrote
+        // (no half-applied update) and the test completes without deadlock.
 
-        assert_float_eq(point.tibber_total.unwrap(), 0.85, "tibber_total");
-        assert_float_eq(point.markup.unwrap(), 0.13, "markup");
-        assert_float_eq(point.markup_percent.unwrap(), 18.0555, "markup_percent");
-        assert_eq!(point.level, Some(PriceLevel::Normal));
-    }
+        // Two distinct snapshots — writes alternate between them. Use unique
+        // spot_sek values so readers can identify which snapshot they saw.
+        let snapshot_a = vec![PricePoint::from_spot(
+            "2026-01-04T00:00:00Z".to_string(),
+            "2026-01-04T00:15:00Z".to_string(),
+            1.0, 0.0, 0.0,
+        )];
+        let snapshot_b = vec![PricePoint::from_spot(
+            "2026-01-04T00:00:00Z".to_string(),
+            "2026-01-04T00:15:00Z".to_string(),
+            2.0, 0.0, 0.0,
+        )];
 
-    #[test]
-    fn test_price_level_from_tibber_str() {
-        assert_eq!(
-            PriceLevel::from_tibber_str("VERY_CHEAP"),
-            Some(PriceLevel::VeryCheap)
-        );
-        assert_eq!(
-            PriceLevel::from_tibber_str("normal"),
-            Some(PriceLevel::Normal)
-        );
-        assert_eq!(PriceLevel::from_tibber_str("INVALID"), None);
-    }
+        let state = PriceState::new("SE3".to_string());
+        // Seed with snapshot_a so readers never see an empty intermediate.
+        state.update_prices(snapshot_a.clone(), Vec::new());
 
-    #[test]
-    fn test_price_level_from_percentile() {
-        assert_eq!(PriceLevel::from_percentile(0.10), PriceLevel::VeryCheap);
-        assert_eq!(PriceLevel::from_percentile(0.30), PriceLevel::Cheap);
-        assert_eq!(PriceLevel::from_percentile(0.50), PriceLevel::Normal);
-        assert_eq!(PriceLevel::from_percentile(0.70), PriceLevel::Expensive);
-        assert_eq!(PriceLevel::from_percentile(0.90), PriceLevel::VeryExpensive);
+        let writer_a = {
+            let state = state.clone();
+            let snap = snapshot_a.clone();
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    state.update_prices(snap.clone(), Vec::new());
+                }
+            })
+        };
+        let writer_b = {
+            let state = state.clone();
+            let snap = snapshot_b.clone();
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    state.update_prices(snap.clone(), Vec::new());
+                }
+            })
+        };
+        let reader = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    let today = state.get_today();
+                    // Every snapshot must be one of the two we wrote — never
+                    // empty, never a mix.
+                    assert_eq!(today.len(), 1, "torn snapshot length");
+                    let spot = today[0].spot_sek;
+                    assert!(
+                        (spot - 1.0).abs() < f64::EPSILON || (spot - 2.0).abs() < f64::EPSILON,
+                        "torn snapshot content: spot={spot}"
+                    );
+                }
+            })
+        };
+
+        writer_a.join().expect("writer_a");
+        writer_b.join().expect("writer_b");
+        reader.join().expect("reader");
+
+        // After all writes complete, the state must hold one of the snapshots.
+        let final_today = state.get_today();
+        assert_eq!(final_today.len(), 1);
     }
 
     #[test]
@@ -602,13 +440,6 @@ mod tests {
         assert_float_eq(stats.max, 1.25, "max");
         assert_float_eq(stats.mean, 0.875, "mean");
         assert_float_eq(stats.median, 0.875, "median"); // (0.75 + 1.0) / 2
-    }
-
-    #[test]
-    fn test_calculate_variance() {
-        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let variance = calculate_variance(&values);
-        assert_float_eq(variance, 2.0, "variance");
     }
 
     fn slot(offset_mins: i64, spot_sek: f64) -> PricePoint {

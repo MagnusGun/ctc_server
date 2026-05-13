@@ -4,11 +4,14 @@
 //! - Winter (Nov 1 - Mar 31): High tariff on weekdays 07:00-20:00, low otherwise
 //! - Summer (Apr 1 - Oct 31): Low tariff 24/7
 //!
-//! Uses Swedish standard time (UTC+1) year-round, ignoring daylight saving time.
-//! Swedish holidays ("röda dagar") are treated as weekends.
+//! Uses Swedish local time (CET in winter, CEST in summer). DST follows the
+//! `Europe/Stockholm` IANA zone via `chrono_tz`. Swedish holidays
+//! ("röda dagar") are treated as weekends.
 
 use std::time::SystemTime;
 
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc};
+use chrono_tz::Europe::Stockholm;
 use serde::Serialize;
 
 /// Tariff mode based on time-of-use pricing
@@ -37,30 +40,61 @@ pub fn get_current_tariff() -> TariffMode {
     get_tariff_at(now)
 }
 
-/// Get tariff mode for a specific time
+/// Get tariff mode for a specific time. The Göteborg Energi tariff calendar
+/// is Swedish-specific, so the timezone is hardcoded to `Europe/Stockholm`
+/// regardless of the deployment's local time.
 #[must_use]
 pub fn get_tariff_at(time: SystemTime) -> TariffMode {
-    let (year, month, day, hour) = system_time_to_swedish(time);
+    let (year, month, day, hour) = system_time_to_local(time, Stockholm);
     let weekday = day_of_week(year, month, day);
 
     is_high_tariff(year, month, day, hour, weekday)
 }
 
-/// Convert `SystemTime` to Swedish standard time components (UTC+1)
-fn system_time_to_swedish(time: SystemTime) -> (i32, u32, u32, u32) {
-    let duration = time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
+/// Convert `SystemTime` to local time components in the given timezone,
+/// accounting for DST.
+pub(crate) fn system_time_to_local(
+    time: SystemTime,
+    tz: chrono_tz::Tz,
+) -> (i32, u32, u32, u32) {
+    let utc: DateTime<Utc> = time.into();
+    let local = utc.with_timezone(&tz);
+    (local.year(), local.month(), local.day(), local.hour())
+}
 
-    // Add 1 hour for Swedish standard time (UTC+1)
-    let secs = duration.as_secs() + 3600;
+/// Return the UTC Unix-seconds of local midnight on the given date in `tz`.
+/// On the ambiguous fall-back day (rare — most IANA zones jump at 02:00 or
+/// 03:00, never midnight) the earliest mapping is chosen.
+pub(crate) fn local_midnight_utc_secs(
+    year: i32,
+    month: u32,
+    day: u32,
+    tz: chrono_tz::Tz,
+) -> u64 {
+    let naive = NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .expect("valid local date");
+    let local = tz
+        .from_local_datetime(&naive)
+        .earliest()
+        .expect("local midnight is unambiguous in practice");
+    #[allow(clippy::cast_sign_loss)]
+    {
+        local.timestamp() as u64
+    }
+}
 
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hour = (time_of_day / 3600) as u32;
-
-    let (year, month, day) = days_to_ymd(days);
-    (year, month, day, hour)
+/// Day-of-month of the last Sunday in the given month.
+///
+/// Only used by test helpers now that DST handling moved to `chrono_tz`; kept
+/// behind `#[cfg(test)]` so it doesn't trip the dead-code lint.
+#[cfg(test)]
+fn last_sunday_of_month(year: i32, month: u32) -> u32 {
+    // Months Mar and Oct always have 31 days.
+    let last_day = 31u32;
+    let weekday = day_of_week(year, month, last_day);
+    // weekday 0 = Sunday. Subtract weekday days to reach the most recent Sunday.
+    last_day - weekday
 }
 
 /// Determine if high tariff applies based on date/time
@@ -153,27 +187,6 @@ fn calculate_easter(year: i32) -> (u32, u32) {
     (month as u32, day as u32)
 }
 
-/// Convert days since Unix epoch to (year, month, day)
-#[allow(clippy::similar_names)]
-// doe/doy are standard names in Howard Hinnant's date algorithm
-fn days_to_ymd(days: u64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let year = if m <= 2 { y + 1 } else { y } as i32;
-
-    #[allow(clippy::cast_possible_truncation)]
-    (year, m as u32, d as u32)
-}
-
 /// Convert (year, month, day) to days since Unix epoch
 #[allow(clippy::similar_names)]
 // doy/day are different: doy = day of year, day = day of month
@@ -204,11 +217,20 @@ mod tests {
     use std::time::Duration;
 
     fn make_time(year: i32, month: u32, day: u32, hour: u32) -> SystemTime {
-        // Convert to UTC (subtract 1 hour from Swedish time)
+        // Convert Swedish local time to UTC. Use a coarse DST check on the
+        // local date (good enough for test inputs that never sit on the
+        // ambiguous transition hour itself).
+        let local_is_cest = match month {
+            4..=9 => true,
+            3 => day >= last_sunday_of_month(year, 3),
+            10 => day < last_sunday_of_month(year, 10),
+            _ => false,
+        };
+        let offset_secs: i64 = if local_is_cest { 7200 } else { 3600 };
         let days = ymd_to_days(year, month, day);
         #[allow(clippy::cast_sign_loss)]
         // days is always positive for dates after 1970
-        let secs = (days * 86400 + i64::from(hour) * 3600 - 3600) as u64;
+        let secs = (days * 86400 + i64::from(hour) * 3600 - offset_secs) as u64;
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
@@ -312,6 +334,44 @@ mod tests {
         assert_eq!(get_tariff_at(time), TariffMode::Low);
     }
 
+    /// Parametric sweep across a 20-year window. Reference dates from the
+    /// Swedish Almanacka / Catholic Easter tables. Guards against subtle
+    /// drift in the Anonymous Gregorian implementation that single-year
+    /// tests would miss.
+    #[test]
+    fn test_easter_parametric_sweep() {
+        let cases: &[(i32, u32, u32)] = &[
+            (2010, 4, 4),
+            (2011, 4, 24),
+            (2012, 4, 8),
+            (2013, 3, 31),
+            (2014, 4, 20),
+            (2015, 4, 5),
+            (2016, 3, 27),
+            (2017, 4, 16),
+            (2018, 4, 1),
+            (2019, 4, 21),
+            (2020, 4, 12),
+            (2021, 4, 4),
+            (2022, 4, 17),
+            (2023, 4, 9),
+            (2024, 3, 31),
+            (2025, 4, 20),
+            (2026, 4, 5),
+            (2027, 3, 28),
+            (2028, 4, 16),
+            (2029, 4, 1),
+            (2030, 4, 21),
+        ];
+        for &(year, month, day) in cases {
+            assert_eq!(
+                calculate_easter(year),
+                (month, day),
+                "Easter Sunday for {year} should be {month:02}-{day:02}"
+            );
+        }
+    }
+
     #[test]
     fn test_day_of_week() {
         // January 1, 1970 was Thursday (4)
@@ -353,5 +413,94 @@ mod tests {
         // March 31, 2025 at 06:00 - low (outside peak hours)
         let time = make_time(2025, 3, 31, 6);
         assert_eq!(get_tariff_at(time), TariffMode::Low);
+    }
+
+    #[test]
+    fn test_last_sunday_of_month() {
+        // DST 2025: spring forward Mar 30, fall back Oct 26.
+        assert_eq!(last_sunday_of_month(2025, 3), 30);
+        assert_eq!(last_sunday_of_month(2025, 10), 26);
+        // DST 2026: spring forward Mar 29, fall back Oct 25.
+        assert_eq!(last_sunday_of_month(2026, 3), 29);
+        assert_eq!(last_sunday_of_month(2026, 10), 25);
+    }
+
+    #[test]
+    fn test_summer_dst_conversion() {
+        // 2026-07-15 12:00 UTC should map to 14:00 Swedish local (CEST).
+        let days = ymd_to_days(2026, 7, 15);
+        #[allow(clippy::cast_sign_loss)]
+        let secs = (days * 86400 + 12 * 3600) as u64;
+        let utc = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let (y, mo, d, h) = system_time_to_local(utc, Stockholm);
+        assert_eq!((y, mo, d, h), (2026, 7, 15, 14));
+    }
+
+    #[test]
+    fn test_spring_dst_transition() {
+        // 2026 last Sunday of March is the 29th. At 00:00 UTC it's still CET
+        // (Swedish local 01:00). At 01:00 UTC the clock jumps to 03:00 CEST.
+        let days = ymd_to_days(2026, 3, 29);
+
+        #[allow(clippy::cast_sign_loss)]
+        let utc_before = SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400) as u64);
+        let (_, _, _, h_before) = system_time_to_local(utc_before, Stockholm);
+        assert_eq!(h_before, 1); // 00:00 UTC -> 01:00 CET
+
+        #[allow(clippy::cast_sign_loss)]
+        let utc_after =
+            SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400 + 2 * 3600) as u64);
+        let (y, mo, d, h_after) = system_time_to_local(utc_after, Stockholm);
+        assert_eq!((y, mo, d, h_after), (2026, 3, 29, 4)); // 02:00 UTC -> 04:00 CEST
+    }
+
+    #[test]
+    fn test_fall_dst_transition() {
+        // 2025 last Sunday of October is the 26th. At 00:00 UTC it's still
+        // CEST (Swedish local 02:00). At 01:00 UTC the clock falls back to
+        // 02:00 CET.
+        let days = ymd_to_days(2025, 10, 26);
+
+        #[allow(clippy::cast_sign_loss)]
+        let utc_before = SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400) as u64);
+        let (_, _, _, h_before) = system_time_to_local(utc_before, Stockholm);
+        assert_eq!(h_before, 2); // 00:00 UTC -> 02:00 CEST
+
+        #[allow(clippy::cast_sign_loss)]
+        let utc_after = SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400 + 3600) as u64);
+        let (_, _, _, h_after) = system_time_to_local(utc_after, Stockholm);
+        assert_eq!(h_after, 2); // 01:00 UTC -> 02:00 CET
+    }
+
+    /// During fall-back Sunday, two distinct UTC instants both map to local
+    /// 02:30. Each instant is unambiguous on the Unix timeline, but the
+    /// presented local time is ambiguous. The tariff lookup must still pick
+    /// `Low` consistently for both (Sunday is always low, regardless of hour),
+    /// so a peak straddling the rollback is not double-counted under "high"
+    /// for the second pass through the 02:00 hour.
+    #[test]
+    fn test_tariff_at_fall_back_ambiguous_hour_is_consistent() {
+        let days = ymd_to_days(2025, 10, 26);
+        // 00:30 UTC (= 02:30 CEST, pre fall-back)
+        #[allow(clippy::cast_sign_loss)]
+        let pre = SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400 + 1800) as u64);
+        // 01:30 UTC (= 02:30 CET, post fall-back)
+        #[allow(clippy::cast_sign_loss)]
+        let post = SystemTime::UNIX_EPOCH + Duration::from_secs((days * 86400 + 3600 + 1800) as u64);
+        assert_eq!(get_tariff_at(pre), TariffMode::Low);
+        assert_eq!(get_tariff_at(post), TariffMode::Low);
+    }
+
+    /// Non-Stockholm timezone: the same UTC instant maps to a different local
+    /// (year, month, day, hour) tuple when interpreted in `America/New_York`.
+    /// On 2026-07-15 the zone is in EDT (UTC-4).
+    #[test]
+    fn system_time_to_local_handles_non_stockholm_tz() {
+        let days = ymd_to_days(2026, 7, 15);
+        #[allow(clippy::cast_sign_loss)]
+        let utc = SystemTime::UNIX_EPOCH
+            + Duration::from_secs((days * 86400 + 12 * 3600) as u64);
+        let (y, mo, d, h) = system_time_to_local(utc, chrono_tz::America::New_York);
+        assert_eq!((y, mo, d, h), (2026, 7, 15, 8));
     }
 }

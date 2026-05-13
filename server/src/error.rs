@@ -177,6 +177,48 @@ impl fmt::Display for ModbusError {
 
 impl std::error::Error for ModbusError {}
 
+impl ModbusError {
+    /// Returns true if this error is potentially transient and worth retrying.
+    ///
+    /// Permanent errors (read-only writes, range/step validation failures,
+    /// visibility issues, illegal address/function exception codes) will never
+    /// succeed on retry and should fail fast.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // Permanent: client/programming errors that retrying cannot fix
+            Self::ReadOnly { .. }
+            | Self::OutOfRange { .. }
+            | Self::InvalidStep { .. }
+            | Self::InvalidAlarmInfoValue(_)
+            | Self::ParameterNotVisible { .. }
+            | Self::VisibilityNotScanned
+            | Self::InvalidVisibilityRegister(_) => false,
+
+            // ProtocolError is ambiguous: tokio-modbus folds exception codes
+            // into it. If the reason mentions an illegal address/function
+            // exception, classify as permanent; otherwise treat as transient.
+            Self::ProtocolError { reason } => !is_illegal_exception(reason),
+
+            // Transient: I/O and bus issues that may clear on retry
+            Self::SerialError { .. }
+            | Self::ReadError { .. }
+            | Self::WriteError { .. }
+            | Self::Timeout { .. }
+            | Self::ValidationReadError { .. }
+            | Self::VerificationError { .. } => true,
+        }
+    }
+}
+
+/// Detect Modbus "illegal" exception codes (0x01 illegal function, 0x02
+/// illegal data address) folded into a `ProtocolError` reason string.
+fn is_illegal_exception(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("illegal function")
+        || lower.contains("illegal data address")
+        || lower.contains("illegal address")
+}
+
 /// API-level errors returned to clients
 ///
 /// These errors map to HTTP status codes and expose minimal information
@@ -226,8 +268,11 @@ impl From<ModbusError> for ApiError {
             | ModbusError::InvalidStep { .. }
             | ModbusError::InvalidAlarmInfoValue(_) => Self::BadRequest,
 
-            // Parameter not available on this hardware
-            ModbusError::ParameterNotVisible { .. } => Self::NotFound,
+            // Parameter not available on this hardware, or caller asked for
+            // a visibility register outside the known range
+            ModbusError::ParameterNotVisible { .. } | ModbusError::InvalidVisibilityRegister(_) => {
+                Self::NotFound
+            }
 
             // Timeout errors
             ModbusError::Timeout { .. } => Self::Timeout,
@@ -239,16 +284,17 @@ impl From<ModbusError> for ApiError {
             | ModbusError::SerialError { .. }
             | ModbusError::ProtocolError { .. }
             | ModbusError::VerificationError { .. }
-            | ModbusError::VisibilityNotScanned
-            | ModbusError::InvalidVisibilityRegister(_) => Self::InternalError,
+            | ModbusError::VisibilityNotScanned => Self::InternalError,
         }
     }
 }
 
 /// Implement Axum's `IntoResponse` for `ApiError`
 ///
-/// Returns only the HTTP status code to clients, no body.
-/// This minimizes information exposure.
+/// Returns only the HTTP status code to clients, with no body. This
+/// deliberately hides internal Modbus register addresses (e.g. "register
+/// 62500") that appear in `ModbusError`'s `Display` impl — those are useful
+/// for server-side logs but must not be exposed to API clients.
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self {
@@ -259,7 +305,7 @@ impl IntoResponse for ApiError {
             Self::Timeout => StatusCode::REQUEST_TIMEOUT,
         };
 
-        // Return only status code, no body
+        // Return only the status code; never propagate ModbusError details.
         status.into_response()
     }
 }
@@ -618,10 +664,10 @@ mod tests {
     }
 
     #[test]
-    fn test_modbus_to_api_error_invalid_visibility_register_is_internal() {
+    fn test_modbus_to_api_error_invalid_visibility_register_is_not_found() {
         let modbus_err = ModbusError::InvalidVisibilityRegister(65000);
         let api_err: ApiError = modbus_err.into();
-        assert_eq!(get_status_code(api_err), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(get_status_code(api_err), StatusCode::NOT_FOUND);
     }
 
     #[test]

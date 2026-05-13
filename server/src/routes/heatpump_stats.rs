@@ -64,7 +64,7 @@ async fn get_history(
 ) -> Result<String, ApiError> {
     debug!("get_heatpump_history: START");
 
-    let days = query.days.unwrap_or(30).min(365);
+    let days = query.days.unwrap_or(30).clamp(1, 365);
     let response = stats.get_history(days);
 
     debug!(
@@ -85,18 +85,22 @@ async fn get_history(
 mod tests {
     use super::*;
 
+    fn parse(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("response is valid JSON")
+    }
+
     #[tokio::test]
     async fn test_get_stats() {
         let stats = HeatPumpStats::new();
 
-        let result = get_stats(State(stats)).await;
-        assert!(result.is_ok());
+        let json = get_stats(State(stats)).await.expect("get_stats");
+        let v = parse(&json);
 
-        let json = result.unwrap();
-        assert!(json.contains("compressor_on"));
-        assert!(json.contains("starts"));
-        assert!(json.contains("operating_hours"));
-        assert!(json.contains("tracking"));
+        assert_eq!(v["compressor_on"].as_bool(), Some(false));
+        assert_eq!(v["starts"]["this_hour"].as_u64(), Some(0));
+        assert_eq!(v["starts"]["this_day"].as_u64(), Some(0));
+        assert_eq!(v["operating_hours"]["this_hour"].as_f64(), Some(0.0));
+        assert!(v["tracking"]["started_at"].is_string());
     }
 
     #[tokio::test]
@@ -108,44 +112,47 @@ mod tests {
         stats.update_state(3, Some(-5.0)); // Compressor ON (observed start)
         stats.update_state(0, Some(-5.0)); // Compressor OFF (cycle complete)
 
-        let result = get_stats(State(stats)).await;
-        assert!(result.is_ok());
+        let json = get_stats(State(stats)).await.expect("get_stats");
+        let v = parse(&json);
 
-        let json = result.unwrap();
-        assert!(json.contains("cycle_stats"));
-        assert!(json.contains("min_secs"));
-        assert!(json.contains("max_secs"));
+        let cycle_stats = &v["cycle_stats"];
+        assert!(cycle_stats.is_object(), "cycle_stats should be populated");
+        assert!(cycle_stats["min_secs"].is_u64());
+        assert!(cycle_stats["max_secs"].is_u64());
+        assert_eq!(cycle_stats["cycle_count"].as_u64(), Some(1));
     }
 
     #[tokio::test]
     async fn test_get_history_default_days() {
         let stats = HeatPumpStats::new();
 
-        let result = get_history(State(stats), Query(HistoryQuery { days: None })).await;
-        assert!(result.is_ok());
+        let json = get_history(State(stats), Query(HistoryQuery { days: None }))
+            .await
+            .expect("get_history");
+        let v = parse(&json);
 
-        let json = result.unwrap();
-        assert!(json.contains("cycles"));
-        assert!(json.contains("daily"));
+        assert!(v["cycles"].is_array());
+        assert!(v["daily"].is_array());
     }
 
     #[tokio::test]
     async fn test_get_history_custom_days() {
         let stats = HeatPumpStats::new();
 
-        let result = get_history(State(stats), Query(HistoryQuery { days: Some(7) })).await;
-        assert!(result.is_ok());
+        let json = get_history(State(stats), Query(HistoryQuery { days: Some(7) }))
+            .await
+            .expect("get_history");
+        let v = parse(&json);
 
-        let json = result.unwrap();
-        assert!(json.contains("cycles"));
-        assert!(json.contains("daily"));
+        assert!(v["cycles"].is_array());
+        assert!(v["daily"].is_array());
     }
 
     #[tokio::test]
     async fn test_get_history_max_days_capped() {
         let stats = HeatPumpStats::new();
 
-        // Request 1000 days - should be capped at 365
+        // Request 1000 days - should be capped at 365 (no panic, returns ok)
         let result = get_history(State(stats), Query(HistoryQuery { days: Some(1000) })).await;
         assert!(result.is_ok());
     }
@@ -160,12 +167,20 @@ mod tests {
             stats.update_state(0, Some(temp));
         }
 
-        let result = get_history(State(stats), Query(HistoryQuery { days: Some(30) })).await;
-        assert!(result.is_ok());
+        let json = get_history(State(stats), Query(HistoryQuery { days: Some(30) }))
+            .await
+            .expect("get_history");
+        let v = parse(&json);
 
-        let json = result.unwrap();
-        // Should have 3 cycles in history
-        assert!(json.contains("duration_secs"));
-        assert!(json.contains("outdoor_temp_c"));
+        let cycles = v["cycles"].as_array().expect("cycles array");
+        // 2 of 3 iterations record: the first 3→0 transition is preceded by
+        // initialization (not an observed start), so the partial cycle is
+        // skipped. The remaining two iterations both record full cycles.
+        assert_eq!(cycles.len(), 2);
+        for c in cycles {
+            assert!(c["duration_secs"].is_u64());
+            // outdoor_temp_c is Option<f32>; tolerate both null and numeric.
+            assert!(c["outdoor_temp_c"].is_number() || c["outdoor_temp_c"].is_null());
+        }
     }
 }

@@ -9,6 +9,11 @@ services:
     container_name: ctc_server
     platform: linux/arm64
 
+    # Headroom for the final store.flush() on `compose stop|down|restart`.
+    # A redb commit is ms-fast in practice, but Docker's default 10s could
+    # be tight on a heavily loaded Pi.
+    stop_grace_period: 30s
+
     # Map serial device and GPIO from host (adjust for your device)
     devices:
       - /dev/ttyAMA4:/dev/ttyAMA4
@@ -25,8 +30,13 @@ services:
       - CTC_SERVER_PORT=3000
       - CTC_SERIAL_DEFAULT_PORT=/dev/ttyAMA4
       - CTC_POWERSAVE=${CTC_POWERSAVE:-false}
-      # Persist heatpump statistics across container restarts
-      # (the file is created on first run inside /app/data which is bind-mounted)
+      # Redb store path. Sensor cache, heatpump stats, and trend history all
+      # live in this single file inside the bind-mounted /app/data directory,
+      # so they survive `docker compose down|up` automatically.
+      - CTC_STORAGE_DB_PATH=/app/data/ctc.redb
+      # Legacy heatpump-stats JSON path. Kept for the one-shot migration on
+      # first boot — once migrated, the file is renamed `.migrated` and this
+      # variable is harmless. Safe to remove in a later cleanup commit.
       - CTC_HEATPUMP_STATS_PERSIST_PATH=/app/data/heatpump_stats.json
       # Tibber integration for real-time consumption tracking
       - CTC_TIBBER_ENABLED=${TIBBER_ENABLED:-false}

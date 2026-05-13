@@ -36,12 +36,14 @@ impl SmartGridMode {
 }
 
 impl std::fmt::Display for SmartGridMode {
+    /// Canonical lowercase form so `mode.to_string().parse()` round-trips
+    /// without depending on `to_lowercase()` normalization.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Normal => write!(f, "Normal"),
-            Self::Blocking => write!(f, "Blocking"),
-            Self::LowPrice => write!(f, "LowPrice"),
-            Self::Overcapacity => write!(f, "Overcapacity"),
+            Self::Normal => write!(f, "normal"),
+            Self::Blocking => write!(f, "blocking"),
+            Self::LowPrice => write!(f, "low_price"),
+            Self::Overcapacity => write!(f, "overcapacity"),
         }
     }
 }
@@ -74,10 +76,23 @@ mod tests {
 
     #[test]
     fn test_display() {
-        assert_eq!(SmartGridMode::Normal.to_string(), "Normal");
-        assert_eq!(SmartGridMode::Blocking.to_string(), "Blocking");
-        assert_eq!(SmartGridMode::LowPrice.to_string(), "LowPrice");
-        assert_eq!(SmartGridMode::Overcapacity.to_string(), "Overcapacity");
+        assert_eq!(SmartGridMode::Normal.to_string(), "normal");
+        assert_eq!(SmartGridMode::Blocking.to_string(), "blocking");
+        assert_eq!(SmartGridMode::LowPrice.to_string(), "low_price");
+        assert_eq!(SmartGridMode::Overcapacity.to_string(), "overcapacity");
+    }
+
+    #[test]
+    fn test_display_round_trips_through_from_str() {
+        for mode in [
+            SmartGridMode::Normal,
+            SmartGridMode::Blocking,
+            SmartGridMode::LowPrice,
+            SmartGridMode::Overcapacity,
+        ] {
+            let s = mode.to_string();
+            assert_eq!(s.parse::<SmartGridMode>().unwrap(), mode);
+        }
     }
 
     #[test]

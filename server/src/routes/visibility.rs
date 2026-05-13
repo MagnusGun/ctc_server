@@ -10,11 +10,29 @@ use axum::{
     extract::{Path, State},
     routing::get,
 };
+use serde::Serialize;
 use tracing::{debug, error};
 
 use crate::error::ApiError;
 use crate::modbus::bms_parameters::get_ctc_parameter_by_id;
 use crate::modbus::{ModbusResponse, ModbusSender, ParameterOperation};
+
+/// Response body for `GET /api/v1/visibility/parameter/{addr}`.
+///
+/// Field order matches the original hand-rolled JSON so the wire format
+/// is preserved. `note` is omitted when absent (matching the original
+/// "known parameter, visible" branch which had no `note`); other optional
+/// fields serialise as JSON `null` when `None`.
+#[derive(Serialize)]
+struct ParameterVisibilityResponse {
+    address: u16,
+    visible: Option<bool>,
+    description: Option<&'static str>,
+    visibility_register: Option<u16>,
+    bit: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'static str>,
+}
 
 /// First visibility register address (inclusive)
 const VISIBILITY_REG_START: u16 = 62500;
@@ -114,7 +132,8 @@ async fn get_visibility(
 /// Get all visibility registers
 /// GET /api/v1/visibility
 ///
-/// Returns all 49 visibility registers (62500-62548) with their bitmask values.
+/// Returns all visibility registers in the configured range (62500-62548 by
+/// default) with their bitmask values.
 ///
 /// Response format:
 /// ```json
@@ -122,8 +141,7 @@ async fn get_visibility(
 ///   "registers": [
 ///     {"register": 62500, "value": 65535, "hex": "0xFFFF"},
 ///     ...
-///   ],
-///   "count": 49
+///   ]
 /// }
 /// ```
 async fn get_all_visibility(State(state): State<VisibilityState>) -> Result<String, ApiError> {
@@ -162,9 +180,8 @@ async fn get_all_visibility(State(state): State<VisibilityState>) -> Result<Stri
                 .collect();
 
             Ok(format!(
-                "{{\"registers\": [{}], \"count\": {}}}\n",
-                registers_json.join(", "),
-                values.len()
+                "{{\"registers\": [{}]}}\n",
+                registers_json.join(", ")
             ))
         }
         Ok(Ok(Ok(ModbusResponse::Value(_)))) => {
@@ -217,6 +234,7 @@ async fn get_all_visibility(State(state): State<VisibilityState>) -> Result<Stri
 ///   "note": "Parameter not in BMS catalog - visibility unknown"
 /// }
 /// ```
+#[allow(clippy::too_many_lines)]
 async fn get_parameter_visibility(
     State(state): State<VisibilityState>,
     Path(addr): Path<u16>,
@@ -230,9 +248,15 @@ async fn get_parameter_visibility(
             "get_parameter_visibility: Parameter {} not in BMS catalog",
             addr
         );
-        return Ok(format!(
-            "{{\"address\": {addr}, \"visible\": null, \"description\": null, \"visibility_register\": null, \"bit\": null, \"note\": \"Parameter not in BMS catalog - visibility unknown\"}}\n"
-        ));
+        let response = ParameterVisibilityResponse {
+            address: addr,
+            visible: None,
+            description: None,
+            visibility_register: None,
+            bit: None,
+            note: Some("Parameter not in BMS catalog - visibility unknown"),
+        };
+        return serialize_response(&response);
     };
 
     // Parameter found - check its visibility
@@ -246,10 +270,15 @@ async fn get_parameter_visibility(
                 "get_parameter_visibility: Parameter {} is always visible",
                 addr
             );
-            return Ok(format!(
-                "{{\"address\": {addr}, \"visible\": true, \"description\": \"{}\", \"visibility_register\": null, \"bit\": null, \"note\": \"Always visible (no visibility check required)\"}}\n",
-                p.description
-            ));
+            let response = ParameterVisibilityResponse {
+                address: addr,
+                visible: Some(true),
+                description: Some(p.description),
+                visibility_register: None,
+                bit: None,
+                note: Some("Always visible (no visibility check required)"),
+            };
+            return serialize_response(&response);
         }
         error!(
             "get_parameter_visibility: Invalid visibility register {} for parameter {}",
@@ -280,10 +309,15 @@ async fn get_parameter_visibility(
                 "get_parameter_visibility: SUCCESS - addr={}, visible={}, vis_reg={}, bit={}",
                 addr, is_visible, vis_register, p.bit
             );
-            Ok(format!(
-                "{{\"address\": {addr}, \"visible\": {is_visible}, \"description\": \"{}\", \"visibility_register\": {vis_register}, \"bit\": {}}}\n",
-                p.description, p.bit
-            ))
+            let response = ParameterVisibilityResponse {
+                address: addr,
+                visible: Some(is_visible),
+                description: Some(p.description),
+                visibility_register: Some(vis_register),
+                bit: Some(p.bit),
+                note: None,
+            };
+            serialize_response(&response)
         }
         Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
             error!("get_parameter_visibility: Unexpected RawRegisters response");
@@ -308,6 +342,15 @@ async fn get_parameter_visibility(
             Err(ApiError::Timeout)
         }
     }
+}
+
+fn serialize_response(resp: &ParameterVisibilityResponse) -> Result<String, ApiError> {
+    let mut json = serde_json::to_string(resp).map_err(|e| {
+        error!("get_parameter_visibility: Failed to serialize response - {e}");
+        ApiError::InternalError
+    })?;
+    json.push('\n');
+    Ok(json)
 }
 
 #[cfg(test)]
@@ -345,13 +388,12 @@ mod tests {
                 .unwrap();
         }
 
-        let result = handle.await.unwrap();
-        assert!(result.is_ok());
-        let json = result.unwrap();
-        assert!(json.contains("\"register\": 62500"));
-        assert!(json.contains("\"value\": 65535"));
-        assert!(json.contains("\"hex\": \"0xFFFF\""));
-        assert!(json.contains("\"bits\": \"1111111111111111\""));
+        let json = handle.await.unwrap().expect("get_visibility");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["register"].as_u64(), Some(62500));
+        assert_eq!(v["value"].as_u64(), Some(65535));
+        assert_eq!(v["hex"].as_str(), Some("0xFFFF"));
+        assert_eq!(v["bits"].as_str(), Some("1111111111111111"));
     }
 
     #[tokio::test]
@@ -370,7 +412,7 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+        assert!(matches!(result.unwrap_err(), ApiError::NotFound));
     }
 
     #[tokio::test]
@@ -419,13 +461,12 @@ mod tests {
             response_tx.send(Ok(ModbusResponse::Value(5.0))).unwrap();
         }
 
-        let result = handle.await.unwrap();
-        assert!(result.is_ok());
-        let json = result.unwrap();
-        assert!(json.contains("\"register\": 62510"));
-        assert!(json.contains("\"value\": 5"));
-        assert!(json.contains("\"hex\": \"0x0005\""));
-        assert!(json.contains("\"bits\": \"0000000000000101\""));
+        let json = handle.await.unwrap().expect("get_visibility");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["register"].as_u64(), Some(62510));
+        assert_eq!(v["value"].as_u64(), Some(5));
+        assert_eq!(v["hex"].as_str(), Some("0x0005"));
+        assert_eq!(v["bits"].as_str(), Some("0000000000000101"));
     }
 
     // Tests for get_all_visibility
@@ -446,18 +487,18 @@ mod tests {
                 .unwrap();
         }
 
-        let result = handle.await.unwrap();
-        assert!(result.is_ok());
-        let json = result.unwrap();
-        assert!(json.contains("\"registers\":"));
-        assert!(json.contains("\"count\": 3"));
-        assert!(json.contains("\"register\": 62500"));
-        assert!(json.contains("\"value\": 65535"));
-        assert!(json.contains("\"hex\": \"0xFFFF\""));
-        assert!(json.contains("\"register\": 62501"));
-        assert!(json.contains("\"value\": 0"));
-        assert!(json.contains("\"register\": 62502"));
-        assert!(json.contains("\"value\": 5"));
+        let json = handle.await.unwrap().expect("get_all_visibility");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let regs = v["registers"].as_array().expect("registers array");
+        assert_eq!(regs.len(), 3);
+        let expected = [(62500u64, 65535u64, "0xFFFF"),
+                        (62501,     0,     "0x0000"),
+                        (62502,     5,     "0x0005")];
+        for (i, (reg, val, hex)) in expected.iter().enumerate() {
+            assert_eq!(regs[i]["register"].as_u64(), Some(*reg));
+            assert_eq!(regs[i]["value"].as_u64(), Some(*val));
+            assert_eq!(regs[i]["hex"].as_str(), Some(*hex));
+        }
     }
 
     #[tokio::test]
@@ -506,14 +547,13 @@ mod tests {
             response_tx.send(Ok(ModbusResponse::Value(512.0))).unwrap();
         }
 
-        let result = handle.await.unwrap();
-        assert!(result.is_ok());
-        let json = result.unwrap();
-        assert!(json.contains("\"address\": 61509"));
-        assert!(json.contains("\"visible\": true"));
-        assert!(json.contains("\"visibility_register\": 62500"));
-        assert!(json.contains("\"bit\": 9"));
-        assert!(json.contains("\"description\":"));
+        let json = handle.await.unwrap().expect("get_parameter_visibility");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["address"].as_u64(), Some(61509));
+        assert_eq!(v["visible"].as_bool(), Some(true));
+        assert_eq!(v["visibility_register"].as_u64(), Some(62500));
+        assert_eq!(v["bit"].as_u64(), Some(9));
+        assert!(v["description"].is_string());
     }
 
     #[tokio::test]
@@ -531,11 +571,10 @@ mod tests {
             response_tx.send(Ok(ModbusResponse::Value(256.0))).unwrap();
         }
 
-        let result = handle.await.unwrap();
-        assert!(result.is_ok());
-        let json = result.unwrap();
-        assert!(json.contains("\"address\": 61509"));
-        assert!(json.contains("\"visible\": false"));
+        let json = handle.await.unwrap().expect("get_parameter_visibility");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["address"].as_u64(), Some(61509));
+        assert_eq!(v["visible"].as_bool(), Some(false));
     }
 
     #[tokio::test]
@@ -545,12 +584,15 @@ mod tests {
         // Use an address that doesn't exist in the BMS catalog (valid u16)
         let result = get_parameter_visibility(State(state), Path(64000)).await;
 
-        assert!(result.is_ok());
-        let json = result.unwrap();
-        assert!(json.contains("\"address\": 64000"));
-        assert!(json.contains("\"visible\": null"));
-        assert!(json.contains("\"description\": null"));
-        assert!(json.contains("\"note\": \"Parameter not in BMS catalog"));
+        let json = result.expect("get_parameter_visibility");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["address"].as_u64(), Some(64000));
+        assert!(v["visible"].is_null());
+        assert!(v["description"].is_null());
+        assert_eq!(
+            v["note"].as_str(),
+            Some("Parameter not in BMS catalog - visibility unknown")
+        );
     }
 
     #[tokio::test]
@@ -560,11 +602,14 @@ mod tests {
         // CTC_ALARM_INFO_COUNT (65001) has visibility register 0 (always visible)
         let result = get_parameter_visibility(State(state), Path(65001)).await;
 
-        assert!(result.is_ok());
-        let json = result.unwrap();
-        assert!(json.contains("\"address\": 65001"));
-        assert!(json.contains("\"visible\": true"));
-        assert!(json.contains("\"note\": \"Always visible"));
+        let json = result.expect("get_parameter_visibility");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["address"].as_u64(), Some(65001));
+        assert_eq!(v["visible"].as_bool(), Some(true));
+        assert_eq!(
+            v["note"].as_str(),
+            Some("Always visible (no visibility check required)")
+        );
     }
 
     #[tokio::test]

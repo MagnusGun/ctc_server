@@ -1,20 +1,21 @@
-//! Tibber WebSocket client for real-time live measurements and price data
+//! Tibber WebSocket client for real-time live measurements
 //!
 //! Connects to Tibber's WebSocket API to receive real-time power consumption
-//! data from Tibber Pulse devices. Also provides REST API access for price
-//! information with `QUARTER_HOURLY` (15-minute) resolution.
+//! data from Tibber Pulse devices.
 
 use std::time::{Duration, SystemTime};
 
+use chrono_tz::Tz;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
 use super::grid::GridState;
-use super::tariff::{TariffMode, get_tariff_at};
+use super::tariff::{TariffMode, get_tariff_at, system_time_to_local};
 
 const TIBBER_WS_URL: &str = "wss://websocket-api.tibber.com/v1-beta/gql/subscriptions";
 const TIBBER_API_URL: &str = "https://api.tibber.com/v1-beta/gql";
@@ -121,200 +122,88 @@ struct Home {
     id: String,
 }
 
-// ============================================================================
-// Price API types
-// ============================================================================
-
-/// Price API response wrapper
-#[derive(Debug, Deserialize)]
-struct PriceResponse {
-    data: Option<PriceData>,
-    errors: Option<Vec<GraphQLError>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphQLError {
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PriceData {
-    viewer: PriceViewer,
-}
-
-#[derive(Debug, Deserialize)]
-struct PriceViewer {
-    homes: Vec<PriceHome>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PriceHome {
-    #[serde(rename = "currentSubscription")]
-    current_subscription: Option<Subscription>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Subscription {
-    #[serde(rename = "priceInfo")]
-    price_info: Option<PriceInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PriceInfo {
-    current: Option<TibberPrice>,
-    today: Vec<TibberPrice>,
-    tomorrow: Vec<TibberPrice>,
-}
-
-/// Single price point from Tibber API
-#[derive(Debug, Clone, Deserialize)]
-pub struct TibberPrice {
-    /// Total price in SEK/kWh (what you pay)
-    pub total: f64,
-    /// Energy component in SEK/kWh
-    pub energy: f64,
-    /// Tax component in SEK/kWh
-    pub tax: f64,
-    /// Start time (ISO 8601)
-    #[serde(rename = "startsAt")]
-    pub starts_at: String,
-    /// Price level classification
-    pub level: Option<String>,
-}
-
-/// Fetched price data from Tibber
-#[derive(Debug, Clone)]
-pub struct TibberPriceData {
-    /// Current price
-    pub current: Option<TibberPrice>,
-    /// Today's prices (up to 96 for 15-min resolution)
-    pub today: Vec<TibberPrice>,
-    /// Tomorrow's prices (empty if not available yet)
-    pub tomorrow: Vec<TibberPrice>,
-}
-
-/// Fetch electricity prices from Tibber API
-///
-/// Uses `QUARTER_HOURLY` resolution for 15-minute price intervals.
-/// Returns None if the API call fails or no data is available.
-pub async fn fetch_prices(api_token: &str) -> Option<TibberPriceData> {
-    let query = r"
-        query GetPrices {
-            viewer {
-                homes {
-                    currentSubscription {
-                        priceInfo(resolution: QUARTER_HOURLY) {
-                            current {
-                                total
-                                energy
-                                tax
-                                startsAt
-                                level
-                            }
-                            today {
-                                total
-                                energy
-                                tax
-                                startsAt
-                                level
-                            }
-                            tomorrow {
-                                total
-                                energy
-                                tax
-                                startsAt
-                                level
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    ";
-
-    let client = reqwest::Client::new();
-
-    let response = match client
-        .post(TIBBER_API_URL)
-        .header("Authorization", format!("Bearer {api_token}"))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", USER_AGENT)
-        .json(&serde_json::json!({ "query": query }))
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            error!("Tibber price fetch failed: {}", e);
-            return None;
-        }
-    };
-
-    if !response.status().is_success() {
-        error!("Tibber price API returned HTTP {}", response.status());
-        return None;
-    }
-
-    let price_response: PriceResponse = match response.json().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to parse Tibber price response: {}", e);
-            return None;
-        }
-    };
-
-    if let Some(errors) = price_response.errors {
-        for err in &errors {
-            error!("Tibber GraphQL error: {}", err.message);
-        }
-        return None;
-    }
-
-    let data = price_response.data?;
-    let home = data.viewer.homes.first()?;
-    let subscription = home.current_subscription.as_ref()?;
-    let price_info = subscription.price_info.as_ref()?;
-
-    info!(
-        "Tibber prices fetched: {} today, {} tomorrow",
-        price_info.today.len(),
-        price_info.tomorrow.len()
-    );
-
-    Some(TibberPriceData {
-        current: price_info.current.clone(),
-        today: price_info.today.clone(),
-        tomorrow: price_info.tomorrow.clone(),
-    })
-}
-
 /// Run the WebSocket connection loop with automatic reconnection
 ///
 /// Syncs historical data ONCE at startup, then relies on real-time WebSocket
 /// updates. The grid state's `maybe_update_peak()` method handles updating
 /// daily peaks when the current hour exceeds stored values.
-pub async fn run_websocket_loop(api_token: String, grid_state: GridState) {
-    // Sync historical data ONCE at startup
+pub async fn run_websocket_loop(
+    api_token: String,
+    grid_state: GridState,
+    tz: Tz,
+    cancel: CancellationToken,
+) {
+    // Sync historical data ONCE at startup. Bail early on cancellation so the
+    // (potentially slow) HTTP call doesn't hold up shutdown.
     info!("Tibber WS: Syncing historical consumption data (startup only)...");
-    if let Err(e) = sync_historical_data(&api_token, &grid_state).await {
-        error!("Tibber WS: Failed to sync historical data: {}", e);
-    }
-
-    // Start WebSocket listener (no periodic sync - real-time updates handle peaks)
-    loop {
-        info!("Tibber WS: Connecting to Tibber WebSocket...");
-
-        match connect_websocket(&api_token, &grid_state).await {
-            Ok(()) => {
-                warn!("Tibber WS: Connection closed, reconnecting in 10 seconds...");
-                time::sleep(Duration::from_secs(10)).await;
-            }
-            Err(e) => {
-                error!("Tibber WS: Connection error: {}", e);
-                info!("Tibber WS: Reconnecting in 30 seconds...");
-                time::sleep(Duration::from_secs(30)).await;
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            info!("Tibber WS: shutdown signal received during startup sync");
+            return;
+        }
+        result = sync_historical_data(&api_token, &grid_state, tz) => {
+            if let Err(e) = result {
+                error!("Tibber WS: Failed to sync historical data: {}", e);
             }
         }
+    }
+
+    // Exponential backoff for connection failures, capped at 5 minutes.
+    // Resets to the base delay after any successful connect.
+    let base_delay = Duration::from_secs(10);
+    let max_delay = Duration::from_secs(300);
+    let mut delay = base_delay;
+    loop {
+        if cancel.is_cancelled() {
+            info!("Tibber WS: shutdown signal received");
+            return;
+        }
+        info!("Tibber WS: Connecting to Tibber WebSocket...");
+
+        let connect_result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                info!("Tibber WS: shutdown signal received mid-connect");
+                return;
+            }
+            r = connect_websocket(&api_token, &grid_state) => r,
+        };
+
+        match connect_result {
+            Ok(()) => {
+                warn!("Tibber WS: Connection closed, reconnecting in 10 seconds...");
+                delay = base_delay;
+                if cancellable_sleep(&cancel, delay).await {
+                    return;
+                }
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                // 401 means the token is bad — exponential backoff won't fix
+                // that. Stop the loop so the operator notices via /status.
+                if msg.contains("401") || msg.to_lowercase().contains("unauthorized") {
+                    error!("Tibber WS: 401 Unauthorized — aborting reconnect loop: {msg}");
+                    return;
+                }
+                error!("Tibber WS: Connection error: {msg}");
+                info!("Tibber WS: Reconnecting in {:?}", delay);
+                if cancellable_sleep(&cancel, delay).await {
+                    return;
+                }
+                delay = (delay * 2).min(max_delay);
+            }
+        }
+    }
+}
+
+/// Sleep for `delay`, or return early if cancellation fires first.
+/// Returns `true` when cancelled, `false` on normal wake-up.
+async fn cancellable_sleep(cancel: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => true,
+        () = time::sleep(delay) => false,
     }
 }
 
@@ -322,14 +211,16 @@ pub async fn run_websocket_loop(api_token: String, grid_state: GridState) {
 async fn sync_historical_data(
     api_token: &str,
     grid_state: &GridState,
+    tz: Tz,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use chrono::Datelike;
     let home_id = get_home_id(api_token).await?;
 
-    // Fetch max allowed (744 hours = 31 days), will filter by month
-    let now = SystemTime::now();
-    let duration = now.duration_since(SystemTime::UNIX_EPOCH)?;
-    let days = duration.as_secs() / 86400;
-    let (current_year, current_month, _) = days_to_ymd(days);
+    // Fetch max allowed (744 hours = 31 days), will filter by month.
+    // The filter compares the local (year, month) of each consumption node
+    // against the current local month; route the current month through the
+    // DST-aware helper so it rolls over at the correct local instant.
+    let (current_year, current_month, _, _) = system_time_to_local(SystemTime::now(), tz);
     let hours_to_fetch = 744; // Max allowed by API
 
     info!(
@@ -352,7 +243,7 @@ async fn sync_historical_data(
         }}"#
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::energy::http_client();
     let response = client
         .post(TIBBER_API_URL)
         .header("Authorization", format!("Bearer {api_token}"))
@@ -386,27 +277,28 @@ async fn sync_historical_data(
     let mut skipped_wrong_month = 0;
 
     for node in &nodes {
-        if let Some(kwh) = node.consumption {
-            // Filter to current month using local time from timestamp
-            if let Some((year, month)) = extract_year_month(&node.from)
-                && (year != current_year || month != current_month)
-            {
-                skipped_wrong_month += 1;
-                continue;
-            }
-
-            // Parse ISO 8601 timestamp for tariff check
-            if let Ok(timestamp) = parse_iso8601(&node.from) {
-                // Check if this was a high-tariff hour
-                if get_tariff_at(timestamp) == TariffMode::High {
-                    grid_state.record_hour(timestamp, f64::from(kwh));
-                    recorded += 1;
-                } else {
-                    skipped_low_tariff += 1;
-                }
-            }
-        } else {
+        let Some(kwh) = node.consumption else {
             skipped_no_data += 1;
+            continue;
+        };
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(node.from.trim()) else {
+            continue;
+        };
+        if parsed.year() != current_year || parsed.month() != current_month {
+            skipped_wrong_month += 1;
+            continue;
+        }
+        let utc_secs = parsed.timestamp();
+        if utc_secs < 0 {
+            continue;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(utc_secs as u64);
+        if get_tariff_at(timestamp) == TariffMode::High {
+            grid_state.record_hour(timestamp, f64::from(kwh));
+            recorded += 1;
+        } else {
+            skipped_low_tariff += 1;
         }
     }
 
@@ -420,7 +312,7 @@ async fn sync_historical_data(
 
 /// Get the home ID from Tibber API
 async fn get_home_id(api_token: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
+    let client = crate::energy::http_client();
     let query = r"{ viewer { homes { id } } }";
 
     let response = client
@@ -536,15 +428,18 @@ async fn connect_websocket(
     write.send(Message::Text(sub_msg.into())).await?;
     info!("Tibber WS: Subscribed to live measurements");
 
-    // Track the last hour we recorded
-    let mut last_recorded_hour: Option<u64> = None;
+    // Per-connection rotation state. Both fields stay None until the first
+    // measurement lands; that way the first message after a reconnect both
+    // initialises the trackers AND records its quarter/hour normally instead
+    // of silently skipping (audit #9).
+    let mut ws_state = WsRotationState::default();
 
     // Process incoming messages with read timeout to detect zombie connections.
     loop {
         match time::timeout(WS_READ_TIMEOUT, read.next()).await {
             Ok(Some(Ok(msg))) => match msg {
                 Message::Text(text) => {
-                    if let Err(e) = process_message(&text, grid_state, &mut last_recorded_hour) {
+                    if let Err(e) = process_message(&text, grid_state, &mut ws_state) {
                         error!("Tibber WS: Failed to process message: {}", e);
                     }
                 }
@@ -575,11 +470,26 @@ async fn connect_websocket(
     Ok(())
 }
 
+/// State tracked between successive WS messages so we can detect quarter +
+/// hour rollovers and the midnight reset of `accumulated_consumption`.
+#[derive(Default)]
+struct WsRotationState {
+    /// Most recent hour boundary (Unix-secs floor to 3600) seen on the
+    /// stream. Used by the hourly peak path.
+    last_recorded_hour: Option<u64>,
+    /// Most recent quarter boundary (Unix-secs floor to 900) seen on the
+    /// stream. Used by the 15-min consumption path.
+    quarter_start_secs: Option<u64>,
+    /// `accumulatedConsumption` value at the start of `quarter_start_secs`.
+    /// Subtracting from the current accumulated gives this quarter's kWh.
+    quarter_start_accumulated: Option<f64>,
+}
+
 /// Process a WebSocket message
 fn process_message(
     text: &str,
     grid_state: &GridState,
-    last_recorded_hour: &mut Option<u64>,
+    state: &mut WsRotationState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws_msg: WSMessage = serde_json::from_str(text)?;
 
@@ -599,30 +509,80 @@ fn process_message(
                     power, accumulated, last_hour
                 );
 
-                // Update current hour consumption (using last completed hour)
+                let Ok(timestamp) = parse_iso8601(&measurement.timestamp) else {
+                    return Ok(());
+                };
+                let now_secs = timestamp
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let current_hour = (now_secs / 3600) * 3600;
+                let current_quarter = (now_secs / 900) * 900;
+
+                // ---- Hourly path (feeds effektabonnemang peak tracking) ----
+                let prev_kwh = grid_state.get_current_hour_kwh();
                 grid_state.update_current_hour(f64::from(last_hour));
 
-                // Check if we need to record the previous hour
-                if let Ok(timestamp) = parse_iso8601(&measurement.timestamp) {
-                    let now_secs = timestamp
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let current_hour = (now_secs / 3600) * 3600;
-
-                    if let Some(last_hour) = *last_recorded_hour
-                        && current_hour > last_hour
-                    {
-                        // Hour changed - record the previous hour
-                        let prev_hour_time =
-                            SystemTime::UNIX_EPOCH + Duration::from_secs(last_hour);
-                        // Get the accumulated consumption at hour end
-                        let prev_kwh = grid_state.get_current_hour_kwh();
-                        if prev_kwh > 0.0 {
-                            grid_state.record_hour(prev_hour_time, prev_kwh);
-                        }
+                if let Some(prev_hour) = state.last_recorded_hour
+                    && current_hour > prev_hour
+                {
+                    let prev_hour_time = SystemTime::UNIX_EPOCH + Duration::from_secs(prev_hour);
+                    if let Some(prev_kwh) = prev_kwh {
+                        grid_state.record_hour(prev_hour_time, prev_kwh);
                     }
-                    *last_recorded_hour = Some(current_hour);
+                }
+                state.last_recorded_hour = Some(current_hour);
+
+                // ---- 15-minute path (current_quarter_kwh + consumption_15min) ----
+                // Tibber's accumulated counter is reported to ~3 decimals
+                // (mWh). A backward stutter inside that resolution is sensor
+                // noise, not a real reset, so the "same quarter, no reset"
+                // and "real midnight reset" guards both tolerate up to
+                // RESET_JITTER_KWH backward before re-anchoring.
+                const RESET_JITTER_KWH: f64 = 0.01;
+                let accumulated = f64::from(accumulated);
+                match (state.quarter_start_secs, state.quarter_start_accumulated) {
+                    (Some(prev_quarter), Some(prev_snapshot))
+                        if prev_quarter == current_quarter
+                            && accumulated + RESET_JITTER_KWH >= prev_snapshot =>
+                    {
+                        // Same quarter, no midnight reset. Forward the live
+                        // delta so the dashboard sees a smooth in-quarter
+                        // accumulation. Clamp the delta at 0 in case the
+                        // backward stutter is positive but tiny.
+                        let delta = (accumulated - prev_snapshot).max(0.0);
+                        grid_state.update_current_quarter(delta);
+                    }
+                    (Some(prev_quarter), Some(prev_snapshot)) => {
+                        // Either the quarter rolled over OR midnight reset
+                        // the accumulator. Close the prior quarter with the
+                        // best estimate of its delta, then re-anchor.
+                        let prior_delta = if accumulated + RESET_JITTER_KWH >= prev_snapshot {
+                            (accumulated - prev_snapshot).max(0.0)
+                        } else {
+                            // Midnight (or counter wobble beyond jitter) —
+                            // the prior quarter's tail is whatever we last
+                            // forwarded.
+                            grid_state.get_current_quarter_kwh()
+                        };
+                        if prior_delta > 0.0 {
+                            grid_state.record_quarter(prev_quarter, prior_delta);
+                        }
+                        // Reset for the new quarter. Forward 0 so the
+                        // current-quarter readout starts fresh.
+                        state.quarter_start_secs = Some(current_quarter);
+                        state.quarter_start_accumulated = Some(accumulated);
+                        grid_state.update_current_quarter(0.0);
+                    }
+                    _ => {
+                        // First measurement after (re)connect. Initialise
+                        // the snapshot at the current quarter boundary so
+                        // the next message produces a sensible delta. Don't
+                        // emit a partial value for this first sample.
+                        state.quarter_start_secs = Some(current_quarter);
+                        state.quarter_start_accumulated = Some(accumulated);
+                        grid_state.update_current_quarter(0.0);
+                    }
                 }
             }
         }
@@ -633,128 +593,26 @@ fn process_message(
     Ok(())
 }
 
-/// Extract (year, month) from ISO 8601 string like "2026-01-15T09:00:00+01:00"
-/// Uses the local time from the string directly (handles DST correctly)
-fn extract_year_month(iso: &str) -> Option<(i32, u32)> {
-    // Format: "YYYY-MM-..."
-    if iso.len() >= 7 {
-        let year: i32 = iso.get(0..4)?.parse().ok()?;
-        let month: u32 = iso.get(5..7)?.parse().ok()?;
-        Some((year, month))
-    } else {
-        None
-    }
-}
-
-/// Parse ISO 8601 timestamp to `SystemTime`
+/// Parse ISO 8601 / RFC 3339 timestamp to `SystemTime`.
 ///
-/// Handles formats like:
-/// - `"2025-01-15T14:30:00.000+01:00"` (with positive timezone offset)
-/// - `"2025-01-15T14:30:00.000-05:00"` (with negative timezone offset)
-/// - `"2025-01-15T13:30:00Z"` (UTC/Zulu time)
-/// - `"2025-01-15T13:30:00"` (no timezone, assumed UTC)
-fn parse_iso8601(s: &str) -> Result<SystemTime, Box<dyn std::error::Error + Send + Sync>> {
+/// Delegates to `chrono::DateTime::parse_from_rfc3339` to avoid the
+/// fractional-seconds / offset-spelling pitfalls of a hand-rolled parser.
+pub(crate) fn parse_iso8601(
+    s: &str,
+) -> Result<SystemTime, Box<dyn std::error::Error + Send + Sync>> {
     let s = s.trim();
-
-    // Find the 'T' separator between date and time
-    let t_idx = s.find('T').ok_or("Invalid ISO 8601 format: missing 'T'")?;
-    let date_part = &s[..t_idx];
-    let time_and_tz = &s[t_idx + 1..];
-
-    // Parse date components
-    let date_parts: Vec<&str> = date_part.split('-').collect();
-    if date_parts.len() != 3 {
-        return Err("Invalid date format".into());
-    }
-    let year: i32 = date_parts[0].parse()?;
-    let month: u32 = date_parts[1].parse()?;
-    let day: u32 = date_parts[2].parse()?;
-
-    // Separate time from timezone offset
-    // Look for 'Z', '+', or '-' (after position 2 to skip negative hours like -05)
-    let (time_part, offset_secs) = if let Some(z_idx) = time_and_tz.find('Z') {
-        (&time_and_tz[..z_idx], 0i64)
-    } else if let Some(plus_idx) = time_and_tz.find('+') {
-        let offset = parse_tz_offset(&time_and_tz[plus_idx + 1..]);
-        (&time_and_tz[..plus_idx], offset)
-    } else if let Some(minus_idx) = time_and_tz[2..].find('-') {
-        // Search after position 2 to avoid matching time like "14:30"
-        let actual_idx = minus_idx + 2;
-        let offset = parse_tz_offset(&time_and_tz[actual_idx + 1..]);
-        (&time_and_tz[..actual_idx], -offset)
-    } else {
-        // No timezone specified, assume UTC
-        (time_and_tz, 0i64)
+    // RFC 3339 requires a timezone designator; if missing, treat as UTC
+    // to preserve the historical behaviour of this helper.
+    let dt = match chrono::DateTime::parse_from_rfc3339(s) {
+        Ok(dt) => dt,
+        Err(_) => chrono::DateTime::parse_from_rfc3339(&format!("{s}Z"))?,
     };
-
-    // Remove fractional seconds (e.g., ".000" in "14:30:00.000")
-    let time_part = time_part.split('.').next().unwrap_or(time_part);
-
-    // Parse time components
-    let time_parts: Vec<&str> = time_part.split(':').collect();
-    if time_parts.len() < 2 {
-        return Err("Invalid time format".into());
+    let utc_secs = dt.timestamp();
+    if utc_secs < 0 {
+        return Err("Timestamp before Unix epoch".into());
     }
-    let hour: i64 = time_parts[0].parse()?;
-    let minute: i64 = time_parts[1].parse()?;
-    let second: i64 = if time_parts.len() > 2 {
-        time_parts[2].parse().unwrap_or(0)
-    } else {
-        0
-    };
-
-    // Convert local time to UTC by subtracting the timezone offset
-    // For "+01:00", offset_secs is positive, so we subtract to get UTC
-    // For "-05:00", offset_secs is negative, so subtracting adds to get UTC
-    let days = ymd_to_days(year, month, day);
-    let local_secs = days * 86400 + hour * 3600 + minute * 60 + second;
-    let utc_secs = local_secs - offset_secs;
-
     #[allow(clippy::cast_sign_loss)]
-    // utc_secs is always positive for dates after 1970
     Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(utc_secs as u64))
-}
-
-/// Parse timezone offset string like "01:00" or "05:30" into seconds
-fn parse_tz_offset(offset_str: &str) -> i64 {
-    let parts: Vec<&str> = offset_str.split(':').collect();
-    let hours: i64 = parts.first().and_then(|h| h.parse().ok()).unwrap_or(0);
-    let mins: i64 = parts.get(1).and_then(|m| m.parse().ok()).unwrap_or(0);
-    hours * 3600 + mins * 60
-}
-
-/// Convert (year, month, day) to days since Unix epoch
-#[allow(clippy::similar_names)]
-fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
-    let y = i64::from(if month <= 2 { year - 1 } else { year });
-    let m = i64::from(if month <= 2 { month + 12 } else { month });
-
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (m - 3) + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-
-    era * 146_097 + doe - 719_468
-}
-
-/// Convert days since Unix epoch to (year, month, day)
-#[allow(clippy::similar_names)]
-fn days_to_ymd(days: u64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let year = if m <= 2 { y + 1 } else { y } as i32;
-
-    #[allow(clippy::cast_possible_truncation)]
-    (year, m as u32, d as u32)
 }
 
 #[cfg(test)]
@@ -824,26 +682,124 @@ mod tests {
         assert_eq!(get_utc_hour(result), 9);
     }
 
-    #[test]
-    fn test_parse_tz_offset() {
-        assert_eq!(parse_tz_offset("01:00"), 3600);
-        assert_eq!(parse_tz_offset("05:30"), 19800);
-        assert_eq!(parse_tz_offset("00:00"), 0);
-        assert_eq!(parse_tz_offset("12:00"), 43200);
+    /// Build a `WSMessage` JSON payload mirroring what Tibber sends so we
+    /// can exercise `process_message` directly.
+    fn ws_payload(timestamp: &str, accumulated: f32, last_hour: f32) -> String {
+        serde_json::json!({
+            "type": "next",
+            "payload": {
+                "data": {
+                    "liveMeasurement": {
+                        "timestamp": timestamp,
+                        "power": 0.0,
+                        "accumulatedConsumption": accumulated,
+                        "accumulatedConsumptionLastHour": last_hour,
+                    }
+                }
+            }
+        })
+        .to_string()
     }
 
     #[test]
-    fn test_days_to_ymd() {
-        // 2025-01-15 is 20103 days after 1970-01-01
-        let (y, m, d) = days_to_ymd(20103);
-        assert_eq!(y, 2025);
-        assert_eq!(m, 1);
-        assert_eq!(d, 15);
+    fn process_message_quarter_rollover_records_prior_quarter() {
+        let grid = GridState::new();
+        let mut state = WsRotationState::default();
+
+        // First quarter (10:00–10:15 UTC). First message initialises; second
+        // forwards the in-quarter delta.
+        process_message(
+            &ws_payload("2026-05-10T10:00:00Z", 0.0, 0.0),
+            &grid,
+            &mut state,
+        )
+        .unwrap();
+        process_message(
+            &ws_payload("2026-05-10T10:05:00Z", 0.3, 0.0),
+            &grid,
+            &mut state,
+        )
+        .unwrap();
+        // Cross into the next quarter (10:15–10:30). The boundary message
+        // carries accumulated=0.5 — exactly the prior-quarter close value
+        // — so the closed quarter records 0.5 kWh of consumption.
+        process_message(
+            &ws_payload("2026-05-10T10:15:00Z", 0.5, 0.0),
+            &grid,
+            &mut state,
+        )
+        .unwrap();
+
+        let consumption = grid.get_consumption_15min();
+        assert_eq!(consumption.len(), 1, "prior quarter should be recorded");
+        let entry = &consumption[0];
+        assert!(
+            (entry.kwh - 0.5).abs() < 1e-6,
+            "prior quarter kwh: expected 0.5, got {}",
+            entry.kwh
+        );
+
+        // The current-quarter readout resets after rollover so the dashboard
+        // doesn't show the closed quarter's total on the new quarter.
+        let now = grid.get_current_quarter_kwh();
+        assert!(
+            now.abs() < 1e-6,
+            "current-quarter reading should reset to 0 after rollover; got {now}"
+        );
     }
 
     #[test]
-    fn test_ymd_to_days() {
-        let days = ymd_to_days(2025, 1, 15);
-        assert_eq!(days, 20103);
+    fn process_message_first_message_after_reconnect_does_not_skip_quarter() {
+        // Audit #9 (reframed): the very first measurement after a WS
+        // reconnect used to silently skip the rollover branch because
+        // last_recorded_hour was None. Now both rotation paths initialise
+        // on the first message instead of skipping it.
+        let grid = GridState::new();
+        let mut state = WsRotationState::default();
+
+        // First message of a new connection mid-quarter. State must
+        // initialise without aborting and without polluting
+        // consumption_15min with a spurious prior-quarter entry.
+        process_message(
+            &ws_payload("2026-05-10T10:07:00Z", 0.42, 0.0),
+            &grid,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            state.last_recorded_hour,
+            Some(10 * 3600 + ymd_unix(2026, 5, 10))
+        );
+        assert!(
+            state.quarter_start_secs.is_some(),
+            "quarter snapshot must initialise on first message"
+        );
+        assert!(
+            grid.get_consumption_15min().is_empty(),
+            "first message must not retroactively close any quarter"
+        );
+
+        // The next quarter boundary closes the in-progress quarter properly
+        // — confirming the first message wasn't silently skipped.
+        process_message(
+            &ws_payload("2026-05-10T10:15:00Z", 0.6, 0.0),
+            &grid,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(grid.get_consumption_15min().len(), 1);
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn ymd_unix(year: i32, month: u32, day: u32) -> u64 {
+        // Small helper for tests only — converts a UTC date to its midnight
+        // Unix seconds without touching the production code path. Test inputs
+        // are all post-1970 so the i64→u64 cast is safe.
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(year, month, day, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp() as u64
     }
 }

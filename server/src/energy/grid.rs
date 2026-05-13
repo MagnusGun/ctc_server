@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use chrono_tz::{Europe::Stockholm, Tz};
 use serde::Serialize;
 use tracing::trace;
 
-use super::tariff::{TariffMode, get_tariff_at};
+use super::tariff::{TariffMode, get_tariff_at, system_time_to_local};
 
 /// Maximum number of 15-min entries to keep (24 hours = 96 entries)
 const MAX_QUARTER_ENTRIES: usize = 96;
@@ -26,6 +27,9 @@ const MAX_QUARTER_ENTRIES: usize = 96;
 #[derive(Clone)]
 pub struct GridState {
     inner: Arc<Mutex<GridStateInner>>,
+    /// Timezone used to key daily peak buckets (matches the deployment's
+    /// local calendar).
+    tz: Tz,
 }
 
 struct GridStateInner {
@@ -34,8 +38,10 @@ struct GridStateInner {
     daily_peaks: HashMap<(i32, u32, u32), (u64, f64)>,
     /// Current month being tracked (year, month)
     current_month: (i32, u32),
-    /// Current hour's accumulated consumption (for real-time display)
-    current_hour_kwh: f64,
+    /// Current hour's accumulated consumption (for real-time display).
+    /// `None` until the first sample arrives for the hour — distinguishes
+    /// "no data yet" from a genuine zero reading.
+    current_hour_kwh: Option<f64>,
     /// Timestamp of current hour start
     current_hour_start: u64,
     /// 15-minute consumption history (rolling 24h window)
@@ -58,23 +64,30 @@ pub struct ConsumptionEntry {
 }
 
 impl GridState {
-    /// Create a new grid state
+    /// Create a new grid state pinned to Europe/Stockholm. Used by tests.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_tz(Stockholm)
+    }
+
+    /// Create a new grid state keyed to `tz` for daily peak buckets.
+    #[must_use]
+    pub fn with_tz(tz: Tz) -> Self {
         let now = SystemTime::now();
-        let (year, month, _, hour_start) = timestamp_to_components(now);
+        let (year, month, _, hour_start) = timestamp_to_components_in(now, tz);
         let quarter_start = timestamp_to_quarter_start(now);
 
         Self {
             inner: Arc::new(Mutex::new(GridStateInner {
                 daily_peaks: HashMap::new(),
                 current_month: (year, month),
-                current_hour_kwh: 0.0,
+                current_hour_kwh: None,
                 current_hour_start: hour_start,
                 consumption_15min: VecDeque::with_capacity(MAX_QUARTER_ENTRIES),
                 current_quarter_kwh: 0.0,
                 current_quarter_start: quarter_start,
             })),
+            tz,
         }
     }
 
@@ -105,7 +118,11 @@ impl GridState {
         }
 
         let mut inner = self.inner.lock().unwrap();
-        let (year, month, day, _) = timestamp_to_components(time);
+        // The day-key uses the configured local calendar. March can already
+        // be in CEST after spring forward while high-tariff hours still
+        // apply, so route through the DST-aware helper instead of a fixed
+        // +1 h offset.
+        let (year, month, day, _) = system_time_to_local(time, self.tz);
         let today = (year, month, day);
 
         // Check for month change
@@ -190,17 +207,16 @@ impl GridState {
     /// When hour changes, records the previous hour as a potential peak.
     pub fn update_current_hour(&self, kwh: f64) {
         let now = SystemTime::now();
-        let (year, month, _, hour_start) = timestamp_to_components(now);
+        let (year, month, _, hour_start) = timestamp_to_components_in(now, self.tz);
 
         let mut inner = self.inner.lock().unwrap();
 
         // Check if hour changed
         if hour_start != inner.current_hour_start {
             // Record the previous hour if we have data
-            if inner.current_hour_kwh > 0.0 {
+            if let Some(prev_kwh) = inner.current_hour_kwh {
                 // Copy values before dropping lock
                 let prev_start = inner.current_hour_start;
-                let prev_kwh = inner.current_hour_kwh;
                 drop(inner);
 
                 // maybe_update_peak will check if it was high-tariff
@@ -222,15 +238,16 @@ impl GridState {
 
             // Reset for new hour
             inner.current_hour_start = hour_start;
-            inner.current_hour_kwh = 0.0;
+            inner.current_hour_kwh = None;
         }
 
-        inner.current_hour_kwh = kwh;
+        inner.current_hour_kwh = Some(kwh);
     }
 
-    /// Get the current hour's accumulated consumption
+    /// Get the current hour's accumulated consumption.
+    /// Returns `None` if no sample has arrived yet for this hour.
     #[must_use]
-    pub fn get_current_hour_kwh(&self) -> f64 {
+    pub fn get_current_hour_kwh(&self) -> Option<f64> {
         self.inner.lock().unwrap().current_hour_kwh
     }
 
@@ -311,8 +328,11 @@ impl GridState {
 
         // Check if quarter changed
         if quarter_start != inner.current_quarter_start {
-            // Record the previous quarter if we have data
-            if inner.current_quarter_kwh > 0.0 {
+            // Record the previous quarter, including idle (0 kWh) ones. Otherwise
+            // the rolling 24 h buffer has variable density and current_15min_kwh
+            // averages skew high — heat-pump-off quarters silently disappear.
+            // NaN is the only thing we drop, since it would poison aggregates.
+            if !inner.current_quarter_kwh.is_nan() {
                 let entry = ConsumptionEntry {
                     timestamp: inner.current_quarter_start,
                     kwh: inner.current_quarter_kwh,
@@ -412,11 +432,6 @@ impl GridState {
             .collect()
     }
 
-    /// Get the number of 15-minute entries recorded
-    #[must_use]
-    pub fn consumption_15min_count(&self) -> usize {
-        self.inner.lock().unwrap().consumption_15min.len()
-    }
 }
 
 impl Default for GridState {
@@ -439,7 +454,13 @@ fn format_timestamp(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// Convert `SystemTime` to the start of its 15-minute period (Unix timestamp)
+/// Convert `SystemTime` to the start of its 15-minute period (Unix timestamp).
+///
+/// 15-minute boundaries align between UTC and Swedish-local because CET/CEST
+/// offsets are both whole hours, so rounding to a 900-second boundary in UTC
+/// produces the same instant as rounding in local time. The DST transitions
+/// themselves are whole-hour shifts, not 15-minute shifts, so they don't
+/// disturb the alignment either.
 fn timestamp_to_quarter_start(time: SystemTime) -> u64 {
     let duration = time
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -451,46 +472,21 @@ fn timestamp_to_quarter_start(time: SystemTime) -> u64 {
     (total_secs / 900) * 900
 }
 
-/// Convert `SystemTime` to (year, month, day, `hour_start_unix_secs`)
-#[allow(clippy::similar_names)]
-// doe/doy are standard names in Howard Hinnant's date algorithm
-fn timestamp_to_components(time: SystemTime) -> (i32, u32, u32, u64) {
+/// Convert `SystemTime` to (year, month, day, `hour_start_unix_secs`) in the
+/// given `tz`. The (year, month, day) tuple is local because it keys the
+/// daily peak map; `hour_start` stays in UTC Unix seconds.
+fn timestamp_to_components_in(time: SystemTime, tz: Tz) -> (i32, u32, u32, u64) {
     let duration = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
 
     let total_secs = duration.as_secs();
-
-    // Round down to hour boundary
     let hour_start = (total_secs / 3600) * 3600;
 
-    // Calculate date components (using UTC, same as time_utils)
-    let days = total_secs / 86400;
-    let (year, month, day) = days_to_ymd(days);
-
+    let (year, month, day, _hour) = system_time_to_local(time, tz);
     (year, month, day, hour_start)
 }
 
-/// Convert days since Unix epoch to (year, month, day)
-#[allow(clippy::similar_names)]
-// doe/doy are standard names in Howard Hinnant's date algorithm
-fn days_to_ymd(days: u64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let year = if m <= 2 { y + 1 } else { y } as i32;
-
-    #[allow(clippy::cast_possible_truncation)]
-    (year, m as u32, d as u32)
-}
 
 #[cfg(test)]
 mod tests {
@@ -534,7 +530,7 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn test_grid_state_new() {
         let state = GridState::new();
-        assert_eq!(state.get_current_hour_kwh(), 0.0);
+        assert_eq!(state.get_current_hour_kwh(), None);
         assert_eq!(state.get_top3_average(), 0.0);
         assert!(state.get_top3_hours().is_empty());
     }
@@ -544,24 +540,77 @@ mod tests {
         let state = GridState::new();
 
         state.update_current_hour(1.5);
-        assert!((state.get_current_hour_kwh() - 1.5).abs() < f64::EPSILON);
+        let v = state.get_current_hour_kwh().expect("kwh recorded");
+        assert!((v - 1.5).abs() < f64::EPSILON);
 
         state.update_current_hour(2.3);
-        assert!((state.get_current_hour_kwh() - 2.3).abs() < f64::EPSILON);
+        let v = state.get_current_hour_kwh().expect("kwh recorded");
+        assert!((v - 2.3).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_timestamp_to_components() {
-        // 2025-01-15 14:30:00 UTC
+        // 2025-01-15 14:30:00 UTC = 15:30:00 CET (same date locally)
         let timestamp = 1_736_951_400;
         let time = SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp);
-        let (year, month, day, hour_start) = timestamp_to_components(time);
+        let (year, month, day, hour_start) = timestamp_to_components_in(time, Stockholm);
 
         assert_eq!(year, 2025);
         assert_eq!(month, 1);
         assert_eq!(day, 15);
         // Hour 14 starts at 14:00:00 = 1736949600
         assert_eq!(hour_start, 1_736_949_600);
+    }
+
+    #[test]
+    fn test_timestamp_to_components_winter_local_day_rollover() {
+        // 2025-01-15 23:30 UTC = 2025-01-16 00:30 CET. The day component must
+        // follow Swedish-local, otherwise daily peaks land on the wrong day
+        // (and month rollover near UTC midnight thrashes the peak cache).
+        let timestamp = 1_736_983_800; // 2025-01-15 23:30:00 UTC
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp);
+        let (year, month, day, _) = timestamp_to_components_in(time, Stockholm);
+        assert_eq!((year, month, day), (2025, 1, 16));
+    }
+
+    #[test]
+    fn test_timestamp_to_components_summer_local_day_rollover() {
+        // 2025-07-15 22:30 UTC = 2025-07-16 00:30 CEST (UTC+2 in summer).
+        let timestamp = 1_752_618_600; // 2025-07-15 22:30:00 UTC
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp);
+        let (year, month, day, _) = timestamp_to_components_in(time, Stockholm);
+        assert_eq!((year, month, day), (2025, 7, 16));
+    }
+
+    #[test]
+    fn test_timestamp_to_components_month_rollover_at_local_midnight() {
+        // 2025-03-31 23:30 UTC = 2025-04-01 01:30 CEST (post spring-forward).
+        // Regression: if the UTC date had leaked in, update_current_hour and
+        // maybe_update_peak would disagree on the month and clear the peak
+        // cache every other call near the month boundary.
+        let timestamp = 1_743_464_000 + 1_400; // 2025-03-31 23:33:20 UTC, close enough
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp);
+        let (year, month, _, _) = timestamp_to_components_in(time, Stockholm);
+        assert_eq!((year, month), (2025, 4));
+    }
+
+    #[test]
+    fn test_timestamp_to_quarter_start_aligns_across_dst() {
+        // 15-min boundaries should land on the same Unix instants regardless
+        // of DST because both CET and CEST offsets are whole hours.
+        let winter = 1_736_951_400; // 2025-01-15 14:30:00 UTC
+        let summer = 1_752_618_600; // 2025-07-15 22:30:00 UTC
+        let q_winter = timestamp_to_quarter_start(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(winter),
+        );
+        let q_summer = timestamp_to_quarter_start(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(summer),
+        );
+        assert_eq!(q_winter % 900, 0);
+        assert_eq!(q_summer % 900, 0);
+        // 14:30 UTC rounds to 14:30 UTC; 22:30 UTC rounds to 22:30 UTC.
+        assert_eq!(q_winter, 1_736_951_400);
+        assert_eq!(q_summer, 1_752_618_600);
     }
 
     #[test]
@@ -728,6 +777,27 @@ mod tests {
     }
 
     #[test]
+    fn test_maybe_update_peak_uses_swedish_local_date_in_cest() {
+        // 2026-03-30 Monday 10:00 Swedish-local (CEST, UTC+2) = 08:00 UTC.
+        // Spring forward happened on 2026-03-29 (last Sunday of March), so
+        // the local zone is already CEST. The day-key must reflect Swedish
+        // local date 2026-03-30, not whatever a +3600 s offset would yield.
+        let state = GridState::new();
+        let utc_secs = hour_timestamp(2026, 3, 30, 8);
+        state.maybe_update_peak(utc_secs, 4.2);
+
+        let inner = state.inner.lock().unwrap();
+        let entry = inner.daily_peaks.get(&(2026, 3, 30));
+        assert!(
+            entry.is_some(),
+            "expected daily peak under Swedish-local date 2026-03-30; got {:?}",
+            inner.daily_peaks.keys().collect::<Vec<_>>()
+        );
+        let (_, kwh) = entry.unwrap();
+        assert!((*kwh - 4.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_recorded_hours_returns_days() {
         let state = GridState::new();
 
@@ -810,7 +880,7 @@ mod tests {
         let ts = hour_timestamp(2026, 1, 15, 10);
         state.record_quarter(ts, f64::NAN);
 
-        assert_eq!(state.consumption_15min_count(), 0);
+        assert!(state.get_consumption_15min().is_empty());
     }
 
     #[test]
@@ -820,7 +890,7 @@ mod tests {
         let ts = hour_timestamp(2026, 1, 15, 10);
         state.record_quarter(ts, -1.0);
 
-        assert_eq!(state.consumption_15min_count(), 0);
+        assert!(state.get_consumption_15min().is_empty());
     }
 
     #[test]
@@ -835,7 +905,7 @@ mod tests {
         }
 
         // Should keep only last 96 entries
-        assert_eq!(state.consumption_15min_count(), MAX_QUARTER_ENTRIES);
+        assert_eq!(state.get_consumption_15min().len(), MAX_QUARTER_ENTRIES);
 
         // First entry should be the 5th one (100 - 96 = 4, so entry index 4)
         let entries = state.get_consumption_15min();

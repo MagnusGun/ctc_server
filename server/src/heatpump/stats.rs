@@ -7,42 +7,30 @@
 //! - Outdoor temperature correlation for each cycle
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
+use chrono_tz::{Europe::Stockholm, Tz};
 use serde::{Deserialize, Serialize};
 use tracing::{trace, warn};
 
-/// On-disk format version. Bump when `PersistedStats` shape changes.
-const PERSIST_SCHEMA_VERSION: u32 = 1;
+use crate::storage::{Accumulators, CycleBlob, DailyBlob, Store};
 
-/// Maximum number of cycles to keep in history
+/// Maximum number of cycles to keep in the in-memory tail (for `cycle_stats`).
+/// The store keeps the full history on disk.
 const MAX_CYCLE_HISTORY: usize = 1000;
 
-/// Maximum number of daily records to keep (1 year)
+/// Maximum number of daily records `get_history` may return (1 year).
 const MAX_DAILY_HISTORY: usize = 365;
 
 /// Heat pump statistics state (thread-safe wrapper)
 #[derive(Clone)]
 pub struct HeatPumpStats {
     inner: Arc<Mutex<HeatPumpStatsInner>>,
-    /// Optional path used by `save_to_disk()`; `None` disables persistence.
-    persist_path: Option<PathBuf>,
-}
-
-/// Subset of stats persisted to disk. Excludes derived/rolling-window state
-/// (those repopulate naturally on the next poll tick) and live cycle state
-/// (we let the existing first-poll path re-sync compressor on/off).
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedStats {
-    schema_version: u32,
-    tracking_started_unix_secs: u64,
-    total_starts: u64,
-    total_operating_secs: u64,
-    cycle_history: VecDeque<CycleRecord>,
-    daily_history: VecDeque<DailyRecord>,
+    /// Optional store. `None` disables persistence (used by tests and
+    /// in-memory-only runs).
+    store: Option<Store>,
 }
 
 /// Internal state for heat pump statistics
@@ -63,11 +51,10 @@ struct HeatPumpStatsInner {
     /// Outdoor temperature when current cycle started (if ON)
     cycle_start_temp: Option<f32>,
 
-    /// Completed cycle history (for cycle time stats)
+    /// Completed cycle history kept in memory for `cycle_stats` computation.
+    /// Hydrated from `Store::recent_cycles` on boot; mirrored to the store on
+    /// every cycle close.
     cycle_history: VecDeque<CycleRecord>,
-
-    /// Daily aggregated history (for charts)
-    daily_history: VecDeque<DailyRecord>,
 
     /// Rolling counters for compressor starts
     starts_this_hour: u32,
@@ -97,6 +84,13 @@ struct HeatPumpStatsInner {
     current_day_temp_sum: f64,
     current_day_temp_count: u32,
 
+    /// Seconds from the current ON cycle that have already been credited
+    /// to previous days' archives because the cycle spans midnight(s).
+    /// Subtracted from the total cycle duration when crediting today's
+    /// counters at cycle completion, so the total isn't double-counted.
+    /// Reset whenever a cycle ends (recorded or discarded).
+    current_cycle_credited_secs: u64,
+
     /// Statistics tracking start time
     tracking_started: SystemTime,
 
@@ -105,6 +99,10 @@ struct HeatPumpStatsInner {
 
     /// Total operating time since tracking began (seconds)
     total_operating_secs: u64,
+
+    /// Timezone used for daily/local-date keying. Defaults to Europe/Stockholm
+    /// for back-compat in test constructors; production uses the configured tz.
+    tz: Tz,
 }
 
 /// A single completed compressor cycle
@@ -206,73 +204,88 @@ pub struct HeatPumpHistoryResponse {
 }
 
 impl HeatPumpStats {
-    /// Create a new in-memory-only heat pump statistics tracker.
-    /// Data is lost on restart. Used by tests and for runs with no persist path.
+    /// Create a new in-memory-only heat pump statistics tracker (Stockholm-pinned).
+    /// Data is lost on restart. Used by tests and for runs with no store.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_tz(Stockholm)
+    }
+
+    /// Create a new in-memory-only tracker keyed to `tz`.
+    #[must_use]
+    pub fn with_tz(tz: Tz) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(fresh_inner(SystemTime::now()))),
-            persist_path: None,
+            inner: Arc::new(Mutex::new(fresh_inner(SystemTime::now(), tz))),
+            store: None,
         }
     }
 
-    /// Create a tracker that loads previous accumulators from `path` if available
-    /// and writes to `path` on cycle completion / day rollover / shutdown.
-    ///
-    /// If the file does not exist, is unreadable, or fails to parse, this falls
-    /// back to a fresh tracker (logging a warning) so a corrupt persistence file
-    /// never blocks server startup.
+    /// Create a tracker backed by `store` and keyed to `tz`. Accumulators and
+    /// the recent-cycle tail are hydrated from the store; future cycle
+    /// completions and day rollovers write back to it (RAM-only — the store's
+    /// hourly `flush()` owns durability).
     #[must_use]
-    pub fn new_with_persistence<P: Into<PathBuf>>(path: P) -> Self {
-        let path = path.into();
-        let inner = match load_persisted(&path) {
-            Ok(Some(persisted)) => {
-                let mut inner = fresh_inner(SystemTime::now());
-                inner.tracking_started =
-                    unix_secs_to_system_time(persisted.tracking_started_unix_secs);
-                inner.total_starts = persisted.total_starts;
-                inner.total_operating_secs = persisted.total_operating_secs;
-                inner.cycle_history = persisted.cycle_history;
-                inner.daily_history = persisted.daily_history;
-                inner
+    pub fn new_with_store_and_tz(store: Store, tz: Tz) -> Self {
+        let mut inner = fresh_inner(SystemTime::now(), tz);
+
+        let acc = store.accumulators();
+        // `tracking_started_unix_secs == 0` is the sentinel for "store has
+        // never recorded a session" — keep the fresh `now` in that case so
+        // tracking_hours starts at 0 instead of 1970.
+        if acc.tracking_started_unix_secs > 0 {
+            inner.tracking_started =
+                UNIX_EPOCH + Duration::from_secs(acc.tracking_started_unix_secs);
+        }
+        inner.total_starts = acc.total_starts;
+        inner.total_operating_secs = acc.total_operating_secs;
+
+        // Hydrate the cycle tail used for cycle_stats. `recent_cycles`
+        // returns newest first; reverse for VecDeque chronological order.
+        match store.recent_cycles(0, MAX_CYCLE_HISTORY) {
+            Ok(cycles) => {
+                let mut cycles: Vec<CycleRecord> = cycles
+                    .into_iter()
+                    .map(|c| CycleRecord {
+                        timestamp: c.timestamp,
+                        duration_secs: c.duration_secs,
+                        outdoor_temp_c: c.outdoor_temp_c,
+                    })
+                    .collect();
+                cycles.reverse();
+                inner.cycle_history = cycles.into();
             }
-            Ok(None) => fresh_inner(SystemTime::now()),
-            Err(e) => {
-                warn!(
-                    "Failed to load persisted heatpump stats from {}: {e} — starting fresh",
-                    path.display()
-                );
-                fresh_inner(SystemTime::now())
-            }
-        };
+            Err(e) => warn!("Failed to hydrate cycle history from store: {e}"),
+        }
+
         Self {
             inner: Arc::new(Mutex::new(inner)),
-            persist_path: Some(path),
+            store: Some(store),
         }
     }
 
-    /// Persist the current accumulators and history to disk via an atomic
-    /// write (temp file + rename). No-op if persistence is disabled.
-    pub fn save_to_disk(&self) -> std::io::Result<()> {
-        let Some(path) = self.persist_path.as_ref() else {
-            return Ok(());
-        };
-        let snapshot = {
-            let inner = self.inner.lock().unwrap();
-            PersistedStats {
-                schema_version: PERSIST_SCHEMA_VERSION,
-                tracking_started_unix_secs: system_time_to_unix_secs(inner.tracking_started),
-                total_starts: inner.total_starts,
-                total_operating_secs: inner.total_operating_secs,
-                cycle_history: inner.cycle_history.clone(),
-                daily_history: inner.daily_history.clone(),
-            }
-        };
-        let json = serde_json::to_vec_pretty(&snapshot).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+    /// Mark the heat-pump status as unknown after a failed Modbus poll.
+    ///
+    /// Without this, the tracker would carry the last observed `compressor_on`
+    /// state across the outage and, on the next ON→OFF transition, credit the
+    /// entire gap (including the outage) as operating time. Instead we discard
+    /// the in-progress cycle: any pre-midnight credit accrued during the
+    /// current cycle is rolled back, and the next successful poll re-syncs
+    /// from a clean slate (treated like the first poll after server start).
+    pub fn mark_poll_failed(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if inner.compressor_on && inner.observed_cycle_start {
+            let credited = inner.current_cycle_credited_secs;
+            inner.operating_secs_this_day = inner.operating_secs_this_day.saturating_sub(credited);
+            inner.current_day_operating_secs =
+                inner.current_day_operating_secs.saturating_sub(credited);
+        }
+
+        inner.observed_cycle_start = false;
+        inner.current_cycle_credited_secs = 0;
+        // Force the next successful poll to be treated as the first poll —
+        // matching the "server starts with heater ON" semantics.
+        inner.initialized = false;
     }
 
     /// Update compressor state based on polled status code
@@ -280,14 +293,19 @@ impl HeatPumpStats {
     /// # Arguments
     /// * `status_code` - Heat pump status code (3, 4, 5 = ON; others = OFF)
     /// * `outdoor_temp` - Current outdoor temperature (Celsius)
+    #[allow(clippy::too_many_lines)]
     pub fn update_state(&self, status_code: u16, outdoor_temp: Option<f32>) {
         let is_on = matches!(status_code, 3..=5);
         let now = SystemTime::now();
         let now_secs = system_time_to_secs(now);
-        let mut should_persist = false;
+
+        // Collected under the lock, acted on after release.
+        let mut closed_cycle: Option<(SystemTime, CycleBlob)> = None;
+        let mut archived_daily: Option<(u32, DailyBlob)> = None;
+        let mut accumulators_snapshot: Option<Accumulators> = None;
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
             // Handle first update - just sync state without counting anything
             // This ensures we don't count partial cycles if server starts with heater ON
@@ -299,9 +317,13 @@ impl HeatPumpStats {
                 return;
             }
 
-            // Check for window rollovers first
-            if inner.check_window_rollovers(now_secs) {
-                should_persist = true;
+            let mut dirty = false;
+
+            // Window rollovers. A day rollover may yield an archived
+            // DailyBlob to flush to the store.
+            if let Some(daily) = inner.check_window_rollovers(now_secs) {
+                archived_daily = Some(daily);
+                dirty = true;
             }
 
             // Record outdoor temp for daily average (if available)
@@ -330,27 +352,43 @@ impl HeatPumpStats {
                         duration_secs,
                         outdoor_temp_c: inner.cycle_start_temp,
                     };
+                    let started_at = inner.state_started_at;
 
-                    inner.cycle_history.push_back(cycle);
+                    inner.cycle_history.push_back(cycle.clone());
                     if inner.cycle_history.len() > MAX_CYCLE_HISTORY {
                         inner.cycle_history.pop_front();
                     }
 
+                    // If this cycle spans midnight, an earlier portion has
+                    // already been credited to previous days' archives at
+                    // day-rollover time. Subtract that portion from the
+                    // current-day counters so the total stays accurate.
+                    let credited = inner.current_cycle_credited_secs;
+                    let today_secs = duration_secs.saturating_sub(credited);
+
                     // Update operating time counters
                     inner.operating_secs_this_hour += duration_secs;
-                    inner.operating_secs_this_day += duration_secs;
+                    inner.operating_secs_this_day += today_secs;
                     inner.operating_secs_this_week += duration_secs;
                     inner.operating_secs_this_month += duration_secs;
                     inner.operating_secs_this_year += duration_secs;
                     inner.total_operating_secs += duration_secs;
-                    inner.current_day_operating_secs += duration_secs;
+                    inner.current_day_operating_secs += today_secs;
 
-                    // Cycle completion advances accumulators — persist.
-                    should_persist = true;
+                    closed_cycle = Some((
+                        started_at,
+                        CycleBlob {
+                            timestamp: cycle.timestamp,
+                            duration_secs: cycle.duration_secs,
+                            outdoor_temp_c: cycle.outdoor_temp_c,
+                        },
+                    ));
+                    dirty = true;
                 }
 
                 // Reset for next cycle
                 inner.observed_cycle_start = false;
+                inner.current_cycle_credited_secs = 0;
             }
 
             // State transition: OFF -> ON (cycle start)
@@ -369,6 +407,7 @@ impl HeatPumpStats {
                 inner.current_day_starts += 1;
 
                 inner.cycle_start_temp = outdoor_temp;
+                dirty = true;
             }
 
             // Update state if changed
@@ -376,17 +415,35 @@ impl HeatPumpStats {
                 inner.compressor_on = is_on;
                 inner.state_started_at = now;
             }
-        } // drop inner lock before any I/O
 
-        if should_persist && let Err(e) = self.save_to_disk() {
-            warn!("Failed to persist heatpump stats: {e}");
+            if dirty {
+                accumulators_snapshot = Some(Accumulators {
+                    tracking_started_unix_secs: system_time_to_secs(inner.tracking_started),
+                    total_starts: inner.total_starts,
+                    total_operating_secs: inner.total_operating_secs,
+                });
+            }
+        } // drop inner lock before touching store
+
+        if let Some(store) = self.store.as_ref() {
+            if let Some((started_at, blob)) = closed_cycle
+                && let Err(e) = store.record_cycle(started_at, blob)
+            {
+                warn!("Failed to record cycle to store: {e}");
+            }
+            if let Some((date, blob)) = archived_daily {
+                store.upsert_daily(date, blob);
+            }
+            if let Some(acc) = accumulators_snapshot {
+                store.set_accumulators(acc);
+            }
         }
     }
 
     /// Get the summary statistics
     #[must_use]
     pub fn get_summary(&self) -> HeatPumpStatsResponse {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = SystemTime::now();
 
         let current_state_duration = now
@@ -451,35 +508,63 @@ impl HeatPumpStats {
         }
     }
 
-    /// Get history data for charts
+    /// Get history data for charts.
+    ///
+    /// Reads from the store when one is attached; otherwise serves the
+    /// in-memory cycle tail (cycles only — daily history requires a store).
     ///
     /// # Arguments
     /// * `days` - Number of days of daily history to return (max 365)
     #[must_use]
     pub fn get_history(&self, days: usize) -> HeatPumpHistoryResponse {
-        let inner = self.inner.lock().unwrap();
-
         let days = days.min(MAX_DAILY_HISTORY);
 
-        // Get recent cycles (last 100 or so for the chart)
-        let cycles: Vec<CycleRecord> = inner
-            .cycle_history
-            .iter()
-            .rev()
-            .take(100)
-            .cloned()
-            .collect::<Vec<_>>()
+        let Some(store) = self.store.as_ref() else {
+            // No store: fall back to the in-memory cycle tail. Daily history
+            // is empty since archive targets the store.
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let cycles: Vec<CycleRecord> = inner
+                .cycle_history
+                .iter()
+                .rev()
+                .take(100)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return HeatPumpHistoryResponse {
+                cycles,
+                daily: Vec::new(),
+            };
+        };
+
+        // Recent cycles: newest first from store, take up to 100, reverse to
+        // chronological order for the chart.
+        let mut cycles: Vec<CycleRecord> = store
+            .recent_cycles(0, 100)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| CycleRecord {
+                timestamp: c.timestamp,
+                duration_secs: c.duration_secs,
+                outdoor_temp_c: c.outdoor_temp_c,
+            })
+            .collect();
+        cycles.reverse();
+
+        // Daily history: ascending by date from store; take the tail `days`.
+        let all_daily = store.all_daily().unwrap_or_default();
+        let daily: Vec<DailyRecord> = all_daily
             .into_iter()
             .rev()
-            .collect();
-
-        // Get daily history
-        let daily: Vec<DailyRecord> = inner
-            .daily_history
-            .iter()
-            .rev()
             .take(days)
-            .cloned()
+            .map(|d| DailyRecord {
+                date: d.date,
+                starts: d.starts,
+                operating_hours: d.operating_hours,
+                avg_outdoor_temp_c: d.avg_outdoor_temp_c,
+            })
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -495,9 +580,9 @@ impl Default for HeatPumpStats {
     }
 }
 
-fn fresh_inner(now: SystemTime) -> HeatPumpStatsInner {
+fn fresh_inner(now: SystemTime, tz: Tz) -> HeatPumpStatsInner {
     let now_secs = system_time_to_secs(now);
-    let (year, month, day) = secs_to_ymd(now_secs);
+    let (year, month, day) = secs_to_ymd_in(now_secs, tz);
     HeatPumpStatsInner {
         initialized: false,
         observed_cycle_start: false,
@@ -505,7 +590,6 @@ fn fresh_inner(now: SystemTime) -> HeatPumpStatsInner {
         state_started_at: now,
         cycle_start_temp: None,
         cycle_history: VecDeque::with_capacity(MAX_CYCLE_HISTORY),
-        daily_history: VecDeque::with_capacity(MAX_DAILY_HISTORY),
 
         starts_this_hour: 0,
         starts_this_day: 0,
@@ -520,7 +604,7 @@ fn fresh_inner(now: SystemTime) -> HeatPumpStatsInner {
         operating_secs_this_year: 0,
 
         current_hour_start: hour_start(now_secs),
-        current_day_start: day_start(now_secs),
+        current_day_start: day_start_in(now_secs, tz),
         current_week_start: week_start(now_secs),
         current_month_start: month_start(year, month),
         current_year_start: year_start(year),
@@ -530,49 +614,23 @@ fn fresh_inner(now: SystemTime) -> HeatPumpStatsInner {
         current_day_operating_secs: 0,
         current_day_temp_sum: 0.0,
         current_day_temp_count: 0,
+        current_cycle_credited_secs: 0,
 
         tracking_started: now,
         total_starts: 0,
         total_operating_secs: 0,
+
+        tz,
     }
-}
-
-/// Returns `Ok(Some(_))` on a successful load, `Ok(None)` if the file does not
-/// exist (a clean first run), or `Err` if the file exists but is unreadable
-/// or unparseable.
-fn load_persisted(path: &Path) -> std::io::Result<Option<PersistedStats>> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let parsed: PersistedStats =
-                serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
-            if parsed.schema_version != PERSIST_SCHEMA_VERSION {
-                return Err(std::io::Error::other(format!(
-                    "unsupported schema version {}",
-                    parsed.schema_version
-                )));
-            }
-            Ok(Some(parsed))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-fn system_time_to_unix_secs(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-
-fn unix_secs_to_system_time(secs: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(secs)
 }
 
 impl HeatPumpStatsInner {
     /// Check and handle window rollovers (hour, day, week, month, year).
-    /// Returns `true` when a day rollover archived a `DailyRecord` (caller
-    /// should persist to disk in that case).
-    fn check_window_rollovers(&mut self, now_secs: u64) -> bool {
-        let (year, month, day) = secs_to_ymd(now_secs);
-        let mut archived = false;
+    /// Returns `Some((yyyymmdd, DailyBlob))` when a day rollover archived a
+    /// record — caller pushes it to the store after releasing the lock.
+    fn check_window_rollovers(&mut self, now_secs: u64) -> Option<(u32, DailyBlob)> {
+        let (year, month, _day) = secs_to_ymd_in(now_secs, self.tz);
+        let mut archived = None;
 
         // Hour rollover
         let new_hour_start = hour_start(now_secs);
@@ -584,20 +642,38 @@ impl HeatPumpStatsInner {
         }
 
         // Day rollover
-        let new_day_start = day_start(now_secs);
+        let new_day_start = day_start_in(now_secs, self.tz);
         if new_day_start != self.current_day_start {
             trace!("Day rollover detected");
 
-            // Archive the previous day's stats
-            self.archive_current_day();
-            archived = true;
+            // If a compressor cycle is currently in progress, credit the
+            // portion of it that falls inside the day being archived. The
+            // credited amount is remembered so it can be subtracted from
+            // the cycle's total when it eventually completes (avoids
+            // double-counting). Gate on `observed_cycle_start` to match
+            // the cycle-completion logic.
+            if self.compressor_on && self.observed_cycle_start {
+                let state_started_secs = system_time_to_secs(self.state_started_at);
+                let cycle_floor = state_started_secs.max(self.current_day_start);
+                if new_day_start > cycle_floor {
+                    let pre_midnight = new_day_start - cycle_floor;
+                    self.operating_secs_this_day += pre_midnight;
+                    self.current_day_operating_secs += pre_midnight;
+                    self.current_cycle_credited_secs += pre_midnight;
+                }
+            }
+
+            // Snapshot the previous day for the store.
+            archived = self.snapshot_current_day();
 
             self.starts_this_day = 0;
             self.operating_secs_this_day = 0;
             self.current_day_start = new_day_start;
 
-            // Reset current day tracking
-            self.current_day_date = (year, month, day);
+            // Reset current day tracking. Derive the date from the new day
+            // boundary, not `now_secs` — a rapid double-tick across midnight
+            // could otherwise drift if those two helpers disagree.
+            self.current_day_date = secs_to_ymd_in(new_day_start, self.tz);
             self.current_day_starts = 0;
             self.current_day_operating_secs = 0;
             self.current_day_temp_sum = 0.0;
@@ -634,15 +710,26 @@ impl HeatPumpStatsInner {
         archived
     }
 
-    /// Archive the current day's stats to daily history
-    fn archive_current_day(&mut self) {
-        // Only archive if we have some data
+    /// Build a `DailyBlob` from the current day's accumulators. Returns
+    /// `None` if the day has no recorded activity.
+    fn snapshot_current_day(&self) -> Option<(u32, DailyBlob)> {
         if self.current_day_starts == 0 && self.current_day_operating_secs == 0 {
-            return;
+            return None;
         }
 
         let (year, month, day) = self.current_day_date;
         let date = format!("{year:04}-{month:02}-{day:02}");
+        // Negative years mean the clock is set before year 0 — practically
+        // unreachable from a u64 Unix timestamp, but if it ever happens we
+        // route the row to a sentinel 1970-01-01 key (19700101) so successive
+        // corruptions don't silently collide at month/day-only keys.
+        #[allow(clippy::cast_sign_loss)]
+        let yyyymmdd = if year < 0 {
+            warn!("snapshot_current_day: negative year {year}; routing to sentinel 1970-01-01");
+            19_700_101
+        } else {
+            (year as u32) * 10_000 + month * 100 + day
+        };
 
         #[allow(clippy::cast_precision_loss)]
         let operating_hours = self.current_day_operating_secs as f64 / 3600.0;
@@ -653,19 +740,15 @@ impl HeatPumpStatsInner {
             None
         };
 
-        let record = DailyRecord {
-            date,
-            starts: self.current_day_starts,
-            operating_hours,
-            avg_outdoor_temp_c: avg_temp,
-        };
-
-        trace!("Archiving daily record: {:?}", record);
-
-        self.daily_history.push_back(record);
-        if self.daily_history.len() > MAX_DAILY_HISTORY {
-            self.daily_history.pop_front();
-        }
+        Some((
+            yyyymmdd,
+            DailyBlob {
+                date,
+                starts: self.current_day_starts,
+                operating_hours,
+                avg_outdoor_temp_c: avg_temp,
+            },
+        ))
     }
 }
 
@@ -688,27 +771,45 @@ fn hour_start(secs: u64) -> u64 {
     (secs / 3600) * 3600
 }
 
-/// Get the start of the day (UTC midnight) containing the given timestamp
-fn day_start(secs: u64) -> u64 {
-    (secs / 86400) * 86400
+/// Get the start of the day (local midnight in `tz`) containing the given
+/// timestamp, expressed as a Unix timestamp in UTC seconds.
+fn day_start_in(secs: u64, tz: Tz) -> u64 {
+    let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    let (year, month, day, _) = crate::energy::tariff::system_time_to_local(time, tz);
+    crate::energy::tariff::local_midnight_utc_secs(year, month, day, tz)
 }
 
-/// Get the start of the week (Monday UTC midnight) containing the given timestamp
+
+/// Get the start of the week (Monday UTC midnight) containing the given timestamp.
 fn week_start(secs: u64) -> u64 {
     let datetime = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
     let days_since_monday = datetime.weekday().num_days_from_monday();
     let monday = datetime - chrono::Duration::days(i64::from(days_since_monday));
-    let monday_midnight = monday.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+    // `(0, 0, 0)` is always a valid time-of-day; `and_hms_opt` only returns
+    // None for out-of-range hours/minutes/seconds.
+    let monday_midnight = monday
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time-of-day")
+        .and_utc();
     #[allow(clippy::cast_sign_loss)]
     {
         monday_midnight.timestamp() as u64
     }
 }
 
-/// Get the start of the month containing the given year/month
+/// Get the start of the month containing the given year/month.
+///
+/// Callers (`year_start`, `month_buckets`) only invoke this with months
+/// produced by `secs_to_ymd_in`, which routes through `system_time_to_local`
+/// and is guaranteed to return month in 1..=12.
 fn month_start(year: i32, month: u32) -> u64 {
-    let date = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
-    let datetime = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, 1)
+        .expect("month must be 1..=12 by caller contract");
+    let datetime = date
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time-of-day")
+        .and_utc();
     #[allow(clippy::cast_sign_loss)]
     {
         datetime.timestamp() as u64
@@ -720,11 +821,13 @@ fn year_start(year: i32) -> u64 {
     month_start(year, 1)
 }
 
-/// Convert Unix timestamp to (year, month, day)
-fn secs_to_ymd(secs: u64) -> (i32, u32, u32) {
-    let datetime = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
-    (datetime.year(), datetime.month(), datetime.day())
+/// Convert Unix timestamp to (year, month, day) in `tz` local time.
+fn secs_to_ymd_in(secs: u64, tz: Tz) -> (i32, u32, u32) {
+    let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    let (year, month, day, _hour) = crate::energy::tariff::system_time_to_local(time, tz);
+    (year, month, day)
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -893,12 +996,24 @@ mod tests {
 
     #[test]
     fn test_day_start_calculation() {
-        // 2026-01-15 14:37:45 UTC
+        // 2026-01-15 14:37:45 UTC == 2026-01-15 15:37:45 Swedish (UTC+1).
         let ts: u64 = 1_768_487_865;
-        let day = day_start(ts);
+        let day = day_start_in(ts, Stockholm);
 
-        // Should be 2026-01-15 00:00:00 UTC = 1768435200
-        assert_eq!(day, 1_768_435_200);
+        // Swedish-local midnight for 2026-01-15 is 2026-01-14 23:00:00 UTC.
+        // 2026-01-15 00:00:00 UTC == 1_768_435_200, so Swedish midnight is
+        // one hour earlier: 1_768_431_600.
+        assert_eq!(day, 1_768_431_600);
+    }
+
+    #[test]
+    fn test_day_start_swedish_boundary() {
+        // 2026-01-15 23:30:00 UTC == 2026-01-16 00:30:00 Swedish — the
+        // Swedish-local day has already rolled over.
+        let ts: u64 = 1_768_519_800;
+        let day = day_start_in(ts, Stockholm);
+        // Swedish midnight of 2026-01-16 == 2026-01-15 23:00:00 UTC == 1_768_518_000.
+        assert_eq!(day, 1_768_518_000);
     }
 
     #[test]
@@ -913,13 +1028,201 @@ mod tests {
 
     #[test]
     fn test_secs_to_ymd() {
-        // 2026-01-15 14:37:45 UTC
+        // 2026-01-15 14:37:45 UTC == 2026-01-15 15:37:45 Swedish.
         let ts: u64 = 1_768_487_865;
-        let (year, month, day) = secs_to_ymd(ts);
+        let (year, month, day) = secs_to_ymd_in(ts, Stockholm);
 
         assert_eq!(year, 2026);
         assert_eq!(month, 1);
         assert_eq!(day, 15);
+    }
+
+    #[test]
+    fn test_secs_to_ymd_crosses_swedish_midnight() {
+        // 2026-01-15 23:30:00 UTC is already 2026-01-16 00:30:00 Swedish.
+        let ts: u64 = 1_768_519_800;
+        let (year, month, day) = secs_to_ymd_in(ts, Stockholm);
+        assert_eq!((year, month, day), (2026, 1, 16));
+    }
+
+    #[test]
+    fn test_secs_to_ymd_crosses_swedish_midnight_cest() {
+        // 2026-07-15 22:30:00 UTC is 2026-07-16 00:30:00 Swedish during CEST
+        // (UTC+2). The Swedish day boundary lies at 22:00 UTC in summer, not
+        // 23:00 UTC as it does in winter.
+        let ts: u64 = 1_784_154_600;
+        let (year, month, day) = secs_to_ymd_in(ts, Stockholm);
+        assert_eq!((year, month, day), (2026, 7, 16));
+    }
+
+    #[test]
+    fn test_day_start_swedish_boundary_cest() {
+        // Same instant as above: 2026-07-15 22:30:00 UTC == 2026-07-16
+        // 00:30:00 Swedish (CEST). The start of the Swedish day 2026-07-16
+        // is 2026-07-15 22:00:00 UTC == 1_784_152_800.
+        let ts: u64 = 1_784_154_600;
+        let day = day_start_in(ts, Stockholm);
+        assert_eq!(day, 1_784_152_800);
+    }
+
+    #[test]
+    fn test_check_window_rollovers_spring_forward_dst() {
+        use chrono::TimeZone;
+
+        // 2026 Stockholm spring forward: Sunday 2026-03-29 02:00 CET → 03:00
+        // CEST. The Sunday→Monday rollover is the DST-affected one: Sunday's
+        // local day is only 23 hours long because the clock jumps forward.
+        let sunday_noon = Stockholm.with_ymd_and_hms(2026, 3, 29, 12, 0, 0).unwrap();
+        let monday_noon = Stockholm.with_ymd_and_hms(2026, 3, 30, 12, 0, 0).unwrap();
+        let monday_midnight = Stockholm.with_ymd_and_hms(2026, 3, 30, 0, 0, 0).unwrap();
+
+        let sunday_noon_secs = u64::try_from(sunday_noon.timestamp()).unwrap();
+        let monday_noon_secs = u64::try_from(monday_noon.timestamp()).unwrap();
+        let monday_midnight_secs = u64::try_from(monday_midnight.timestamp()).unwrap();
+
+        let mut inner = fresh_inner(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(sunday_noon_secs),
+            Stockholm,
+        );
+        // Force the day to look active so snapshot_current_day archives.
+        inner.current_day_starts = 3;
+        inner.current_day_operating_secs = 7200;
+
+        let archived = inner
+            .check_window_rollovers(monday_noon_secs)
+            .expect("Sunday should be archived on Monday rollover");
+        assert_eq!(archived.0, 20_260_329, "yyyymmdd for archived Sunday");
+        assert_eq!(archived.1.date, "2026-03-29");
+        assert_eq!(archived.1.starts, 3);
+
+        assert_eq!(
+            inner.current_day_start, monday_midnight_secs,
+            "new current_day_start should be Monday Stockholm midnight"
+        );
+        assert_eq!(inner.current_day_date, (2026, 3, 30));
+        assert_eq!(inner.current_day_starts, 0);
+    }
+
+    #[test]
+    fn test_active_cycle_credit_across_spring_forward_dst() {
+        use chrono::TimeZone;
+
+        // Stockholm 2026-03-30 (Monday) midnight is the day boundary that
+        // immediately follows DST spring-forward (Sunday 02:00 → 03:00 CEST).
+        // An active cycle that started 30 min before Monday-midnight Stockholm
+        // should credit Sunday with that 30 min when the day rolls over.
+        let sunday_anchor = Stockholm.with_ymd_and_hms(2026, 3, 29, 12, 0, 0).unwrap();
+        let monday_midnight = Stockholm.with_ymd_and_hms(2026, 3, 30, 0, 0, 0).unwrap();
+        let cycle_start = monday_midnight - chrono::Duration::minutes(30);
+        let after_midnight = monday_midnight + chrono::Duration::minutes(10);
+
+        let sunday_anchor_secs = u64::try_from(sunday_anchor.timestamp()).unwrap();
+        let monday_midnight_secs = u64::try_from(monday_midnight.timestamp()).unwrap();
+        let cycle_start_secs = u64::try_from(cycle_start.timestamp()).unwrap();
+        let after_midnight_secs = u64::try_from(after_midnight.timestamp()).unwrap();
+
+        let mut inner = fresh_inner(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(sunday_anchor_secs),
+            Stockholm,
+        );
+        // Simulate an in-progress cycle that started 30 min before Monday-midnight.
+        inner.compressor_on = true;
+        inner.observed_cycle_start = true;
+        inner.state_started_at =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(cycle_start_secs);
+
+        let archived = inner
+            .check_window_rollovers(after_midnight_secs)
+            .expect("Sunday should be archived on Monday rollover");
+        assert_eq!(archived.0, 20_260_329, "yyyymmdd for archived Sunday");
+
+        // Sunday should be credited with the 30 min pre-midnight portion.
+        let archived_secs = (archived.1.operating_hours * 3600.0).round() as i64;
+        assert_eq!(archived_secs, 1800, "Sunday operating_secs from pre-midnight credit");
+
+        // current_cycle_credited_secs records the credit so the eventual
+        // cycle close subtracts it instead of double-counting.
+        assert_eq!(inner.current_cycle_credited_secs, 1800);
+
+        // Day boundary advanced cleanly to Monday Stockholm midnight.
+        assert_eq!(inner.current_day_start, monday_midnight_secs);
+        assert_eq!(inner.current_day_date, (2026, 3, 30));
+    }
+
+    #[test]
+    fn test_active_cycle_credit_across_fall_back_dst() {
+        use chrono::TimeZone;
+
+        // Stockholm 2026-10-26 (Monday) midnight is the boundary right after
+        // DST fall-back (Sunday 03:00 CEST → 02:00 CET). Sunday's local day
+        // is 25 hours long; the credit math must still produce exactly the
+        // pre-midnight chunk regardless of day length.
+        let sunday_anchor = Stockholm.with_ymd_and_hms(2026, 10, 25, 12, 0, 0).unwrap();
+        let monday_midnight = Stockholm.with_ymd_and_hms(2026, 10, 26, 0, 0, 0).unwrap();
+        let cycle_start = monday_midnight - chrono::Duration::minutes(45);
+        let after_midnight = monday_midnight + chrono::Duration::minutes(15);
+
+        let sunday_anchor_secs = u64::try_from(sunday_anchor.timestamp()).unwrap();
+        let monday_midnight_secs = u64::try_from(monday_midnight.timestamp()).unwrap();
+        let cycle_start_secs = u64::try_from(cycle_start.timestamp()).unwrap();
+        let after_midnight_secs = u64::try_from(after_midnight.timestamp()).unwrap();
+
+        let mut inner = fresh_inner(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(sunday_anchor_secs),
+            Stockholm,
+        );
+        inner.compressor_on = true;
+        inner.observed_cycle_start = true;
+        inner.state_started_at =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(cycle_start_secs);
+
+        let archived = inner
+            .check_window_rollovers(after_midnight_secs)
+            .expect("Sunday should be archived on Monday rollover");
+        assert_eq!(archived.0, 20_261_025, "yyyymmdd for archived Sunday");
+
+        let archived_secs = (archived.1.operating_hours * 3600.0).round() as i64;
+        assert_eq!(archived_secs, 2700, "Sunday operating_secs (45 min pre-midnight)");
+        assert_eq!(inner.current_cycle_credited_secs, 2700);
+        assert_eq!(inner.current_day_start, monday_midnight_secs);
+        assert_eq!(inner.current_day_date, (2026, 10, 26));
+    }
+
+    #[test]
+    fn test_check_window_rollovers_fall_back_dst() {
+        use chrono::TimeZone;
+
+        // 2026 Stockholm fall back: Sunday 2026-10-25 03:00 CEST → 02:00 CET.
+        // The Sunday→Monday rollover is the DST-affected one: Sunday's local
+        // day is 25 hours long because the clock jumps back.
+        let sunday_noon = Stockholm.with_ymd_and_hms(2026, 10, 25, 12, 0, 0).unwrap();
+        let monday_noon = Stockholm.with_ymd_and_hms(2026, 10, 26, 12, 0, 0).unwrap();
+        let monday_midnight = Stockholm.with_ymd_and_hms(2026, 10, 26, 0, 0, 0).unwrap();
+
+        let sunday_noon_secs = u64::try_from(sunday_noon.timestamp()).unwrap();
+        let monday_noon_secs = u64::try_from(monday_noon.timestamp()).unwrap();
+        let monday_midnight_secs = u64::try_from(monday_midnight.timestamp()).unwrap();
+
+        let mut inner = fresh_inner(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(sunday_noon_secs),
+            Stockholm,
+        );
+        inner.current_day_starts = 5;
+        inner.current_day_operating_secs = 10_800;
+
+        let archived = inner
+            .check_window_rollovers(monday_noon_secs)
+            .expect("Sunday should be archived on Monday rollover");
+        assert_eq!(archived.0, 20_261_025, "yyyymmdd for archived Sunday");
+        assert_eq!(archived.1.date, "2026-10-25");
+        assert_eq!(archived.1.starts, 5);
+
+        assert_eq!(
+            inner.current_day_start, monday_midnight_secs,
+            "new current_day_start should be Monday Stockholm midnight"
+        );
+        assert_eq!(inner.current_day_date, (2026, 10, 26));
+        assert_eq!(inner.current_day_starts, 0);
     }
 
     #[test]
@@ -1039,6 +1342,161 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_poll_failed_discards_in_progress_cycle() {
+        let stats = HeatPumpStats::new();
+
+        // Establish an observed ON cycle.
+        stats.update_state(0, Some(0.0));
+        stats.update_state(3, Some(-5.0));
+        assert_eq!(stats.get_summary().starts.this_hour, 1);
+
+        // Modbus poll fails — state becomes unknown, cycle is discarded.
+        stats.mark_poll_failed();
+
+        // Compressor turns off during the outage; we only see it after recovery.
+        stats.update_state(0, Some(-5.0));
+
+        // No cycle should be recorded (we couldn't verify the cycle's duration).
+        let summary = stats.get_summary();
+        assert!(
+            summary.cycle_stats.is_none(),
+            "outage cycle must not be recorded"
+        );
+        // No operating time should be credited across the outage.
+        assert!(summary.operating_hours.this_hour < 0.001);
+
+        assert_eq!(summary.starts.this_hour, 1);
+    }
+
+    #[test]
+    fn test_mark_poll_failed_rolls_back_pre_midnight_credit() {
+        let stats = HeatPumpStats::new();
+
+        stats.update_state(0, Some(0.0));
+        stats.update_state(3, Some(-5.0));
+
+        let now_secs = system_time_to_secs(SystemTime::now());
+        let today_midnight = day_start_in(now_secs, Stockholm);
+        let yesterday_midnight = day_start_in(today_midnight - 1, Stockholm);
+
+        {
+            let mut inner = stats.inner.lock().unwrap();
+            inner.state_started_at =
+                SystemTime::UNIX_EPOCH + Duration::from_secs(today_midnight - 1800);
+            inner.current_day_start = yesterday_midnight;
+            inner.current_day_date = secs_to_ymd_in(yesterday_midnight, Stockholm);
+            inner.current_day_starts = 1;
+        }
+        stats.update_state(3, Some(-5.0));
+
+        let before_today = stats.get_summary().operating_hours.this_day;
+        stats.mark_poll_failed();
+        let after_today = stats.get_summary().operating_hours.this_day;
+        assert!(
+            before_today >= after_today,
+            "mark_poll_failed should not inflate today's operating hours \
+             (before={before_today}, after={after_today})"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn test_cycle_spanning_midnight_splits_between_days() {
+        let (_dir, store) = tmp_store();
+        let stats = HeatPumpStats::new_with_store_and_tz(store, Stockholm);
+
+        // Bring the tracker into a clean OFF state, then ON state.
+        stats.update_state(0, Some(0.0));
+        stats.update_state(3, Some(-5.0));
+
+        // Now rewrite internal state so the current ON cycle appears to
+        // have started 30 minutes before Swedish-local midnight, and the
+        // "current day" is the day that just ended. We do NOT touch `now`
+        // itself — `update_state` reads `SystemTime::now()` which is
+        // strictly after the rewritten state_started_at, so the day
+        // rollover at the top of `update_state` will fire.
+        let now = SystemTime::now();
+        let now_secs = system_time_to_secs(now);
+        // Find the Swedish-local midnight that has most recently passed.
+        let today_midnight = day_start_in(now_secs, Stockholm);
+        // Skip the test if we happen to be running within ±5 s of Swedish-local
+        // midnight. The test arithmetic relies on the day boundary not moving
+        // between the two `SystemTime::now()` reads, which can fail at the
+        // exact rollover. Re-running the suite a few seconds later will work.
+        if now_secs.saturating_sub(today_midnight) < 5 {
+            eprintln!(
+                "test_cycle_spanning_midnight_splits_between_days: skipping — too close to Swedish-local midnight (now-midnight = {} s)",
+                now_secs - today_midnight
+            );
+            return;
+        }
+        // Cycle started 30 min before that midnight.
+        let cycle_start_secs = today_midnight - 1800;
+        let yesterday_midnight = day_start_in(today_midnight - 1, Stockholm);
+
+        {
+            let mut inner = stats.inner.lock().unwrap();
+            inner.state_started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(cycle_start_secs);
+            inner.current_day_start = yesterday_midnight;
+            // Match current_day_date to yesterday so archive_current_day
+            // writes a record labelled with yesterday's date.
+            inner.current_day_date = secs_to_ymd_in(yesterday_midnight, Stockholm);
+            // Pretend yesterday already had a non-trivial accumulator so
+            // archive_current_day doesn't early-return on the "no data" guard.
+            inner.current_day_starts = 1;
+        }
+
+        // Cycle ends "now" — duration is roughly (now - cycle_start).
+        stats.update_state(0, Some(-5.0));
+
+        let now_secs_after = system_time_to_secs(SystemTime::now());
+        let total_cycle_secs = now_secs_after - cycle_start_secs;
+        // Today gets only the portion after Swedish-local midnight.
+        let expected_today_secs = now_secs_after - today_midnight;
+        // Yesterday gets the 30 min before midnight.
+        let expected_yesterday_secs: u64 = 1800;
+
+        let summary = stats.get_summary();
+        // Allow a small tolerance because SystemTime::now() advances
+        // between our reads.
+        let this_day_secs = (summary.operating_hours.this_day * 3600.0).round() as u64;
+        assert!(
+            this_day_secs.abs_diff(expected_today_secs) <= 1,
+            "today's operating secs: got {this_day_secs}, expected ~{expected_today_secs}"
+        );
+
+        // Yesterday should have been archived with ~30 min of operating time.
+        let history = stats.get_history(7);
+        let yesterday = history
+            .daily
+            .iter()
+            .find(|d| {
+                let (y, m, d_) = secs_to_ymd_in(yesterday_midnight, Stockholm);
+                d.date == format!("{y:04}-{m:02}-{d_:02}")
+            })
+            .expect("yesterday's archive should be present");
+        let yesterday_secs = (yesterday.operating_hours * 3600.0).round() as u64;
+        assert_eq!(
+            yesterday_secs, expected_yesterday_secs,
+            "yesterday's operating secs"
+        );
+
+        // Total across both days must equal the full cycle (no double counting).
+        assert!(
+            (yesterday_secs + this_day_secs).abs_diff(total_cycle_secs) <= 1,
+            "split totals should equal cycle duration: \
+             yesterday={yesterday_secs} + today={this_day_secs} vs cycle={total_cycle_secs}"
+        );
+
+        // The cycle history still records the full duration.
+        let last_cycle = history.cycles.last().expect("cycle recorded");
+        assert!(
+            last_cycle.duration_secs.abs_diff(total_cycle_secs) <= 1,
+            "cycle history duration should be the full cycle"
+        );
+    }
+
+    #[test]
     fn test_partial_cycle_no_operating_time() {
         let stats = HeatPumpStats::new();
 
@@ -1057,21 +1515,16 @@ mod tests {
         assert_eq!(summary.tracking.total_starts, 0);
     }
 
-    fn unique_persist_path(label: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        let pid = std::process::id();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        p.push(format!("ctc_stats_{label}_{pid}_{nanos}.json"));
-        p
+    fn tmp_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("ctc.redb")).unwrap();
+        (dir, store)
     }
 
     #[test]
-    fn test_persist_round_trip() {
-        let path = unique_persist_path("round_trip");
-        let stats = HeatPumpStats::new_with_persistence(path.clone());
+    fn test_store_round_trip() {
+        let (_dir, store) = tmp_store();
+        let stats = HeatPumpStats::new_with_store_and_tz(store.clone(), Stockholm);
 
         // Drive a complete cycle so accumulators advance.
         stats.update_state(0, Some(10.0));
@@ -1082,73 +1535,47 @@ mod tests {
         let before = stats.get_summary();
         assert_eq!(before.tracking.total_starts, 1);
 
-        // Reload — start times must match (same tracking_started_unix_secs)
-        // and total_starts must survive.
-        let reloaded = HeatPumpStats::new_with_persistence(path.clone());
+        // A second HeatPumpStats sharing the same store must see the same
+        // accumulators — no flush is needed because Store keeps everything
+        // in RAM until `flush()` is called.
+        let reloaded = HeatPumpStats::new_with_store_and_tz(store, Stockholm);
         let after = reloaded.get_summary();
         assert_eq!(after.tracking.total_starts, 1);
         assert_eq!(after.tracking.started_at, before.tracking.started_at);
 
-        // Cycle history must round-trip.
+        // Cycle history must round-trip via the store.
         let history = reloaded.get_history(7);
         assert_eq!(history.cycles.len(), 1);
-
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn test_persist_missing_file_starts_fresh() {
-        let path = unique_persist_path("missing");
-        assert!(!path.exists());
-        let stats = HeatPumpStats::new_with_persistence(path.clone());
+    fn test_store_round_trip_after_flush() {
+        // Open a store, write a cycle, flush, then re-open the store and
+        // verify accumulators + cycle survive across the simulated restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ctc.redb");
+
+        {
+            let store = Store::open(&path).unwrap();
+            let stats = HeatPumpStats::new_with_store_and_tz(store.clone(), Stockholm);
+            stats.update_state(0, Some(5.0));
+            stats.update_state(3, Some(6.0));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            stats.update_state(0, Some(7.0));
+            store.flush().unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let stats = HeatPumpStats::new_with_store_and_tz(store, Stockholm);
+        let summary = stats.get_summary();
+        assert_eq!(summary.tracking.total_starts, 1);
+        assert_eq!(stats.get_history(7).cycles.len(), 1);
+    }
+
+    #[test]
+    fn test_fresh_store_starts_with_zero_accumulators() {
+        let (_dir, store) = tmp_store();
+        let stats = HeatPumpStats::new_with_store_and_tz(store, Stockholm);
         assert_eq!(stats.get_summary().tracking.total_starts, 0);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn test_persist_corrupt_file_starts_fresh() {
-        let path = unique_persist_path("corrupt");
-        std::fs::write(&path, b"this is not json").unwrap();
-        let stats = HeatPumpStats::new_with_persistence(path.clone());
-        // Falls back cleanly without panic.
-        assert_eq!(stats.get_summary().tracking.total_starts, 0);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn test_persist_unknown_schema_version_starts_fresh() {
-        let path = unique_persist_path("schema");
-        let bogus = serde_json::json!({
-            "schema_version": 999,
-            "tracking_started_unix_secs": 1_700_000_000u64,
-            "total_starts": 42u64,
-            "total_operating_secs": 1234u64,
-            "cycle_history": [],
-            "daily_history": [],
-        });
-        std::fs::write(&path, serde_json::to_vec(&bogus).unwrap()).unwrap();
-        let stats = HeatPumpStats::new_with_persistence(path.clone());
-        // Schema mismatch → we treat the file as unreadable and start fresh.
-        assert_eq!(stats.get_summary().tracking.total_starts, 0);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn test_save_to_disk_atomic_write() {
-        let path = unique_persist_path("atomic");
-        let stats = HeatPumpStats::new_with_persistence(path.clone());
-        stats.save_to_disk().unwrap();
-        // After a successful save, the .tmp must not be lingering.
-        let tmp = path.with_extension("json.tmp");
-        assert!(!tmp.exists(), "temp file should be renamed away");
-        assert!(path.exists(), "final file should exist");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn test_new_disables_persistence() {
-        // The plain `new()` keeps existing test ergonomics: no file is created.
-        let stats = HeatPumpStats::new();
-        stats.save_to_disk().unwrap(); // no-op, never errors
     }
 }

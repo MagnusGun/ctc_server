@@ -1,124 +1,147 @@
 //! Heat pump status polling loop
 //!
-//! Polls the heat pump status and outdoor temperature registers at a configurable
-//! interval to track compressor cycles and correlate with temperature.
+//! Reads the latest `HEATPUMP_STATUS` and `CTC_OUTDOOR_TEMP` values from the
+//! shared sensor cache (filled by `storage::poller`) and feeds them into the
+//! `HeatPumpStats` tracker. We deliberately do not issue our own Modbus reads
+//! here: the sensor-cache poller is the single Modbus reader for these two
+//! registers, which avoids actor-mutex contention and duplicated round-trips.
+//!
+//! Resolution is therefore bounded by the sensor cache's tick (5 s by default),
+//! not this loop's `poll_interval_secs`. Setting `poll_interval_secs` faster
+//! than the cache tick just re-samples the same values.
 
 use std::time::Duration;
 
-use tokio::sync::oneshot;
-use tokio::time::interval;
-use tracing::{debug, error, info, trace};
+use tokio::time::{MissedTickBehavior, interval};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, trace};
 
 use crate::heatpump::stats::HeatPumpStats;
-use crate::modbus::bms_parameters::{CTC_OUTDOOR_TEMP, HEATPUMP_STATUS};
-use crate::modbus::{ModbusResponse, ModbusSender, ParameterOperation};
+use crate::storage::{Sensor, Store};
 
-/// Run the heat pump status polling loop
+/// Run the heat pump status polling loop.
 ///
-/// Polls `HEATPUMP_STATUS` and `CTC_OUTDOOR_TEMP` at the specified interval
-/// and updates the statistics tracker with state changes.
+/// On each tick, reads the latest `HpStatus` and `Outdoor` values from the
+/// sensor cache and forwards them to `stats.update_state`. The cache may
+/// still be empty for a few seconds after startup; in that case we skip
+/// the update with a debug log.
 ///
 /// # Arguments
-/// * `modbus_tx` - Channel to send Modbus requests
+/// * `store` - Sensor cache (single source of truth for `HEATPUMP_STATUS` and
+///   `CTC_OUTDOOR_TEMP`)
 /// * `stats` - Heat pump statistics tracker
-/// * `poll_interval_secs` - Polling interval in seconds
-/// * `request_timeout_secs` - Timeout for each Modbus request
+/// * `poll_interval_secs` - How often to consult the cache
 pub async fn run_poll_loop(
-    modbus_tx: ModbusSender,
+    store: Store,
     stats: HeatPumpStats,
     poll_interval_secs: u64,
-    request_timeout_secs: u64,
+    cancel: CancellationToken,
 ) {
     let mut ticker = interval(Duration::from_secs(poll_interval_secs));
-    let request_timeout = Duration::from_secs(request_timeout_secs);
+    // Match the sensor-cache poller — a backlog of ticks after a stall isn't
+    // useful when we're just re-reading the same cached values.
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     info!(
-        "Heat pump status polling started (interval: {}s)",
+        "Heat pump status polling started (interval: {}s, source: sensor cache)",
         poll_interval_secs
     );
 
     loop {
-        ticker.tick().await;
-
-        // Read heat pump status
-        let hp_status = read_register(&modbus_tx, &HEATPUMP_STATUS, request_timeout).await;
-
-        // Read outdoor temperature
-        let outdoor_temp = read_register(&modbus_tx, &CTC_OUTDOOR_TEMP, request_timeout).await;
-
-        match hp_status {
-            Some(hp_status_value) => {
-                // Status is returned as f32 but is actually an integer code
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let status_code = hp_status_value as u16;
-
-                trace!(
-                    "Heat pump poll: status={}, outdoor_temp={:?}",
-                    status_code, outdoor_temp
-                );
-
-                stats.update_state(status_code, outdoor_temp);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                info!("Heat pump poller: shutdown signal received");
+                return;
             }
-            None => {
-                debug!("Failed to read heat pump status, skipping update");
-            }
+            _ = ticker.tick() => {}
         }
-    }
-}
 
-/// Read a single register value with timeout
-///
-/// Returns `Some(value)` on success, `None` on failure
-async fn read_register(
-    modbus_tx: &ModbusSender,
-    param: &crate::modbus::CTCModbusParameter,
-    timeout: Duration,
-) -> Option<f32> {
-    let (response_tx, response_rx) = oneshot::channel();
+        let hp_status = store.latest_sample(Sensor::HpStatus).map(|(_, v)| v);
+        let outdoor_temp = store.latest_sample(Sensor::Outdoor).map(|(_, v)| v);
 
-    // Send read request to actor
-    if modbus_tx
-        .send((ParameterOperation::Read(*param), response_tx))
-        .await
-        .is_err()
-    {
-        error!(
-            "Failed to send {} request to Modbus actor",
-            param.description
-        );
-        return None;
-    }
+        if let Some(hp_status_value) = hp_status {
+            // Status is returned as f32 but is actually an integer code
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let status_code = hp_status_value as u16;
 
-    // Wait for response with timeout
-    match tokio::time::timeout(timeout, response_rx).await {
-        Ok(Ok(Ok(ModbusResponse::Value(value)))) => Some(value),
-        Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
-            error!("Unexpected RawRegisters response for {}", param.description);
-            None
-        }
-        Ok(Ok(Err(e))) => {
-            debug!("Modbus error reading {}: {}", param.description, e);
-            None
-        }
-        Ok(Err(e)) => {
-            debug!("Channel error reading {}: {}", param.description, e);
-            None
-        }
-        Err(_) => {
-            debug!("Timeout reading {}", param.description);
-            None
+            trace!(
+                "Heat pump poll: status={}, outdoor_temp={:?}",
+                status_code, outdoor_temp
+            );
+
+            stats.update_state(status_code, outdoor_temp);
+        } else {
+            // Invalidate the in-progress cycle so the outage period isn't
+            // counted as operating time. The next successful poll will
+            // re-sync state cleanly.
+            debug!("Failed to read heat pump status — marking state unknown");
+            stats.mark_poll_failed();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Note: Integration tests would require mocking the Modbus actor
-    // These are basic unit tests for the module structure
+    use super::*;
+    use std::time::SystemTime;
 
-    #[test]
-    fn test_module_compiles() {
-        // This test ensures the module compiles correctly
-        // Actual polling tests require a running Modbus actor
+    #[tokio::test]
+    async fn poller_skips_when_cache_empty() {
+        // Fresh store has no samples — the loop's empty-cache branch invokes
+        // mark_poll_failed silently. Asserting the loop respects the cancel
+        // token and exits in bounded time is the contract we care about.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("ctc.redb")).unwrap();
+        let stats =
+            HeatPumpStats::new_with_store_and_tz(store.clone(), chrono_tz::Europe::Stockholm);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_poll_loop(store, stats, 1, cancel.clone()));
+
+        // tokio::time::interval fires immediately on first tick, so one body
+        // iteration is guaranteed by the time we cancel.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("poller should stop within 1s of cancel")
+            .expect("task should not panic");
+    }
+
+    #[tokio::test]
+    async fn poller_updates_stats_from_cache() {
+        // Seed the cache with HpStatus=1 (Ready, OFF). The poll loop should
+        // forward that to stats and initialize the tracker, observable via
+        // get_summary().
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("ctc.redb")).unwrap();
+        let stats =
+            HeatPumpStats::new_with_store_and_tz(store.clone(), chrono_tz::Europe::Stockholm);
+
+        store
+            .record_sample(Sensor::HpStatus, SystemTime::now(), 1.0)
+            .expect("seed HpStatus");
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_poll_loop(
+            store.clone(),
+            stats.clone(),
+            1,
+            cancel.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("poller should stop within 1s of cancel")
+            .expect("task should not panic");
+
+        // HpStatus=1 (Ready) → compressor off. The poll initialized stats
+        // without recording a start (initialization sync, not OFF→ON).
+        let summary = stats.get_summary();
+        assert!(!summary.compressor_on);
+        assert_eq!(summary.starts.this_hour, 0);
     }
 }

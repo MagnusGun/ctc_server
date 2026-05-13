@@ -87,7 +87,7 @@ pub async fn read_parameter(
     match timeout(request_timeout, response_rx).await {
         Ok(Ok(Ok(ModbusResponse::Value(value)))) => {
             trace!("{log_context}: {value}");
-            Ok(format!("{{\"{json_key}\": {value:?}}}\n"))
+            format_value_json(json_key, value)
         }
         Ok(Ok(Ok(ModbusResponse::RawRegisters { .. }))) => {
             error!("Unexpected RawRegisters response in {log_context}");
@@ -111,6 +111,19 @@ pub async fn read_parameter(
             Err(ApiError::Timeout)
         }
     }
+}
+
+/// Format a single `{json_key: value}\n` response as proper JSON.
+///
+/// Uses `serde_json` so the value is emitted as a JSON number rather than
+/// relying on `Debug`, which can produce odd shapes for integer-coded
+/// registers and is not guaranteed to be valid JSON for all `f32` values.
+fn format_value_json(json_key: &str, value: f32) -> Result<String, ApiError> {
+    let body = serde_json::json!({ json_key: value });
+    serde_json::to_string(&body).map(|s| s + "\n").map_err(|e| {
+        error!("Failed to serialize {json_key} response: {e}");
+        ApiError::InternalError
+    })
 }
 
 /// Generic helper function to write a Modbus parameter
@@ -154,7 +167,7 @@ pub async fn write_parameter(
     match timeout(request_timeout, response_rx).await {
         Ok(Ok(Ok(_))) => {
             trace!("{log_context}: write_parameter - Response received: SUCCESS");
-            Ok(format!("{{\"{json_key}\": {value:?}}}\n"))
+            format_value_json(json_key, value)
         }
         Ok(Ok(Err(e))) => {
             // Log full error details internally
@@ -281,7 +294,7 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "{\"temperature\": 22.5}\n");
+        assert_eq!(result.unwrap(), "{\"temperature\":22.5}\n");
     }
 
     #[tokio::test]
@@ -359,7 +372,7 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "{\"temperature\": 23.0}\n");
+        assert_eq!(result.unwrap(), "{\"temperature\":23.0}\n");
     }
 
     #[tokio::test]

@@ -6,10 +6,8 @@ FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest AS planner
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY server/Cargo.toml ./server/
-COPY smartgrid_test/Cargo.toml ./smartgrid_test/
 # Create minimal source structure for cargo-chef to analyze workspace
 RUN mkdir -p server/src && echo "fn main() {}" > server/src/main.rs
-RUN mkdir -p smartgrid_test/src && echo "fn main() {}" > smartgrid_test/src/main.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2: Cacher - Build and cache dependencies (cross-compile to ARM64)
@@ -64,9 +62,6 @@ COPY --from=cacher /usr/local/cargo /usr/local/cargo
 COPY Cargo.toml Cargo.lock ./
 COPY server/Cargo.toml ./server/
 COPY server/src ./server/src
-# Create minimal smartgrid_test structure for workspace resolution (not built)
-COPY smartgrid_test/Cargo.toml ./smartgrid_test/
-RUN mkdir -p smartgrid_test/src && echo "fn main() {}" > smartgrid_test/src/main.rs
 
 # Build the release binary and strip it
 RUN cargo build --release --target aarch64-unknown-linux-gnu -p server \
@@ -90,9 +85,6 @@ COPY --from=builder --chown=1000:1000 /app/target/aarch64-unknown-linux-gnu/rele
 
 # Copy static files directly from context with ownership
 COPY --chown=1000:1000 server/static /app/static
-
-# Copy default config template with ownership
-COPY --chown=1000:1000 config.toml.example /app/config.toml.default
 
 # Switch to non-root user
 USER ctc

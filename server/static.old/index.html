@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CTC EcoHeat 410 Status</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <header>
+        <div class="header-content">
+            <h1>⚡ CTC EcoHeat 410</h1>
+            <div class="header-status-group">
+                <div class="header-badge-group" data-tooltip="Grid control mode: Normal, Blocking, LowPrice, OverCapacity" data-tooltip-bottom>
+                    <span class="header-badge-label">SmartGrid:</span>
+                    <span class="header-badge" id="smartgrid-status">--</span>
+                    <span class="header-badge-timestamp" id="smartgrid-timestamp"></span>
+                </div>
+                <div class="header-badge-group clickable" id="powersave-toggle"
+                     data-tooltip="Click to toggle power saving mode" data-tooltip-bottom
+                     role="button" tabindex="0" aria-label="Toggle power save mode">
+                    <span class="header-badge-label">Powersave:</span>
+                    <span class="header-badge" id="powersave-status">--</span>
+                </div>
+                <div class="connection-status" id="connection-status">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Connecting...</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main>
+        <!-- Temperatures and Heating System -->
+        <section class="info-row">
+            <div class="card panel-card">
+                <h2>🌡️ Temperatures</h2>
+                <div class="temp-grid">
+                    <div class="temp-grid-item" data-tooltip="Current indoor temperature from room sensor">
+                        <div class="temp-grid-label">Room</div>
+                        <div class="temp-grid-value" id="room-temp">--.-°</div>
+                        <div class="temp-grid-sub" id="room-setpoint">set: --°</div>
+                    </div>
+                    <div class="temp-grid-item" data-tooltip="Outside air temperature">
+                        <div class="temp-grid-label">Outdoor</div>
+                        <div class="temp-grid-value" id="outdoor-temp">--.-°</div>
+                    </div>
+                    <div class="temp-grid-item" data-tooltip="Domestic hot water temperature (top of tank)">
+                        <div class="temp-grid-label">Upper (DHW)</div>
+                        <div class="temp-grid-value" id="dhw-temp">--.-°C</div>
+                    </div>
+                    <div class="temp-grid-item" data-tooltip="Radiator water / lower tank temperature">
+                        <div class="temp-grid-label">Lower (Rad)</div>
+                        <div class="temp-grid-value" id="lower-tank-temp">--.-°C</div>
+                    </div>
+                </div>
+            </div>
+            <div class="card panel-card">
+                <h2>⚙️ Heating System</h2>
+                <div class="info-grid">
+                    <div class="info-item" data-tooltip="Auto, On, or Off">
+                        <span class="info-label">Mode</span>
+                        <span class="info-value" id="heating-mode">--</span>
+                    </div>
+                    <div class="info-item" data-tooltip="Current heating activity: Off, Vacation, Night, or Heating">
+                        <span class="info-label">Status</span>
+                        <span class="info-value status-indicator" id="heating-status">--</span>
+                    </div>
+                    <div class="info-item" data-tooltip="Hot water going out to radiators/underfloor heating">
+                        <span class="info-label">Flow</span>
+                        <span class="info-value" id="flow-temp">--.-°</span>
+                    </div>
+                    <div class="info-item" data-tooltip="Cooled water returning from heating system">
+                        <span class="info-label">Return</span>
+                        <span class="info-value" id="return-temp">--.-°</span>
+                    </div>
+                    <div class="info-item" data-tooltip="Target flow temperature based on outdoor temp curve">
+                        <span class="info-label">Flow SP</span>
+                        <span class="info-value" id="flow-setpoint">--.-°C</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Heat Pump Panel -->
+        <section class="heatpump-section">
+            <div class="card panel-card wide">
+                <div class="panel-header">
+                    <h2>🔄 Heat Pump</h2>
+                    <div class="status-badges">
+                        <span class="status-badge" id="hp-status-badge" data-tooltip="HP Status: Heating, Ready, Defrost, Blocked, etc.">--</span>
+                        <span class="status-badge compressor" id="compressor-badge" data-tooltip="Compressor: ON, OFF, WAIT, TEST, N/A, DISABLED, ERROR">--</span>
+                        <span class="status-badge system" id="system-status-badge" data-tooltip="System: HP Upper/Lower, Add, DHW, HC, Pool, Off, Cooling, Swap">--</span>
+                    </div>
+                </div>
+                <div class="hp-grid">
+                    <div class="hp-row">
+                        <div class="hp-item" data-tooltip="Water entering the heat pump from tank">
+                            <span class="hp-label">HP In</span>
+                            <span class="hp-value" id="hp-in">--.-°</span>
+                        </div>
+                        <div class="hp-item" data-tooltip="Water leaving the heat pump to tank">
+                            <span class="hp-label">HP Out</span>
+                            <span class="hp-value" id="hp-out">--.-°</span>
+                        </div>
+                        <div class="hp-item" data-tooltip="Compressor discharge (hot gas) temperature">
+                            <span class="hp-label">Discharge</span>
+                            <span class="hp-value" id="hp-discharge">--.-°</span>
+                        </div>
+                        <div class="hp-item" data-tooltip="Compressor suction (cold gas) temperature">
+                            <span class="hp-label">Suction</span>
+                            <span class="hp-value" id="hp-suction">--.-°</span>
+                        </div>
+                    </div>
+                    <div class="hp-row hp-row-3">
+                        <div class="hp-item" data-tooltip="Refrigerant high pressure (condenser side)">
+                            <span class="hp-label">High P</span>
+                            <span class="hp-value" id="hp-high-p">--.-- bar</span>
+                        </div>
+                        <div class="hp-item" data-tooltip="Refrigerant low pressure (evaporator side)">
+                            <span class="hp-label">Low P</span>
+                            <span class="hp-value" id="hp-low-p">--.-- bar</span>
+                        </div>
+                        <div class="hp-item brine-inline" data-tooltip="Brine circuit: In (from ground) → Out (to ground), ΔT = heat extracted">
+                            <span class="hp-label">Brine In → Out (ΔT)</span>
+                            <span class="hp-value"><span id="brine-in">--.-</span> → <span id="brine-out">--.-</span> (<span id="brine-delta">--.-</span>°)</span>
+                        </div>
+                    </div>
+                    <div class="hp-pumps">
+                        <div class="pump-item" data-tooltip="Circulates water between heat pump and tank">
+                            <span class="pump-label">Charge Pump</span>
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="charge-pump-bar"></div>
+                            </div>
+                            <span class="pump-value" id="charge-pump">--%</span>
+                        </div>
+                        <div class="pump-item" data-tooltip="Circulates brine through ground loop">
+                            <span class="pump-label">Brine Pump</span>
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="brine-pump-bar"></div>
+                            </div>
+                            <span class="pump-value" id="brine-pump">--%</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Heat Pump Statistics -->
+        <section class="heatpump-section">
+            <div class="card panel-card wide clickable" id="heatpump-stats-panel"
+                 data-tooltip="Click to view statistics charts" role="button" tabindex="0">
+                <div class="panel-header">
+                    <h2>Heat Pump Statistics</h2>
+                    <div class="tracking-info" id="hp-tracking-info">
+                        <span class="tracking-badge">Tracking: --</span>
+                    </div>
+                </div>
+                <div class="hp-stats-grid">
+                    <!-- Cycle Statistics -->
+                    <div class="stats-section">
+                        <h3>Cycle Times</h3>
+                        <div class="cycle-stats">
+                            <div class="cycle-stat" data-tooltip="Shortest compressor run time">
+                                <span class="cycle-label">Min</span>
+                                <span class="cycle-value" id="cycle-min">--:--</span>
+                            </div>
+                            <div class="cycle-stat" data-tooltip="Longest compressor run time">
+                                <span class="cycle-label">Max</span>
+                                <span class="cycle-value" id="cycle-max">--:--</span>
+                            </div>
+                            <div class="cycle-stat" data-tooltip="Average compressor run time">
+                                <span class="cycle-label">Avg</span>
+                                <span class="cycle-value" id="cycle-avg">--:--</span>
+                            </div>
+                            <div class="cycle-stat" data-tooltip="Total completed cycles since tracking started">
+                                <span class="cycle-label">Count</span>
+                                <span class="cycle-value" id="cycle-count">--</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Starts per Window -->
+                    <div class="stats-section">
+                        <h3>Compressor Starts</h3>
+                        <div class="starts-grid">
+                            <div class="starts-item">
+                                <span class="starts-label">This Hour</span>
+                                <span class="starts-value" id="starts-hour">--</span>
+                            </div>
+                            <div class="starts-item">
+                                <span class="starts-label">Today</span>
+                                <span class="starts-value" id="starts-day">--</span>
+                            </div>
+                            <div class="starts-item">
+                                <span class="starts-label">This Week</span>
+                                <span class="starts-value" id="starts-week">--</span>
+                            </div>
+                            <div class="starts-item">
+                                <span class="starts-label">This Month</span>
+                                <span class="starts-value" id="starts-month">--</span>
+                            </div>
+                            <div class="starts-item">
+                                <span class="starts-label">This Year</span>
+                                <span class="starts-value" id="starts-year">--</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Operating Hours -->
+                    <div class="stats-section">
+                        <h3>Operating Hours</h3>
+                        <div class="ophours-grid">
+                            <div class="ophours-item">
+                                <span class="ophours-label">This Hour</span>
+                                <span class="ophours-value" id="ophours-hour">-- min</span>
+                            </div>
+                            <div class="ophours-item">
+                                <span class="ophours-label">Today</span>
+                                <span class="ophours-value" id="ophours-day">-- h</span>
+                            </div>
+                            <div class="ophours-item">
+                                <span class="ophours-label">This Week</span>
+                                <span class="ophours-value" id="ophours-week">-- h</span>
+                            </div>
+                            <div class="ophours-item">
+                                <span class="ophours-label">This Month</span>
+                                <span class="ophours-value" id="ophours-month">-- h</span>
+                            </div>
+                            <div class="ophours-item">
+                                <span class="ophours-label">This Year</span>
+                                <span class="ophours-value" id="ophours-year">-- h</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Heat Pump Stats Modal -->
+        <div class="stats-modal" id="stats-modal" style="display: none;">
+            <div class="stats-modal-content">
+                <div class="stats-modal-header">
+                    <h2>Heat Pump Statistics Charts</h2>
+                    <button class="modal-close" id="stats-modal-close">&times;</button>
+                </div>
+                <div class="stats-modal-tabs">
+                    <button class="tab-btn active" data-chart="cycles">Cycles</button>
+                    <button class="tab-btn" data-chart="hours">Hours/Day</button>
+                    <button class="tab-btn" data-chart="starts">Starts/Day</button>
+                    <button class="tab-btn" data-chart="cycle-temp">Cycle vs Temp</button>
+                    <button class="tab-btn" data-chart="hours-temp">Hours vs Temp</button>
+                </div>
+                <div class="stats-modal-body">
+                    <div class="chart-empty" id="chart-empty">
+                        No data available yet. Statistics will appear after compressor cycles complete.
+                    </div>
+                    <canvas id="stats-chart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Energy & Prices (merged Grid + Prices) -->
+        <section class="info-row">
+            <div class="card panel-card wide" id="energy-panel">
+                <h2>⚡ Energy & Prices</h2>
+                <div class="price-info">
+                    <!-- Grid info row -->
+                    <div class="grid-info">
+                        <div class="grid-tariff-section">
+                            <span class="tariff-label">Tariff:</span>
+                            <span class="tariff-badge" id="tariff-mode" data-tooltip="Goteborg Energi time-of-use tariff">--</span>
+                        </div>
+                        <div class="grid-stats">
+                            <div class="grid-stat" data-tooltip="Energy consumed in the current hour (from Tibber if configured)">
+                                <span class="grid-stat-label">Current Hour</span>
+                                <span class="grid-stat-value" id="current-hour-kwh">-- kWh</span>
+                            </div>
+                            <div class="grid-stat has-popup" id="peak-stat" data-tooltip="Average of top 3 daily peaks this month (one peak per day)">
+                                <span class="grid-stat-label">Peak Avg (Top 3)</span>
+                                <span class="grid-stat-value" id="monthly-peak-kwh">-- kWh</span>
+                                <div class="peak-popup" id="peak-popup">
+                                    <div class="peak-no-data">No peak data yet</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Current price section -->
+                    <div class="price-current-section">
+                        <div class="price-current" id="price-current">
+                            <div class="price-time" id="price-time">--:-- - --:--</div>
+                            <div class="price-main">
+                                <span class="price-value" id="price-spot">--</span>
+                                <span class="price-unit">kr/kWh</span>
+                                <span class="price-level-badge" id="price-level">--</span>
+                            </div>
+                            <div class="price-breakdown" id="price-breakdown">
+                                <div class="price-row">
+                                    <span class="price-row-label">Spot (Nord Pool)</span>
+                                    <span class="price-row-value" id="price-spot-detail">--</span>
+                                </div>
+                                <div class="price-row tibber-row" id="tibber-section" style="display: none;">
+                                    <span class="price-row-label">Tibber total</span>
+                                    <span class="price-row-value" id="price-tibber-total">--</span>
+                                </div>
+                                <div class="price-row tibber-row" style="display: none;">
+                                    <span class="price-row-label sub">└ Tibber markup</span>
+                                    <span class="price-row-value sub" id="price-markup">--</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="price-stats" id="price-stats">
+                            <div class="price-stat">
+                                <span class="price-stat-label">Min</span>
+                                <span class="price-stat-value" id="price-min">--</span>
+                            </div>
+                            <div class="price-stat">
+                                <span class="price-stat-label">Max</span>
+                                <span class="price-stat-value" id="price-max">--</span>
+                            </div>
+                            <div class="price-stat">
+                                <span class="price-stat-label">Avg</span>
+                                <span class="price-stat-value" id="price-avg">--</span>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Price chart with hover tooltip -->
+                    <div class="price-chart-section">
+                        <canvas id="price-chart" width="800" height="150"></canvas>
+                        <div class="chart-tooltip" id="chart-tooltip" style="display: none;"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Alarms -->
+        <section class="info-row">
+            <div class="card panel-card wide" id="alarms-panel">
+                <h2>📋 System Messages</h2>
+                <div class="alarms-content" id="alarms-content">
+                    <div class="no-alarms">✓ No messages</div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <span>Last updated: <span id="last-updated">--:--:--</span></span>
+        <span>Auto-refresh: 5s</span>
+        <span id="server-version">v--</span>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>

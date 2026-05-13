@@ -58,6 +58,25 @@ macro_rules! ctc_parameter {
         };
     };
 }
+
+// Variant for read-only parameters whose raw register value is unsigned
+// (e.g. status/code registers where bit 15 must not be sign-extended).
+macro_rules! ctc_parameter_unsigned {
+    ($name:ident, $id:expr, $desc:expr, $factor:expr, $visible:expr, $bit:expr) => {
+        pub const $name: CTCModbusParameter = CTCModbusParameter {
+            id: $id,
+            signed: false,
+            access: Access::R,
+            reg_max: None,
+            reg_min: None,
+            reg_step: None,
+            visible: $visible,
+            bit: $bit,
+            factor: $factor,
+            description: $desc,
+        };
+    };
+}
 // region: --- CTC Heating System 1 Modbus Parameters
 
 ctc_parameter!(
@@ -186,7 +205,7 @@ ctc_parameter!(
     62531,
     15
 );
-ctc_parameter!(
+ctc_parameter_unsigned!(
     HEATSYSTEM_STATUS,
     62246,
     "Heating system 1 status",
@@ -245,7 +264,7 @@ ctc_parameter!(
     62531,
     8
 );
-ctc_parameter!(CTC_SYSTEM_STATUS, 62005, "System status", 1.0, 62531, 9);
+ctc_parameter_unsigned!(CTC_SYSTEM_STATUS, 62005, "System status", 1.0, 62531, 9);
 // Radiator water temperature (also measures lower tank temperature)
 ctc_parameter!(CTC_RADIATOR_WATER, 62006, "Radiator water", 0.1, 62531, 10);
 ctc_parameter!(CTC_PRODUCT_TYPE, 62253, "Product type", 1.0, 62547, 1);
@@ -355,7 +374,7 @@ ctc_parameter!(
     62501,
     5
 );
-ctc_parameter!(
+ctc_parameter_unsigned!(
     HEATPUMP_STATUS,
     62017,
     "Heat pump 1 (A1): Status",
@@ -553,9 +572,18 @@ pub const CTC_ALARM_INFO_COUNT: CTCModbusParameter = CTCModbusParameter {
     description: "Active alarm and info count",
 };
 
+/// Lowest valid alarm reference value (inclusive) for the text buffer transfer register.
+pub const ALARM_REF_MIN: u16 = 0;
+/// Highest valid alarm reference value (inclusive) for the text buffer transfer register.
+pub const ALARM_REF_MAX: u16 = 9999;
+/// Offset added to an info index to form its reference value (info N = `INFO_REF_OFFSET` + N).
+pub const INFO_REF_OFFSET: u16 = 10000;
+/// Highest valid info reference value (inclusive) for the text buffer transfer register.
+pub const INFO_REF_MAX: u16 = 19999;
+
 /// Transfer alarm/info reference into text buffer (write-only)
-/// Values 0-9999: Alarm number (0 = Alarm number 0)
-/// Values 10000-19999: Info number (10000 = Info number 0)
+/// Values `ALARM_REF_MIN`-`ALARM_REF_MAX`: Alarm number (0 = Alarm number 0)
+/// Values `INFO_REF_OFFSET`-`INFO_REF_MAX`: Info number (`INFO_REF_OFFSET` = Info number 0)
 pub const CTC_ALARM_INFO_BUFFER: CTCModbusParameter = CTCModbusParameter {
     id: 65100,
     signed: false,
@@ -676,7 +704,8 @@ pub fn get_custom_ctc_parameter_by_addr(addr: u16, factor: Option<f32>) -> CTCMo
         reg_max: None,
         reg_min: None,
         reg_step: None,
-        visible: 62500,
+        // Custom reads bypass the visibility scan: visible == 0 means always-visible.
+        visible: 0,
         bit: 0,
         factor: factor.unwrap_or(1.0),
         description: "Custom CTC Parameter",

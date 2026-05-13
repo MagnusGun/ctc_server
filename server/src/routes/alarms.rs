@@ -5,7 +5,7 @@
 //! - Quick status check (for polling): reads just the count register
 //! - Full details: reads bitmasks and text buffers for active alarms/info
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use axum::{Router, extract::State, routing::get};
@@ -19,7 +19,7 @@ use crate::messages::{
     CachedAlarmText, cleanup_inactive_codes, decode_text_buffer, parse_alarm_text,
     record_first_seen, scan_bitmask,
 };
-use crate::modbus::bms_parameters::CTC_ALARM_INFO_COUNT;
+use crate::modbus::bms_parameters::{CTC_ALARM_INFO_COUNT, INFO_REF_OFFSET};
 use crate::modbus::{ModbusResponse, ModbusSender, ParameterOperation};
 
 /// Text buffer transfer register (write alarm/info reference here)
@@ -33,9 +33,44 @@ const TEXT_BUFFER_COUNT: u16 = 25;
 const INFO_BITMASK_START: u16 = 65060;
 const INFO_BITMASK_COUNT: u16 = 10;
 
+/// Serialises concurrent `get_alarms` requests so two callers cannot race on
+/// building `active_codes` and calling `cleanup_inactive_codes` against each
+/// other's view of the bitmask.
+static ALARMS_HANDLER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Alarm bitmask: 50 registers starting at 65010 (800 alarms max)
 const ALARM_BITMASK_START: u16 = 65010;
 const ALARM_BITMASK_COUNT: u16 = 50;
+
+/// Encode an info index as a text buffer transfer reference
+fn info_ref(idx: u16) -> u16 {
+    INFO_REF_OFFSET + idx
+}
+
+/// Namespace tag for first-seen cache keys. Alarms and infos can share the
+/// same code value (e.g. "117"), so the persisted key prefix keeps them in
+/// separate buckets in `ALARM_FIRST_SEEN`.
+#[derive(Copy, Clone, Debug)]
+enum AlarmKind {
+    Alarm,
+    Info,
+}
+
+impl AlarmKind {
+    fn cache_key(self, code: impl std::fmt::Display) -> String {
+        let prefix = match self {
+            Self::Alarm => 'A',
+            Self::Info => 'I',
+        };
+        format!("{prefix}:{code}")
+    }
+}
+
+/// Decode a text buffer transfer reference back to an info index, if it is one
+#[allow(dead_code)]
+fn decode_info_ref(reference: u16) -> Option<u16> {
+    reference.checked_sub(INFO_REF_OFFSET)
+}
 
 /// State for alarm routes
 #[derive(Clone)]
@@ -53,13 +88,20 @@ struct AlarmStatusResponse {
     has_infos: bool,
 }
 
-/// Full alarm response with all active alarms and infos
+/// Full alarm response with all active alarms and infos.
+///
+/// `alarm_count` / `info_count` match the lengths of the returned vectors,
+/// which can be smaller than the device-reported count if some text fetches
+/// failed. `partial = true` signals that case so dashboards can show a
+/// "fetch failed" hint instead of silently under-reporting.
 #[derive(Serialize)]
 struct AlarmResponse {
     alarm_count: u8,
     info_count: u8,
     alarms: Vec<AlarmMessage>,
     infos: Vec<AlarmMessage>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    partial: bool,
 }
 
 pub fn routes(sender: ModbusSender, request_timeout_secs: u64) -> Router {
@@ -178,6 +220,11 @@ async fn get_alarm_status(State(state): State<AlarmState>) -> Result<String, Api
 /// ```
 #[allow(clippy::too_many_lines)]
 async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError> {
+    // Serialise concurrent requests so two callers cannot observe slightly
+    // different bitmask states and have one's cleanup evict entries the other
+    // still considers active.
+    let _guard = ALARMS_HANDLER_LOCK.lock().await;
+
     debug!("get_alarms: START");
 
     // First, read alarm/info count register (65001)
@@ -226,21 +273,29 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
             }
         };
 
-    // If no alarms or infos, return early
+    // If no alarms or infos, return early — but first reap any stale
+    // ALARM_FIRST_SEEN entries from a previously-active code. The device
+    // reporting zero counts IS authoritative evidence that nothing is active,
+    // so an empty active_codes set is the right thing to retain against.
     if alarm_count == 0 && info_count == 0 {
         debug!("get_alarms: No active alarms or infos");
+        cleanup_inactive_codes(&HashSet::new());
         let response = AlarmResponse {
             alarm_count,
             info_count,
             alarms: Vec::new(),
             infos: Vec::new(),
+            partial: false,
         };
         return serde_json::to_string(&response)
             .map(|s| s + "\n")
             .map_err(|_| ApiError::InternalError);
     }
 
-    // Read alarm bitmask and scan for active indices
+    // Read alarm bitmask and scan for active indices.
+    // Track whether the read succeeded: on failure we cannot tell which codes
+    // are still active, so we must not evict any first-seen entries.
+    let mut alarm_bitmask_ok = true;
     let active_alarm_refs = if alarm_count > 0 {
         debug!("get_alarms: Reading alarm bitmask registers");
         match read_raw_registers(&state, ALARM_BITMASK_START, ALARM_BITMASK_COUNT).await {
@@ -255,6 +310,7 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
             }
             Err(e) => {
                 warn!("get_alarms: Failed to read alarm bitmask: {}", e);
+                alarm_bitmask_ok = false;
                 Vec::new()
             }
         }
@@ -262,7 +318,8 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
         Vec::new()
     };
 
-    // Read info bitmask and scan for active indices
+    // Read info bitmask and scan for active indices.
+    let mut info_bitmask_ok = true;
     let active_info_refs = if info_count > 0 {
         debug!("get_alarms: Reading info bitmask registers");
         match read_raw_registers(&state, INFO_BITMASK_START, INFO_BITMASK_COUNT).await {
@@ -277,6 +334,7 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
             }
             Err(e) => {
                 warn!("get_alarms: Failed to read info bitmask: {}", e);
+                info_bitmask_ok = false;
                 Vec::new()
             }
         }
@@ -287,27 +345,25 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
     // Fetch text for each ACTUALLY active alarm
     let mut alarms = Vec::new();
     let mut active_codes = HashSet::new();
+    // Track whether every text-fetch succeeded. A failure means `active_codes`
+    // is missing the code-based key for that reference, so cleanup would
+    // orphan its `ALARM_FIRST_SEEN["A:{code}"]` entry. The reference-keyed
+    // fallback that used to be inserted here did not match the success path's
+    // code-keyed entries either, so cleanup evicted them anyway.
+    let mut all_text_fetches_ok = true;
     for reference in active_alarm_refs {
-        match get_or_fetch_alarm_text(&state, reference, false).await {
+        match get_or_fetch_alarm_text(&state, reference).await {
             Ok(cached) => {
-                let message_en = cached
-                    .code
-                    .as_ref()
-                    .and_then(|c| ALARM_TRANSLATIONS.get(c.as_str()).map(|s| (*s).to_string()));
-                let description = cached
-                    .code
-                    .as_ref()
-                    .and_then(|c| ALARM_DESCRIPTIONS.get(c.as_str()).map(|s| (*s).to_string()));
-                let description_sv = cached.code.as_ref().and_then(|c| {
-                    ALARM_DESCRIPTIONS_SV
-                        .get(c.as_str())
-                        .map(|s| (*s).to_string())
-                });
-                // Track first-seen timestamp using code or reference as key
-                let key = cached
-                    .code
-                    .clone()
-                    .unwrap_or_else(|| format!("E{reference}"));
+                let message_en = lookup_translation(cached.code.as_deref());
+                let description = lookup_description(cached.code.as_deref());
+                let description_sv = lookup_description_sv(cached.code.as_deref());
+                // Track first-seen timestamp using code or reference as key.
+                // Namespace with "A:" so alarms and infos that share a code
+                // value (e.g. "117") cannot shadow each other in the map.
+                let key = cached.code.as_ref().map_or_else(
+                    || AlarmKind::Alarm.cache_key(reference),
+                    |c| AlarmKind::Alarm.cache_key(c),
+                );
                 active_codes.insert(key.clone());
                 let first_seen_time = record_first_seen(&key);
                 alarms.push(AlarmMessage {
@@ -325,6 +381,7 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
                     "get_alarms: Failed to fetch alarm {} text: {}",
                     reference, e
                 );
+                all_text_fetches_ok = false;
                 // Continue with remaining alarms
             }
         }
@@ -333,27 +390,19 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
     // Fetch text for each ACTUALLY active info
     let mut infos = Vec::new();
     for reference in active_info_refs {
-        // Add 10000 offset for info references (as per CTC protocol)
-        match get_or_fetch_alarm_text(&state, 10000 + reference, true).await {
+        // Add info offset for info references (as per CTC protocol)
+        match get_or_fetch_alarm_text(&state, info_ref(reference)).await {
             Ok(cached) => {
-                let message_en = cached
-                    .code
-                    .as_ref()
-                    .and_then(|c| ALARM_TRANSLATIONS.get(c.as_str()).map(|s| (*s).to_string()));
-                let description = cached
-                    .code
-                    .as_ref()
-                    .and_then(|c| ALARM_DESCRIPTIONS.get(c.as_str()).map(|s| (*s).to_string()));
-                let description_sv = cached.code.as_ref().and_then(|c| {
-                    ALARM_DESCRIPTIONS_SV
-                        .get(c.as_str())
-                        .map(|s| (*s).to_string())
-                });
-                // Track first-seen timestamp using code or reference as key
-                let key = cached
-                    .code
-                    .clone()
-                    .unwrap_or_else(|| format!("I{reference}"));
+                let message_en = lookup_translation(cached.code.as_deref());
+                let description = lookup_description(cached.code.as_deref());
+                let description_sv = lookup_description_sv(cached.code.as_deref());
+                // Track first-seen timestamp using code or reference as key.
+                // Namespace with "I:" so infos and alarms that share a code
+                // value (e.g. "117") cannot shadow each other in the map.
+                let key = cached.code.as_ref().map_or_else(
+                    || AlarmKind::Info.cache_key(reference),
+                    |c| AlarmKind::Info.cache_key(c),
+                );
                 active_codes.insert(key.clone());
                 let first_seen_time = record_first_seen(&key);
                 infos.push(AlarmMessage {
@@ -368,25 +417,46 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
             }
             Err(e) => {
                 warn!("get_alarms: Failed to fetch info {} text: {}", reference, e);
+                all_text_fetches_ok = false;
                 // Continue with remaining infos
             }
         }
     }
 
-    // Clean up first-seen entries for alarms/infos that are no longer active
-    cleanup_inactive_codes(&active_codes);
+    // Clean up first-seen entries for alarms/infos that are no longer active.
+    // Only safe to evict when bitmask reads AND every text fetch succeeded —
+    // otherwise `active_codes` is incomplete and we would drop still-active
+    // entries. Note: ALARM_FIRST_SEEN is in-memory only and does not persist
+    // across restarts.
+    if alarm_bitmask_ok && info_bitmask_ok && all_text_fetches_ok {
+        cleanup_inactive_codes(&active_codes);
+    } else {
+        debug!(
+            "get_alarms: Skipping cleanup_inactive_codes due to transient read failure (bitmask alarm={alarm_bitmask_ok} info={info_bitmask_ok} text={all_text_fetches_ok})"
+        );
+    }
 
     debug!(
-        "get_alarms: SUCCESS - {} alarms, {} infos fetched",
+        "get_alarms: SUCCESS - reported {} of {} active alarms, {} of {} active infos",
         alarms.len(),
-        infos.len()
+        alarm_count,
+        infos.len(),
+        info_count,
     );
 
+    // Report counts that match the returned vectors so clients see a
+    // consistent view even when some text fetches failed or the bitmask
+    // read returned no bits. `partial` flags the case where at least one
+    // read failed — clients can show a "fetch failed" hint instead of
+    // silently treating an under-report as the truth.
+    let partial = !(alarm_bitmask_ok && info_bitmask_ok && all_text_fetches_ok);
+    #[allow(clippy::cast_possible_truncation)]
     let response = AlarmResponse {
-        alarm_count,
-        info_count,
+        alarm_count: alarms.len().min(u8::MAX as usize) as u8,
+        info_count: infos.len().min(u8::MAX as usize) as u8,
         alarms,
         infos,
+        partial,
     };
 
     serde_json::to_string(&response)
@@ -399,17 +469,21 @@ async fn get_alarms(State(state): State<AlarmState>) -> Result<String, ApiError>
 async fn get_or_fetch_alarm_text(
     state: &AlarmState,
     reference: u16,
-    is_info: bool,
 ) -> Result<CachedAlarmText, ApiError> {
-    // Check cache first
-    if let Ok(cache) = ALARM_TEXT_CACHE.read()
-        && let Some(cached) = cache.get(&reference)
+    // Check cache first. Recover from poisoning — a previous panic left the
+    // map in an indeterminate-but-usable state, and falling through to a fresh
+    // device fetch on every request defeats the cache entirely.
     {
-        debug!(
-            "get_or_fetch_alarm_text: Cache hit for reference {}",
-            reference
-        );
-        return Ok(cached.clone());
+        let cache = ALARM_TEXT_CACHE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.get(&reference) {
+            debug!(
+                "get_or_fetch_alarm_text: Cache hit for reference {}",
+                reference
+            );
+            return Ok(cached.clone());
+        }
     }
 
     debug!(
@@ -486,7 +560,7 @@ async fn get_or_fetch_alarm_text(
                 reference, raw_text
             );
 
-            let (code, message) = parse_alarm_text(&raw_text, is_info);
+            let (code, message) = parse_alarm_text(&raw_text);
 
             let cached = CachedAlarmText {
                 code,
@@ -494,8 +568,11 @@ async fn get_or_fetch_alarm_text(
                 raw_text,
             };
 
-            // Store in cache
-            if let Ok(mut cache) = ALARM_TEXT_CACHE.write() {
+            // Store in cache. Recover from poisoning to match the read path.
+            {
+                let mut cache = ALARM_TEXT_CACHE
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 cache.insert(reference, cached.clone());
             }
 
@@ -572,6 +649,26 @@ fn format_timestamp(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+fn lookup(code: Option<&str>, map: &HashMap<&str, &str>, what: &str) -> Option<String> {
+    let code = code?;
+    if let Some(s) = map.get(code) {
+        Some((*s).to_string())
+    } else {
+        debug!("Alarm code {code} has no {what}");
+        None
+    }
+}
+
+fn lookup_translation(code: Option<&str>) -> Option<String> {
+    lookup(code, &ALARM_TRANSLATIONS, "English translation")
+}
+fn lookup_description(code: Option<&str>) -> Option<String> {
+    lookup(code, &ALARM_DESCRIPTIONS, "English description")
+}
+fn lookup_description_sv(code: Option<&str>) -> Option<String> {
+    lookup(code, &ALARM_DESCRIPTIONS_SV, "Swedish description")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,14 +715,14 @@ mod tests {
 
     #[test]
     fn test_parse_alarm_text_with_code() {
-        let (code, message) = parse_alarm_text("[E040] Low brine flow", false);
+        let (code, message) = parse_alarm_text("[E040] Low brine flow");
         assert_eq!(code, Some("E040".to_string()));
         assert_eq!(message, "Low brine flow");
     }
 
     #[test]
     fn test_parse_alarm_text_without_code() {
-        let (code, message) = parse_alarm_text("Some message without code", false);
+        let (code, message) = parse_alarm_text("Some message without code");
         assert_eq!(code, None);
         assert_eq!(message, "Some message without code");
     }
@@ -770,6 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_alarms_no_active() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
         let (state, mut rx) = create_mock_state();
 
         let handle = tokio::spawn(async move { get_alarms(State(state)).await });
@@ -790,6 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_alarms_channel_closed() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
         let (state, rx) = create_mock_state();
 
         // Drop receiver to simulate actor shutdown
@@ -798,5 +897,196 @@ mod tests {
         let result = get_alarms(State(state)).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
+    }
+
+    /// Two concurrent `get_alarms` calls must be serialised by
+    /// `ALARMS_HANDLER_LOCK`: while one call is between its bitmask scan and
+    /// its `cleanup_inactive_codes`, the other must not have begun. Otherwise
+    /// the second call's cleanup could evict first-seen entries the first
+    /// call is mid-way through recording.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::items_after_statements,
+        clippy::similar_names,
+        clippy::cast_sign_loss
+    )]
+    async fn test_get_alarms_concurrent_calls_are_serialised() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
+        use crate::messages::types::ALARM_FIRST_SEEN;
+        // The guard above clears ALARM_FIRST_SEEN before this test and serialises
+        // it against other alarm tests so no leaked entries skew the assertions.
+        const REF_A: u16 = 700;
+        const REF_B: u16 = 701;
+        let key_a = AlarmKind::Alarm.cache_key(format!("E{REF_A}"));
+        let key_b = AlarmKind::Alarm.cache_key(format!("E{REF_B}"));
+        let stale_key = AlarmKind::Alarm.cache_key("STALE_FOR_SERIALISATION_TEST");
+
+        // Pre-populate the alarm text cache so `get_or_fetch_alarm_text`
+        // returns synchronously — avoids needing to mock the 200 ms
+        // transfer-register handshake per active alarm.
+        {
+            let mut cache = ALARM_TEXT_CACHE
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.insert(
+                REF_A,
+                CachedAlarmText {
+                    code: Some(format!("E{REF_A}")),
+                    message: "Test alarm A".to_string(),
+                    raw_text: format!("[E{REF_A}] Test alarm A"),
+                },
+            );
+            cache.insert(
+                REF_B,
+                CachedAlarmText {
+                    code: Some(format!("E{REF_B}")),
+                    message: "Test alarm B".to_string(),
+                    raw_text: format!("[E{REF_B}] Test alarm B"),
+                },
+            );
+        }
+        // Seed a stale first-seen entry. Neither caller's active set will
+        // contain it, so `cleanup_inactive_codes` must evict it. Recover
+        // from poison so a panicking sibling test doesn't block this one.
+        {
+            let mut first = ALARM_FIRST_SEEN
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            first.insert(stale_key.clone(), SystemTime::now());
+            first.remove(&key_a);
+            first.remove(&key_b);
+        }
+
+        // Build the bitmask response with bits set for REF_A and REF_B.
+        let mut alarm_bitmask = vec![0u16; usize::from(ALARM_BITMASK_COUNT)];
+        for r in [REF_A, REF_B] {
+            let reg = usize::from(r / 16);
+            let bit = r % 16;
+            alarm_bitmask[reg] |= 1 << bit;
+        }
+
+        // Two callers, each with their own mock channel so we can observe
+        // which call is currently issuing requests.
+        let (state_a, mut rx_a) = create_mock_state();
+        let (state_b, mut rx_b) = create_mock_state();
+        let bitmask_a = alarm_bitmask.clone();
+        let bitmask_b = alarm_bitmask.clone();
+
+        async fn serve_get_alarms(rx: &mut MockReceiver, bitmask: Vec<u16>) {
+            // 1. Count read: 2 alarms, 0 infos => 0x0002.
+            let (op, tx) = rx.recv().await.expect("count read");
+            assert!(matches!(op, ParameterOperation::Read(_)));
+            tx.send(Ok(ModbusResponse::Value(2.0))).unwrap();
+            // 2. Alarm bitmask read.
+            let (op, tx) = rx.recv().await.expect("alarm bitmask read");
+            match op {
+                ParameterOperation::ReadRawRegisters { start, count } => {
+                    assert_eq!(start, ALARM_BITMASK_START);
+                    assert_eq!(count, ALARM_BITMASK_COUNT);
+                }
+                _ => panic!("expected ReadRawRegisters, got {op:?}"),
+            }
+            tx.send(Ok(ModbusResponse::RawRegisters {
+                start: ALARM_BITMASK_START,
+                values: bitmask,
+            }))
+            .unwrap();
+            // No info bitmask read because info_count == 0.
+            // No text-buffer transfers because we primed ALARM_TEXT_CACHE.
+        }
+
+        let h_a = tokio::spawn(async move { get_alarms(State(state_a)).await });
+        let h_b = tokio::spawn(async move { get_alarms(State(state_b)).await });
+
+        // Whichever caller wins the lock first issues its count read first;
+        // identify it by selecting on the two mock channels.
+        let first_is_a = tokio::select! {
+            biased;
+            req = rx_a.recv() => {
+                let (op, tx) = req.expect("first count read");
+                assert!(matches!(op, ParameterOperation::Read(_)));
+                tx.send(Ok(ModbusResponse::Value(2.0))).unwrap();
+                true
+            }
+            req = rx_b.recv() => {
+                let (op, tx) = req.expect("first count read");
+                assert!(matches!(op, ParameterOperation::Read(_)));
+                tx.send(Ok(ModbusResponse::Value(2.0))).unwrap();
+                false
+            }
+        };
+
+        let (first_rx, second_rx, first_bitmask, second_bitmask) = if first_is_a {
+            (&mut rx_a, &mut rx_b, bitmask_a, bitmask_b)
+        } else {
+            (&mut rx_b, &mut rx_a, bitmask_b, bitmask_a)
+        };
+
+        // Drive the runtime so the second caller's task is definitely polled
+        // and has reached the handler mutex. Without these yields, "no message
+        // on second_rx" might mean "task never ran" rather than "task parked
+        // on the mutex" — which would make the probe assert nothing useful.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        // With the runtime driven, the second caller has been polled and is
+        // parked on the handler mutex. Its mock channel must stay silent until
+        // the first caller releases the lock. try_recv is deterministic and
+        // doesn't rely on a wall-clock probe.
+        match second_rx.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {} // expected: blocked
+            Ok((op, _tx)) => panic!(
+                "second caller was not blocked on the handler mutex — \
+                 received {op:?} while first caller is still inside get_alarms"
+            ),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("second mock channel disconnected unexpectedly")
+            }
+        }
+
+        let (op, tx) = first_rx.recv().await.expect("first alarm bitmask read");
+        match op {
+            ParameterOperation::ReadRawRegisters { start, count } => {
+                assert_eq!(start, ALARM_BITMASK_START);
+                assert_eq!(count, ALARM_BITMASK_COUNT);
+            }
+            other => panic!("expected ReadRawRegisters, got {other:?}"),
+        }
+        tx.send(Ok(ModbusResponse::RawRegisters {
+            start: ALARM_BITMASK_START,
+            values: first_bitmask,
+        }))
+        .unwrap();
+
+        // First caller finishes (cache served the text). Now the second
+        // caller's count read becomes available.
+        serve_get_alarms(second_rx, second_bitmask).await;
+
+        let r_a = h_a.await.unwrap();
+        let r_b = h_b.await.unwrap();
+        assert!(r_a.is_ok(), "caller A failed: {r_a:?}");
+        assert!(r_b.is_ok(), "caller B failed: {r_b:?}");
+
+        // After both completions, ALARM_FIRST_SEEN must contain both active
+        // entries and the stale key must be evicted.
+        let first = ALARM_FIRST_SEEN
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            first.contains_key(&key_a),
+            "expected {key_a} to be recorded; have {:?}",
+            first.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            first.contains_key(&key_b),
+            "expected {key_b} to be recorded; have {:?}",
+            first.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !first.contains_key(&stale_key),
+            "stale entry should have been evicted by cleanup_inactive_codes"
+        );
     }
 }

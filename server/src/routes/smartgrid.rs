@@ -3,12 +3,18 @@
 //! These endpoints provide control over the `SmartGrid` functionality using GPIO relays.
 //! `SmartGrid` modes are set by controlling the K24 (Smart A) and K25 (Smart B) GPIO pins
 //! which correspond to the CTC heat pump's external smart grid input terminals.
+//!
+//! All side effects are dispatched through [`SmartGridHandle`], an mpsc
+//! sender backed by the [`crate::smartgrid::actor`] task. Commands are
+//! processed serially in that task, so concurrent POSTs cannot interleave
+//! the bump → cancel → set → schedule sequence.
 
 use std::str::FromStr;
 
 use axum::{
     Router,
     extract::{Query, State},
+    http::StatusCode,
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -19,24 +25,24 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use crate::config::SmartGridConfig;
 use crate::energy::price::PriceState;
 use crate::error::ApiError;
-use crate::smartgrid::{GpioController, SmartGridMode, apply_mode};
+use crate::smartgrid::{SmartGridError, SmartGridHandle, SmartGridMode};
 
-/// State for `SmartGrid` routes
+/// State for `SmartGrid` routes.
 #[derive(Clone)]
 pub struct SmartGridState {
-    gpio: Option<GpioController>,
+    handle: Option<SmartGridHandle>,
     price_state: PriceState,
     config: SmartGridConfig,
 }
 
 pub fn routes(
-    gpio: Option<GpioController>,
+    handle: Option<SmartGridHandle>,
     price_state: PriceState,
     config: SmartGridConfig,
     _request_timeout_secs: u64,
 ) -> Router {
     let state = SmartGridState {
-        gpio,
+        handle,
         price_state,
         config,
     };
@@ -86,7 +92,8 @@ struct ProposedResumeResponse {
     window_hours: u64,
 }
 
-/// Set `SmartGrid` mode via GPIO
+/// Set `SmartGrid` mode via GPIO.
+///
 /// `POST /api/v1/smartgrid?mode=blocking&schedule_resume=true`
 ///
 /// Valid modes: normal, blocking, lowprice, overcapacity
@@ -103,29 +110,20 @@ async fn set_smartgrid(
         query.mode, query.schedule_resume
     );
 
-    // Check if GPIO is available
-    let gpio = state.gpio.as_ref().ok_or_else(|| {
+    let handle = state.handle.as_ref().ok_or_else(|| {
         error!("set_smartgrid: GPIO not available - SmartGrid control requires GPIO");
         ApiError::ServiceUnavailable
     })?;
 
-    // Parse the mode string
     let mode = SmartGridMode::from_str(&query.mode).map_err(|e| {
         error!("set_smartgrid: Invalid mode '{}': {}", query.mode, e);
         ApiError::BadRequest
     })?;
 
-    let fires_at = apply_mode(
-        gpio,
-        mode,
-        query.schedule_resume,
-        &state.price_state,
-        &state.config,
-    )
-    .map_err(|e| {
-        error!("set_smartgrid: {e}");
-        ApiError::InternalError
-    })?;
+    let fires_at = handle
+        .set_mode(mode, query.schedule_resume)
+        .await
+        .map_err(map_smartgrid_error)?;
 
     let response = SetSmartGridResponse {
         smartgrid_mode: mode.to_string(),
@@ -139,34 +137,31 @@ async fn set_smartgrid(
         })
 }
 
-/// Get current `SmartGrid` mode from GPIO
-/// GET /api/v1/smartgrid
+/// Get current `SmartGrid` mode from GPIO.
 ///
-/// Requires GPIO to be enabled in configuration.
-/// Returns mode, timestamp of last mode change (if any), and scheduled
-/// auto-resume time (if any).
+/// GET /api/v1/smartgrid
 async fn get_smartgrid(State(state): State<SmartGridState>) -> Result<String, ApiError> {
     debug!("get_smartgrid: START");
 
-    let gpio = state.gpio.as_ref().ok_or_else(|| {
+    let handle = state.handle.as_ref().ok_or_else(|| {
         error!("get_smartgrid: GPIO not available - SmartGrid control requires GPIO");
         ApiError::ServiceUnavailable
     })?;
 
-    let mode = gpio.read_mode().map_err(|e| {
-        error!("get_smartgrid: GPIO read error - {e}");
-        ApiError::InternalError
-    })?;
-
-    let changed_at = gpio.mode_changed_at().map_err(|e| {
-        error!("get_smartgrid: Failed to read mode timestamp - {e}");
-        ApiError::InternalError
-    })?;
+    let mode = handle.read_mode().await.map_err(map_smartgrid_error)?;
+    let changed_at = handle
+        .mode_changed_at()
+        .await
+        .map_err(map_smartgrid_error)?;
+    let scheduled_resume_at = handle
+        .scheduled_resume_at()
+        .await
+        .map_err(map_smartgrid_error)?;
 
     let response = SmartGridResponse {
         smartgrid_mode: mode.to_string(),
         changed_at: changed_at.map(format_system_time),
-        scheduled_resume_at: gpio.scheduled_resume_at().map(format_system_time),
+        scheduled_resume_at: scheduled_resume_at.map(format_system_time),
     };
 
     serde_json::to_string(&response)
@@ -199,21 +194,36 @@ async fn get_proposed_resume(State(state): State<SmartGridState>) -> Result<Stri
 
 /// Cancel any pending auto-resume without changing the current `SmartGrid` mode.
 ///
-/// Idempotent — calling this when no schedule exists returns 200 with
-/// `scheduled_resume_at: null`.
-async fn delete_scheduled_resume(State(state): State<SmartGridState>) -> Result<String, ApiError> {
+/// Idempotent — calling this when no schedule exists returns `204 No Content`.
+async fn delete_scheduled_resume(
+    State(state): State<SmartGridState>,
+) -> Result<StatusCode, ApiError> {
     debug!("delete_scheduled_resume: START");
 
-    let gpio = state.gpio.as_ref().ok_or_else(|| {
+    let handle = state.handle.as_ref().ok_or_else(|| {
         error!("delete_scheduled_resume: GPIO not available");
         ApiError::ServiceUnavailable
     })?;
 
-    gpio.cancel_scheduled_resume();
+    handle
+        .cancel_scheduled_resume()
+        .await
+        .map_err(map_smartgrid_error)?;
 
-    // Body mirrors the shape of GET /api/v1/smartgrid (single field), so
-    // clients can reuse the same parser.
-    Ok("{\"scheduled_resume_at\": null}\n".to_string())
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn map_smartgrid_error(err: SmartGridError) -> ApiError {
+    match err {
+        SmartGridError::ActorGone => {
+            error!("SmartGrid: actor unavailable");
+            ApiError::ServiceUnavailable
+        }
+        e @ (SmartGridError::Apply(_) | SmartGridError::Internal(_)) => {
+            error!("SmartGrid: {e}");
+            ApiError::InternalError
+        }
+    }
 }
 
 fn format_system_time(t: std::time::SystemTime) -> String {
@@ -223,6 +233,8 @@ fn format_system_time(t: std::time::SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smartgrid::actor::test_support::spawn_with_test_gpio;
+    use tokio_util::sync::CancellationToken;
 
     fn test_config() -> SmartGridConfig {
         SmartGridConfig {
@@ -231,9 +243,9 @@ mod tests {
         }
     }
 
-    fn create_state_without_gpio() -> SmartGridState {
+    fn create_state_without_handle() -> SmartGridState {
         SmartGridState {
-            gpio: None,
+            handle: None,
             price_state: PriceState::new("SE3".to_string()),
             config: test_config(),
         }
@@ -241,45 +253,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_smartgrid_no_gpio() {
-        let state = create_state_without_gpio();
-
+        let state = create_state_without_handle();
         let result = get_smartgrid(State(state)).await;
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
     }
 
     #[tokio::test]
     async fn test_set_smartgrid_no_gpio() {
-        let state = create_state_without_gpio();
+        let state = create_state_without_handle();
         let query = SmartGridQuery {
             mode: "blocking".to_string(),
             schedule_resume: false,
         };
-
         let result = set_smartgrid(State(state), Query(query)).await;
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
     }
 
     #[tokio::test]
     async fn test_set_smartgrid_invalid_mode() {
-        let state = create_state_without_gpio();
+        let state = create_state_without_handle();
         let query = SmartGridQuery {
             mode: "invalid_mode".to_string(),
             schedule_resume: false,
         };
-
-        // Even with no GPIO, invalid mode should return BadRequest first
-        // But since we check GPIO first, it returns ServiceUnavailable
+        // With no GPIO, we get ServiceUnavailable before mode validation.
         let result = set_smartgrid(State(state), Query(query)).await;
-        assert!(result.is_err());
-        // With no GPIO, we get ServiceUnavailable before mode validation
         assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
     }
 
     #[tokio::test]
     async fn test_proposed_resume_no_prices() {
-        let state = create_state_without_gpio();
+        let state = create_state_without_handle();
         let result = get_proposed_resume(State(state)).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
         assert!(parsed["starts_at"].is_null());
@@ -288,28 +292,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_scheduled_resume_no_gpio() {
-        let state = create_state_without_gpio();
+        let state = create_state_without_handle();
         let result = delete_scheduled_resume(State(state)).await;
         assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
     }
 
     #[tokio::test]
-    async fn test_delete_scheduled_resume_with_gpio_returns_null() {
-        // GpioController::new() does not touch hardware; only set_mode does.
-        // The DELETE handler only calls cancel_scheduled_resume(), so this
-        // exercises the full success path even on machines without GPIO.
+    async fn test_delete_scheduled_resume_with_handle_returns_no_content() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) =
+            spawn_with_test_gpio(PriceState::new("SE3".to_string()), test_config(), cancel);
         let state = SmartGridState {
-            gpio: Some(GpioController::new(20, 21, false)),
+            handle: Some(handle),
             price_state: PriceState::new("SE3".to_string()),
             config: test_config(),
         };
-        let result = delete_scheduled_resume(State(state.clone())).await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
-        assert!(parsed["scheduled_resume_at"].is_null());
+        let status = delete_scheduled_resume(State(state.clone())).await.unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
-        // Idempotent: a second call returns the same shape.
         let again = delete_scheduled_resume(State(state)).await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(again.trim()).unwrap();
-        assert!(parsed["scheduled_resume_at"].is_null());
+        assert_eq!(again, StatusCode::NO_CONTENT);
     }
 }

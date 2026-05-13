@@ -6,9 +6,14 @@
 //! API format: `GET <https://www.elprisetjustnu.se/api/v1/prices/{YEAR}/{MM}-{DD}_{ZONE}.json>`
 //! Returns 96 entries per day (15-min resolution) from October 2025 onward.
 
-use chrono::{DateTime, Datelike, Utc};
+use std::time::SystemTime;
+
+use chrono::{DateTime, Datelike, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use tracing::{debug, error, trace, warn};
+
+use super::tariff::system_time_to_local;
 
 const ELPRIS_BASE_URL: &str = "https://www.elprisetjustnu.se/api/v1/prices";
 
@@ -36,27 +41,22 @@ pub struct ElprisClient {
     base_url: String,
     region: String,
     client: reqwest::Client,
+    /// Timezone used to derive "today"'s date for the URL. Sweden's
+    /// electricity zones span a single timezone, but the deployment may be
+    /// elsewhere — we want the user's calendar day, not UTC.
+    tz: Tz,
 }
 
 impl ElprisClient {
-    /// Create a new client for the specified region
+    /// Create a new client for the specified region and local timezone.
     ///
     /// Valid regions: SE1 (Luleå), SE2 (Sundsvall), SE3 (Stockholm), SE4 (Malmö)
-    pub fn new(region: impl Into<String>) -> Self {
+    pub fn new(region: impl Into<String>, tz: Tz) -> Self {
         Self {
             base_url: ELPRIS_BASE_URL.to_string(),
             region: region.into(),
-            client: reqwest::Client::new(),
-        }
-    }
-
-    /// Create a client with custom base URL (for testing)
-    #[cfg(test)]
-    pub fn with_base_url(base_url: String, region: String) -> Self {
-        Self {
-            base_url,
-            region,
-            client: reqwest::Client::new(),
+            client: crate::energy::http_client().clone(),
+            tz,
         }
     }
 
@@ -107,13 +107,19 @@ impl ElprisClient {
     }
 
     /// Get today's prices
+    ///
+    /// "Today" is derived from local time in the configured `tz`, not UTC.
+    /// Between local midnight and UTC midnight, the UTC date is still
+    /// "yesterday" by the user's reckoning, so using `Utc::now()` would
+    /// return yesterday's prices in the evening.
     pub async fn get_today_prices(&self) -> Result<Vec<ElprisEntry>, ElprisError> {
-        self.get_prices(Utc::now()).await
+        self.get_prices(local_today_as_utc(SystemTime::now(), self.tz))
+            .await
     }
 
     /// Get tomorrow's prices (returns None if not yet available)
     pub async fn get_tomorrow_prices(&self) -> Result<Vec<ElprisEntry>, ElprisError> {
-        let tomorrow = Utc::now() + chrono::Duration::days(1);
+        let tomorrow = local_today_as_utc(SystemTime::now(), self.tz) + chrono::Duration::days(1);
         self.get_prices(tomorrow).await
     }
 
@@ -141,10 +147,6 @@ impl ElprisClient {
         }
     }
 
-    /// Get the region this client is configured for
-    pub fn region(&self) -> &str {
-        &self.region
-    }
 }
 
 /// Error types for elpris API
@@ -173,6 +175,19 @@ impl std::fmt::Display for ElprisError {
 
 impl std::error::Error for ElprisError {}
 
+/// Return a `DateTime<Utc>` whose calendar date matches today in `tz`-local
+/// time.
+///
+/// `ElprisClient::get_prices` only consumes year/month/day from the value, so
+/// we embed the local date into a UTC noon timestamp. Using noon avoids any
+/// risk that further timezone math elsewhere shifts the date.
+fn local_today_as_utc(now: SystemTime, tz: Tz) -> DateTime<Utc> {
+    let (year, month, day, _hour) = system_time_to_local(now, tz);
+    Utc.with_ymd_and_hms(year, month, day, 12, 0, 0)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,17 +211,50 @@ mod tests {
     }
 
     #[test]
-    fn test_elpris_client_new() {
-        let client = ElprisClient::new("SE3");
-        assert_eq!(client.region(), "SE3");
-    }
-
-    #[test]
     fn test_elpris_error_display() {
         assert_eq!(
             ElprisError::NotAvailable.to_string(),
             "Prices not available"
         );
         assert_eq!(ElprisError::Http(404).to_string(), "HTTP error: 404");
+    }
+
+    #[test]
+    #[allow(clippy::cast_sign_loss)]
+    fn test_swedish_today_uses_local_date() {
+        use std::time::Duration;
+
+        // 2026-01-15 23:30 UTC — Swedish local time is 00:30 on 2026-01-16,
+        // so "today" should be the 16th, not the 15th.
+        // 2026-01-15 23:30 UTC = days_since_epoch(2026-01-15) * 86400 + 23*3600 + 30*60
+        // Use a known timestamp: 2026-01-15T23:30:00Z
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 15, 23, 30, 0)
+            .unwrap()
+            .timestamp() as u64;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(ts);
+
+        let today = local_today_as_utc(now, chrono_tz::Europe::Stockholm);
+        assert_eq!(today.year(), 2026);
+        assert_eq!(today.month(), 1);
+        assert_eq!(today.day(), 16);
+    }
+
+    #[test]
+    #[allow(clippy::cast_sign_loss)]
+    fn test_swedish_today_midday_utc_matches() {
+        use std::time::Duration;
+
+        // 2026-06-15 12:00 UTC — Swedish local time is 13:00, same date.
+        let ts = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 15, 12, 0, 0)
+            .unwrap()
+            .timestamp() as u64;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(ts);
+
+        let today = local_today_as_utc(now, chrono_tz::Europe::Stockholm);
+        assert_eq!(today.year(), 2026);
+        assert_eq!(today.month(), 6);
+        assert_eq!(today.day(), 15);
     }
 }
