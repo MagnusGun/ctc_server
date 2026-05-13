@@ -1,7 +1,7 @@
 //! Legacy module retained for its `GpioController`-level supersession tests.
 //!
 //! The `apply_mode` and `run_resume_task` helpers that used to live here have
-//! moved into [`super::actor`], which owns all SmartGrid state in a single
+//! moved into [`super::actor`], which owns all `SmartGrid` state in a single
 //! task and processes commands serially (no more route-level mutex needed,
 //! no more orphan timer tasks at shutdown).
 

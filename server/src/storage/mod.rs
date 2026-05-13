@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -349,7 +349,7 @@ impl Store {
             return Ok(());
         }
         let s = unix_secs(t)?;
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let buf = st.series.entry(sensor.as_u16()).or_default();
         buf.push_back((s, value));
         let cutoff = s - self.series_retention_secs;
@@ -370,7 +370,7 @@ impl Store {
     /// trade one cheap hit for a transaction per request.
     #[must_use]
     pub fn series_range(&self, sensor: Sensor, from: i64, to: i64) -> Vec<(i64, f32)> {
-        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.series
             .get(&sensor.as_u16())
             .map(|buf| {
@@ -387,7 +387,7 @@ impl Store {
     pub fn latest_sample(&self, sensor: Sensor) -> Option<(i64, f32)> {
         self.state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .series
             .get(&sensor.as_u16())
             .and_then(|buf| buf.back().copied())
@@ -395,7 +395,7 @@ impl Store {
 
     /// Replace the accumulator snapshot in memory. Caller owns increment logic.
     pub fn set_accumulators(&self, acc: Accumulators) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.accumulators = acc;
         st.mark_dirty();
     }
@@ -404,7 +404,7 @@ impl Store {
     pub fn accumulators(&self) -> Accumulators {
         self.state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .accumulators
             .clone()
     }
@@ -414,7 +414,7 @@ impl Store {
     /// sequence counter so neither overwrites the other.
     pub fn record_cycle(&self, started_at: SystemTime, blob: CycleBlob) -> Result<()> {
         let s = unix_secs(started_at)?;
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let seq = *st.cycle_seq_next.entry(s).or_insert(0);
         st.cycle_seq_next.insert(s, seq.saturating_add(1));
         st.pending_cycles.push(((s, seq), blob));
@@ -425,20 +425,19 @@ impl Store {
     /// Queue a step-response event. Also pushed to the in-memory cache so the
     /// API can serve it immediately without waiting for the hourly flush.
     pub fn record_step_event(&self, blob: StepEventBlob) {
-        let key = match i64::try_from(blob.started_at) {
-            Ok(k) => k,
-            Err(_) => {
-                // started_at > i64::MAX implies a corrupt clock (year > 292 billion).
-                // Clamp so we don't drop the event, but warn loudly — silent
-                // saturation produces colliding STEP_EVENTS keys.
-                tracing::warn!(
-                    "Step event timestamp {} overflows i64; clamping to i64::MAX (key collision possible)",
-                    blob.started_at
-                );
-                i64::MAX
-            }
+        let key = if let Ok(k) = i64::try_from(blob.started_at) {
+            k
+        } else {
+            // started_at > i64::MAX implies a corrupt clock (year > 292 billion).
+            // Clamp so we don't drop the event, but warn loudly — silent
+            // saturation produces colliding STEP_EVENTS keys.
+            tracing::warn!(
+                "Step event timestamp {} overflows i64; clamping to i64::MAX (key collision possible)",
+                blob.started_at
+            );
+            i64::MAX
         };
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.step_events_cache.insert(0, blob.clone());
         if st.step_events_cache.len() > MAX_STEP_EVENTS {
             st.step_events_cache.truncate(MAX_STEP_EVENTS);
@@ -451,7 +450,7 @@ impl Store {
     /// `MAX_STEP_EVENTS`.
     #[must_use]
     pub fn recent_step_events(&self, limit: usize) -> Vec<StepEventBlob> {
-        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.step_events_cache
             .iter()
             .take(limit.min(MAX_STEP_EVENTS))
@@ -462,7 +461,7 @@ impl Store {
     /// Upsert a per-day aggregate. Multiple updates per day collapse to one
     /// row on flush — the latest value wins.
     pub fn upsert_daily(&self, date_yyyymmdd: u32, blob: DailyBlob) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.pending_daily.insert(date_yyyymmdd, blob);
         st.mark_dirty();
     }
@@ -478,7 +477,7 @@ impl Store {
         // so a single out-of-order entry shouldn't truncate the rest.
         let mut out: Vec<CycleBlob> = Vec::new();
         {
-            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             for ((t, _), c) in st.pending_cycles.iter().rev() {
                 if *t < since {
                     continue;
@@ -518,7 +517,7 @@ impl Store {
             }
         }
         {
-            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             for (k, v) in &st.pending_daily {
                 by_date.insert(*k, v.clone());
             }
@@ -533,7 +532,7 @@ impl Store {
     #[allow(clippy::many_single_char_names)]
     pub fn flush(&self) -> Result<()> {
         let (accumulators, cycles, daily, step_events, gen_at_snapshot) = {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if !st.dirty {
                 return Ok(());
             }
@@ -587,7 +586,7 @@ impl Store {
         // writer bumped the generation while we were committing. Otherwise
         // their `dirty = true` would be silently clobbered and the next
         // flush would skip their data.
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if st.dirty_gen == gen_at_snapshot {
             st.dirty = false;
         }

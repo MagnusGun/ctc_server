@@ -491,6 +491,13 @@ fn process_message(
     grid_state: &GridState,
     state: &mut WsRotationState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Tibber's accumulated counter is reported to ~3 decimals (mWh). A
+    // backward stutter inside that resolution is sensor noise, not a real
+    // reset, so the "same quarter, no reset" and "real midnight reset"
+    // guards below both tolerate up to RESET_JITTER_KWH backward before
+    // re-anchoring.
+    const RESET_JITTER_KWH: f64 = 0.01;
+
     let ws_msg: WSMessage = serde_json::from_str(text)?;
 
     if ws_msg.msg_type == "next" {
@@ -534,12 +541,6 @@ fn process_message(
                 state.last_recorded_hour = Some(current_hour);
 
                 // ---- 15-minute path (current_quarter_kwh + consumption_15min) ----
-                // Tibber's accumulated counter is reported to ~3 decimals
-                // (mWh). A backward stutter inside that resolution is sensor
-                // noise, not a real reset, so the "same quarter, no reset"
-                // and "real midnight reset" guards both tolerate up to
-                // RESET_JITTER_KWH backward before re-anchoring.
-                const RESET_JITTER_KWH: f64 = 0.01;
                 let accumulated = f64::from(accumulated);
                 match (state.quarter_start_secs, state.quarter_start_accumulated) {
                     (Some(prev_quarter), Some(prev_snapshot))

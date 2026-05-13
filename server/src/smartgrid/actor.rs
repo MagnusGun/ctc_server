@@ -1,4 +1,4 @@
-//! SmartGrid actor.
+//! `SmartGrid` actor.
 //!
 //! Owns the [`GpioController`] and all in-memory mode bookkeeping (current
 //! mode, last-changed timestamp, pending auto-resume) in a single async
@@ -73,7 +73,7 @@ pub fn push_pump_to_homey(hooks: Option<&HomeyHooks>, mode: SmartGridMode) {
     });
 }
 
-/// Errors a SetMode command can surface.
+/// Errors a `SetMode` command can surface.
 #[derive(Debug)]
 pub enum ApplyModeError {
     Gpio(String),
@@ -271,12 +271,11 @@ impl SmartGridActor {
                     info!("SmartGrid actor: shutdown signal received");
                     break;
                 }
-                cmd = rx.recv() => match cmd {
-                    Some(c) => self.handle(c),
-                    None => {
-                        info!("SmartGrid actor: all senders dropped, exiting");
-                        break;
-                    }
+                cmd = rx.recv() => if let Some(c) = cmd {
+                    self.handle(c);
+                } else {
+                    info!("SmartGrid actor: all senders dropped, exiting");
+                    break;
                 }
             }
         }
@@ -438,7 +437,7 @@ pub(crate) mod test_support {
 
     use super::*;
 
-    /// Spawn the actor with a test-only GpioController (no hardware ioctls).
+    /// Spawn the actor with a test-only `GpioController` (no hardware ioctls).
     /// The actor still serialises commands correctly; only `do_set_mode`
     /// will error out at the GPIO write step. For tests that don't care
     /// about that (concurrency, schedule, supersession), set the initial
@@ -539,7 +538,7 @@ mod tests {
         cancel.cancel();
     }
 
-    /// Regression for Critical #2 from the code review: concurrent SetMode
+    /// Regression for Critical #2 from the code review: concurrent `SetMode`
     /// calls must not interleave. Even with no real GPIO, the actor's serial
     /// command processing means both calls return their results without
     /// races.

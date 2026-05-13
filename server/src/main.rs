@@ -806,6 +806,12 @@ fn calculate_price_levels(
 ) -> Vec<crate::energy::price::PricePoint> {
     use crate::energy::price::PriceLevel;
 
+    // Tolerance for the "all prices equal" short-circuit below. Half an
+    // öre/kWh: spot prices are reported to 5-6 decimals but the
+    // user-meaningful resolution is öre (0.01 SEK/kWh). A spread below
+    // half an öre is rounding noise, not a real price gradient.
+    const ORE_TOLERANCE_SEK_PER_KWH: f64 = 0.005;
+
     if prices.is_empty() {
         return prices;
     }
@@ -816,11 +822,6 @@ fn calculate_price_levels(
 
     // Degenerate case: all prices equal (e.g. all zero on a calm weekend).
     // Treat them all as Normal — any other classification is meaningless.
-    //
-    // Tolerance is half an öre/kWh: spot prices are reported to 5-6 decimals
-    // but the user-meaningful resolution is öre (0.01 SEK/kWh). A spread
-    // below half an öre is rounding noise, not a real price gradient.
-    const ORE_TOLERANCE_SEK_PER_KWH: f64 = 0.005;
     if (sorted_prices.last().copied().unwrap_or(0.0)
         - sorted_prices.first().copied().unwrap_or(0.0))
     .abs()

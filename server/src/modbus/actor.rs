@@ -978,7 +978,7 @@ impl CtcActor {
     ///
     /// Takes `Duration` + `Option<Instant>` by value so the returned future
     /// captures only `Copy` values — keeping `&CtcActor` out of the future
-    /// matters because the actor is `!Sync` (the tokio_modbus context isn't).
+    /// matters because the actor is `!Sync` (the `tokio_modbus` context isn't).
     async fn wait_for_inter_request_gap(gap: Duration, last: Option<Instant>) {
         if gap.is_zero() {
             return;
@@ -986,7 +986,7 @@ impl CtcActor {
         if let Some(last) = last {
             let elapsed = last.elapsed();
             if elapsed < gap {
-                sleep(gap - elapsed).await;
+                sleep(gap.saturating_sub(elapsed)).await;
             }
         }
     }

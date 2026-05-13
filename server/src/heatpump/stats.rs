@@ -7,7 +7,7 @@
 //! - Outdoor temperature correlation for each cycle
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
@@ -272,7 +272,7 @@ impl HeatPumpStats {
     /// current cycle is rolled back, and the next successful poll re-syncs
     /// from a clean slate (treated like the first poll after server start).
     pub fn mark_poll_failed(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
         if inner.compressor_on && inner.observed_cycle_start {
             let credited = inner.current_cycle_credited_secs;
@@ -305,7 +305,7 @@ impl HeatPumpStats {
         let mut accumulators_snapshot: Option<Accumulators> = None;
 
         {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
             // Handle first update - just sync state without counting anything
             // This ensures we don't count partial cycles if server starts with heater ON
@@ -443,7 +443,7 @@ impl HeatPumpStats {
     /// Get the summary statistics
     #[must_use]
     pub fn get_summary(&self) -> HeatPumpStatsResponse {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let now = SystemTime::now();
 
         let current_state_duration = now
@@ -522,7 +522,7 @@ impl HeatPumpStats {
         let Some(store) = self.store.as_ref() else {
             // No store: fall back to the in-memory cycle tail. Daily history
             // is empty since archive targets the store.
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             let cycles: Vec<CycleRecord> = inner
                 .cycle_history
                 .iter()
@@ -1133,11 +1133,11 @@ mod tests {
             .expect("Sunday should be archived on Monday rollover");
         assert_eq!(archived.0, 20_260_329, "yyyymmdd for archived Sunday");
 
-        // Sunday should be credited with the 30 min pre-midnight portion.
-        let archived_secs = (archived.1.operating_hours * 3600.0).round() as i64;
-        assert_eq!(
-            archived_secs, 1800,
-            "Sunday operating_secs from pre-midnight credit"
+        // Sunday should be credited with the 30 min pre-midnight portion (0.5 h).
+        assert_float_eq(
+            archived.1.operating_hours,
+            1800.0 / 3600.0,
+            "Sunday operating_hours from pre-midnight credit",
         );
 
         // current_cycle_credited_secs records the credit so the eventual
@@ -1180,10 +1180,11 @@ mod tests {
             .expect("Sunday should be archived on Monday rollover");
         assert_eq!(archived.0, 20_261_025, "yyyymmdd for archived Sunday");
 
-        let archived_secs = (archived.1.operating_hours * 3600.0).round() as i64;
-        assert_eq!(
-            archived_secs, 2700,
-            "Sunday operating_secs (45 min pre-midnight)"
+        // Sunday should be credited with the 45 min pre-midnight portion (0.75 h).
+        assert_float_eq(
+            archived.1.operating_hours,
+            2700.0 / 3600.0,
+            "Sunday operating_hours (45 min pre-midnight)",
         );
         assert_eq!(inner.current_cycle_credited_secs, 2700);
         assert_eq!(inner.current_day_start, monday_midnight_secs);

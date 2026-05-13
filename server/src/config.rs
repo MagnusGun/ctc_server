@@ -211,6 +211,11 @@ impl Config {
     /// stub the few env vars that the `config` crate's `Environment` source
     /// cannot route correctly because field names contain underscores
     /// (`storage.db_path`, `heatpump_stats.persist_path`).
+    //
+    // 100+ lines of sequential `.set_default(...)` builder calls; splitting
+    // them into per-section helpers would fragment a single declarative
+    // schema purely to satisfy a line-count heuristic.
+    #[allow(clippy::too_many_lines)]
     fn load_with_env<F>(config_path: Option<&str>, get_env: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
