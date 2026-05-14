@@ -97,20 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // respawn; these atomics survive because they live above the actor.
     let sup_stats = Arc::new(SupervisorStats::default());
 
-    CtcActorBuilder::new(tty_path)
-        .baud_rate(config.serial.baud_rate)
-        .data_bits(config.serial.get_data_bits()?)
-        .parity(config.serial.get_parity()?)
-        .stop_bits(config.serial.get_stop_bits()?)
-        .flow_control(config.serial.get_flow_control()?)
-        .timeout(Duration::from_secs(config.serial.timeout_secs))
-        .slave_id(config.modbus.slave_id)
-        .operation_timeout(Duration::from_secs(config.modbus.operation_timeout_secs))
-        .max_retries(config.modbus.max_retries)
-        .initial_retry_delay(Duration::from_millis(config.modbus.initial_retry_delay_ms))
-        .backoff_multiplier(config.modbus.backoff_multiplier)
-        .max_consecutive_failures(config.modbus.max_consecutive_failures)
-        .inter_request_gap(Duration::from_millis(config.modbus.inter_request_gap_ms))
+    CtcActorBuilder::new(tty_path, &config.serial, &config.modbus)?
         .sup_stats(Arc::clone(&sup_stats))
         .spawn_supervised(rx);
 

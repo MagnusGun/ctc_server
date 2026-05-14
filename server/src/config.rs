@@ -16,21 +16,37 @@ use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
 /// Root configuration structure
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
     pub serial: SerialConfig,
+    #[serde(default)]
     pub modbus: ModbusConfig,
+    #[serde(default)]
     pub temperature_validation: TemperatureValidationConfig,
+    #[serde(default)]
     pub gpio: GpioConfig,
+    #[serde(default)]
     pub tibber: TibberConfig,
+    #[serde(default)]
     pub price: PriceConfig,
+    #[serde(default)]
     pub heatpump_stats: HeatPumpStatsConfig,
+    #[serde(default)]
     pub smartgrid: SmartGridConfig,
+    #[serde(default)]
     pub homey: HomeyConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     /// IANA timezone used for local-time conversions (e.g. daily-stats keying,
     /// price-fetch schedule). The Göteborg Energi tariff calendar is always
     /// Swedish and ignores this setting.
+    #[serde(default = "default_tz")]
     pub tz: String,
+}
+
+fn default_tz() -> String {
+    "Europe/Stockholm".to_string()
 }
 
 /// Embedded redb store configuration
@@ -41,8 +57,17 @@ pub struct StorageConfig {
     pub db_path: String,
 }
 
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            db_path: "./data/ctc.redb".to_string(),
+        }
+    }
+}
+
 /// HTTP server configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     /// Host address to bind to (e.g., "0.0.0.0" or "127.0.0.1")
     pub host: String,
@@ -50,8 +75,18 @@ pub struct ServerConfig {
     pub port: u16,
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: 3000,
+        }
+    }
+}
+
 /// Serial port configuration for Modbus RTU
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct SerialConfig {
     /// Default serial port path if not provided via CLI
     pub default_port: String,
@@ -69,8 +104,23 @@ pub struct SerialConfig {
     pub timeout_secs: u64,
 }
 
+impl Default for SerialConfig {
+    fn default() -> Self {
+        Self {
+            default_port: "/dev/ttyAMA4".to_string(),
+            baud_rate: 9600,
+            data_bits: 8,
+            parity: "even".to_string(),
+            stop_bits: 1,
+            flow_control: "hardware".to_string(),
+            timeout_secs: 1,
+        }
+    }
+}
+
 /// Modbus protocol configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ModbusConfig {
     /// Modbus slave ID (typically 1 for CTC systems)
     pub slave_id: u8,
@@ -90,14 +140,33 @@ pub struct ModbusConfig {
     /// Should be higher than `operation_timeout_secs` to allow for retries
     pub request_timeout_secs: u64,
     /// Minimum delay in milliseconds between consecutive Modbus transactions.
-    /// Modbus RTU spec requires ≥3.5 character times (≈3.6 ms @ 9600 baud);
-    /// CTC firmware typically needs more breathing room between back-to-back
-    /// reads. 10 ms is a safe default; raise to 20-50 ms on noisy buses.
+    /// Modbus RTU spec requires ≥3.5 character times (≈3.6 ms @ 9600 baud),
+    /// but CTC firmware needs more post-response settle time: at 10 ms, prod
+    /// observed ~3 timeouts/hour with the timing-out attempt landing exactly
+    /// at the gap floor. 25 ms eliminates that class of retry; bump higher
+    /// (50+) only if a noisier bus shows residual timeouts.
     pub inter_request_gap_ms: u64,
+}
+
+impl Default for ModbusConfig {
+    fn default() -> Self {
+        Self {
+            slave_id: 1,
+            channel_buffer_size: 32,
+            operation_timeout_secs: 1,
+            max_retries: 2,
+            initial_retry_delay_ms: 100,
+            backoff_multiplier: 2.0,
+            max_consecutive_failures: 5,
+            request_timeout_secs: 10,
+            inter_request_gap_ms: 25,
+        }
+    }
 }
 
 /// Temperature validation configuration for API endpoints
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct TemperatureValidationConfig {
     /// Minimum allowed room temperature setpoint (°C)
     pub min: f32,
@@ -105,8 +174,18 @@ pub struct TemperatureValidationConfig {
     pub max: f32,
 }
 
+impl Default for TemperatureValidationConfig {
+    fn default() -> Self {
+        Self {
+            min: 5.0,
+            max: 30.0,
+        }
+    }
+}
+
 /// GPIO relay configuration for `SmartGrid` control
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct GpioConfig {
     /// Enable GPIO-based `SmartGrid` control
     pub enabled: bool,
@@ -118,8 +197,20 @@ pub struct GpioConfig {
     pub active_low: bool,
 }
 
+impl Default for GpioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            gpio_k24: 20,
+            gpio_k25: 21,
+            active_low: false,
+        }
+    }
+}
+
 /// Tibber API configuration for energy consumption data
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
 pub struct TibberConfig {
     /// Enable Tibber API integration
     pub enabled: bool,
@@ -137,6 +228,7 @@ pub struct TibberApi {
 
 /// Electricity price configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct PriceConfig {
     /// Enable price tracking
     pub enabled: bool,
@@ -150,8 +242,19 @@ pub struct PriceConfig {
     pub fetch_hour_local: u32,
 }
 
+impl Default for PriceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            zone: "SE3".to_string(),
+            fetch_hour_local: 14,
+        }
+    }
+}
+
 /// Heat pump statistics tracking configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct HeatPumpStatsConfig {
     /// Enable heat pump statistics tracking
     pub enabled: bool,
@@ -159,8 +262,17 @@ pub struct HeatPumpStatsConfig {
     pub poll_interval_secs: u64,
     /// Optional path to a JSON file used to persist accumulators and history
     /// across restarts. `None` (or empty) disables persistence.
-    #[serde(default)]
     pub persist_path: Option<String>,
+}
+
+impl Default for HeatPumpStatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: 10,
+            persist_path: None,
+        }
+    }
 }
 
 /// `SmartGrid` behavioural configuration.
@@ -171,6 +283,7 @@ pub struct HeatPumpStatsConfig {
 /// the prefix repetition. Hence `#[allow(clippy::struct_field_names)]`.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct SmartGridConfig {
     /// Enable auto-resume to Normal after a manually-triggered Blocking
     pub auto_resume_enabled: bool,
@@ -184,12 +297,23 @@ pub struct SmartGridConfig {
     pub auto_resume_min_duration_minutes: u16,
 }
 
+impl Default for SmartGridConfig {
+    fn default() -> Self {
+        Self {
+            auto_resume_enabled: true,
+            auto_resume_window_hours: 12,
+            auto_resume_min_duration_minutes: 30,
+        }
+    }
+}
+
 /// Homey REST API integration for controlling the Cirkulationspump smart plug.
 ///
 /// When `enabled = true`, the `SmartGrid` actor pushes the pump on/off via the
 /// Homey REST API on every mode change (`Blocking` → off, anything else → on),
 /// and a reconciliation poller corrects drift every `poll_interval_secs`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct HomeyConfig {
     /// Enable Homey REST integration
     pub enabled: bool,
@@ -198,13 +322,24 @@ pub struct HomeyConfig {
     /// Personal Access Token. Required scopes:
     /// `homey.device.control`, `homey.device.readonly`.
     /// Set via `CTC_HOMEY_TOKEN` env var — never commit.
-    #[serde(default)]
     pub token: Option<String>,
     /// Device id of the smart plug acting as the pump switch.
     pub pump_device_id: String,
     /// Reconciliation poll interval in seconds. `0` disables the poller
     /// (push-only mode — drift will not be corrected).
     pub poll_interval_secs: u64,
+}
+
+impl Default for HomeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            token: None,
+            pump_device_id: String::new(),
+            poll_interval_secs: 60,
+        }
+    }
 }
 
 impl Config {
@@ -223,11 +358,6 @@ impl Config {
     /// stub the few env vars that the `config` crate's `Environment` source
     /// cannot route correctly because field names contain underscores
     /// (`storage.db_path`, `heatpump_stats.persist_path`).
-    //
-    // 100+ lines of sequential `.set_default(...)` builder calls; splitting
-    // them into per-section helpers would fragment a single declarative
-    // schema purely to satisfy a line-count heuristic.
-    #[allow(clippy::too_many_lines)]
     fn load_with_env<F>(config_path: Option<&str>, get_env: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -288,64 +418,6 @@ impl Config {
                 builder = builder.set_override(cfg_key, v)?;
             }
         }
-
-        // Set default values
-        builder = builder
-            // Server defaults
-            .set_default("server.host", "0.0.0.0")?
-            .set_default("server.port", 3000)?
-            // Serial defaults
-            .set_default("serial.default_port", "/dev/ttyAMA4")?
-            .set_default("serial.baud_rate", 9600)?
-            .set_default("serial.data_bits", 8)?
-            .set_default("serial.parity", "even")?
-            .set_default("serial.stop_bits", 1)?
-            .set_default("serial.flow_control", "hardware")?
-            .set_default("serial.timeout_secs", 1)?
-            // Modbus defaults
-            .set_default("modbus.slave_id", 1)?
-            .set_default("modbus.channel_buffer_size", 32)?
-            .set_default("modbus.operation_timeout_secs", 1)?
-            .set_default("modbus.max_retries", 2)?
-            .set_default("modbus.initial_retry_delay_ms", 100)?
-            .set_default("modbus.backoff_multiplier", 2.0)?
-            .set_default("modbus.max_consecutive_failures", 5)?
-            .set_default("modbus.request_timeout_secs", 10)?
-            .set_default("modbus.inter_request_gap_ms", 10)?
-            // Temperature validation defaults
-            .set_default("temperature_validation.min", 5.0)?
-            .set_default("temperature_validation.max", 30.0)?
-            // GPIO defaults
-            .set_default("gpio.enabled", true)?
-            .set_default("gpio.gpio_k24", 20)?
-            .set_default("gpio.gpio_k25", 21)?
-            .set_default("gpio.active_low", false)?
-            // Tibber defaults
-            .set_default("tibber.enabled", false)?
-            .set_default("tibber.api.token", None::<String>)?
-            // Price defaults
-            .set_default("price.enabled", true)?
-            .set_default("price.zone", "SE3")?
-            .set_default("price.fetch_hour_local", 14)?
-            // Heat pump stats defaults
-            .set_default("heatpump_stats.enabled", true)?
-            .set_default("heatpump_stats.poll_interval_secs", 10)?
-            .set_default("heatpump_stats.persist_path", None::<String>)?
-            // SmartGrid defaults
-            .set_default("smartgrid.auto_resume_enabled", true)?
-            .set_default("smartgrid.auto_resume_window_hours", 12)?
-            .set_default("smartgrid.auto_resume_min_duration_minutes", 30)?
-            // Homey defaults — disabled by default; opt in via [homey].enabled
-            // or CTC_HOMEY_ENABLED=true.
-            .set_default("homey.enabled", false)?
-            .set_default("homey.url", "")?
-            .set_default("homey.token", None::<String>)?
-            .set_default("homey.pump_device_id", "")?
-            .set_default("homey.poll_interval_secs", 60)?
-            // Storage defaults — CTC_DB_PATH env var overrides
-            .set_default("storage.db_path", "./data/ctc.redb")?
-            // Timezone default — Stockholm preserves prior hardcoded behaviour.
-            .set_default("tz", "Europe/Stockholm")?;
 
         let mut cfg: Self = builder.build()?.try_deserialize()?;
         // Tibber/elpris only publish today + tomorrow, so a scan window
@@ -557,93 +629,11 @@ mod tests {
     #[test]
     fn test_partial_config() {
         // Test that the config system works when only some values are specified
-        // This simulates a user having a config.toml with only port = 8080
+        // This simulates a user having a config.toml with only port = 8080.
+        // `#[serde(default)]` on every substruct lets every other field fall
+        // back to `Default::default()` during deserialization.
         let builder = ConfigBuilder::builder()
-            .set_default("server.host", "0.0.0.0")
-            .unwrap()
-            .set_default("server.port", 3000)
-            .unwrap()
             .set_override("server.port", 8080)
-            .unwrap()
-            .set_default("serial.default_port", "/dev/ttyAMA4")
-            .unwrap()
-            .set_default("serial.baud_rate", 9600)
-            .unwrap()
-            .set_default("serial.data_bits", 8)
-            .unwrap()
-            .set_default("serial.parity", "even")
-            .unwrap()
-            .set_default("serial.stop_bits", 1)
-            .unwrap()
-            .set_default("serial.flow_control", "hardware")
-            .unwrap()
-            .set_default("serial.timeout_secs", 1)
-            .unwrap()
-            .set_default("modbus.slave_id", 1)
-            .unwrap()
-            .set_default("modbus.channel_buffer_size", 24)
-            .unwrap()
-            .set_default("modbus.operation_timeout_secs", 5)
-            .unwrap()
-            .set_default("modbus.max_retries", 2)
-            .unwrap()
-            .set_default("modbus.initial_retry_delay_ms", 100)
-            .unwrap()
-            .set_default("modbus.request_timeout_secs", 10)
-            .unwrap()
-            .set_default("modbus.backoff_multiplier", 2.0)
-            .unwrap()
-            .set_default("modbus.max_consecutive_failures", 5)
-            .unwrap()
-            .set_default("modbus.inter_request_gap_ms", 10)
-            .unwrap()
-            .set_default("temperature_validation.min", 5.0)
-            .unwrap()
-            .set_default("temperature_validation.max", 30.0)
-            .unwrap()
-            .set_default("gpio.enabled", true)
-            .unwrap()
-            .set_default("gpio.gpio_k24", 20)
-            .unwrap()
-            .set_default("gpio.gpio_k25", 21)
-            .unwrap()
-            .set_default("gpio.active_low", false)
-            .unwrap()
-            .set_default("tibber.enabled", false)
-            .unwrap()
-            .set_default("tibber.api.token", None::<String>)
-            .unwrap()
-            .set_default("price.enabled", true)
-            .unwrap()
-            .set_default("price.zone", "SE3")
-            .unwrap()
-            .set_default("price.fetch_hour_local", 14)
-            .unwrap()
-            .set_default("heatpump_stats.enabled", true)
-            .unwrap()
-            .set_default("heatpump_stats.poll_interval_secs", 10)
-            .unwrap()
-            .set_default("heatpump_stats.persist_path", None::<String>)
-            .unwrap()
-            .set_default("smartgrid.auto_resume_enabled", true)
-            .unwrap()
-            .set_default("smartgrid.auto_resume_window_hours", 12)
-            .unwrap()
-            .set_default("smartgrid.auto_resume_min_duration_minutes", 30)
-            .unwrap()
-            .set_default("homey.enabled", false)
-            .unwrap()
-            .set_default("homey.url", "")
-            .unwrap()
-            .set_default("homey.token", None::<String>)
-            .unwrap()
-            .set_default("homey.pump_device_id", "")
-            .unwrap()
-            .set_default("homey.poll_interval_secs", 60)
-            .unwrap()
-            .set_default("storage.db_path", "./data/ctc.redb")
-            .unwrap()
-            .set_default("tz", "Europe/Stockholm")
             .unwrap();
 
         let config: Config = builder.build().unwrap().try_deserialize().unwrap();

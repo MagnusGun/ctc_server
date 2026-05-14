@@ -21,6 +21,9 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::config::{ModbusConfig, SerialConfig};
+use config::ConfigError;
+
 /// Response types for Modbus operations
 #[derive(Debug, Clone)]
 pub enum ModbusResponse {
@@ -417,7 +420,6 @@ pub struct CtcActor {
 /// addresses on the hot path.
 const PER_REGISTER_CAP: usize = 256;
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct CtcActorBuilder {
     tty_path: String,
@@ -438,28 +440,35 @@ pub struct CtcActorBuilder {
     sup_stats: Arc<SupervisorStats>,
 }
 
-#[allow(dead_code)]
 impl CtcActorBuilder {
-    /// Create a new builder with just the TTY path
-    /// All other parameters should be set via builder methods
-    pub fn new(tty_path: impl Into<String>) -> Self {
-        Self {
+    /// Create a builder seeded from the loaded config. Serial enum conversions
+    /// (parity / stop bits / flow control) happen here, so this is fallible.
+    ///
+    /// # Errors
+    /// Returns `ConfigError` if any of `serial.parity`, `serial.stop_bits`,
+    /// `serial.data_bits`, or `serial.flow_control` cannot be parsed.
+    pub fn new(
+        tty_path: impl Into<String>,
+        serial: &SerialConfig,
+        modbus: &ModbusConfig,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self {
             tty_path: tty_path.into(),
-            baud_rate: 9600,                           // Will be overridden by config
-            data_bits: DataBits::Eight,                // Will be overridden by config
-            parity: Parity::Even,                      // Will be overridden by config
-            stop_bits: StopBits::One,                  // Will be overridden by config
-            flow_control: FlowControl::Hardware,       // Will be overridden by config
-            timeout: Duration::from_secs(1),           // Will be overridden by config
-            slave_id: 1,                               // Will be overridden by config
-            operation_timeout: Duration::from_secs(5), // Will be overridden by config
-            max_retries: 2,                            // Will be overridden by config
-            initial_retry_delay: Duration::from_millis(100), // Will be overridden by config
-            backoff_multiplier: 2.0,                   // Will be overridden by config
-            max_consecutive_failures: 5,               // Will be overridden by config
-            inter_request_gap: Duration::from_millis(10), // Will be overridden by config
+            baud_rate: serial.baud_rate,
+            data_bits: serial.get_data_bits()?,
+            parity: serial.get_parity()?,
+            stop_bits: serial.get_stop_bits()?,
+            flow_control: serial.get_flow_control()?,
+            timeout: Duration::from_secs(serial.timeout_secs),
+            slave_id: modbus.slave_id,
+            operation_timeout: Duration::from_secs(modbus.operation_timeout_secs),
+            max_retries: modbus.max_retries,
+            initial_retry_delay: Duration::from_millis(modbus.initial_retry_delay_ms),
+            backoff_multiplier: modbus.backoff_multiplier,
+            max_consecutive_failures: modbus.max_consecutive_failures,
+            inter_request_gap: Duration::from_millis(modbus.inter_request_gap_ms),
             sup_stats: Arc::new(SupervisorStats::default()),
-        }
+        })
     }
 
     /// Replace the supervisor stats Arc. Callers should hand the same
@@ -468,71 +477,6 @@ impl CtcActorBuilder {
     /// actor on `build()`.
     pub fn sup_stats(mut self, sup_stats: Arc<SupervisorStats>) -> Self {
         self.sup_stats = sup_stats;
-        self
-    }
-
-    pub fn baud_rate(mut self, baud_rate: u32) -> Self {
-        self.baud_rate = baud_rate;
-        self
-    }
-
-    pub fn data_bits(mut self, data_bits: DataBits) -> Self {
-        self.data_bits = data_bits;
-        self
-    }
-
-    pub fn parity(mut self, parity: Parity) -> Self {
-        self.parity = parity;
-        self
-    }
-
-    pub fn stop_bits(mut self, stop_bits: StopBits) -> Self {
-        self.stop_bits = stop_bits;
-        self
-    }
-
-    pub fn flow_control(mut self, flow_control: FlowControl) -> Self {
-        self.flow_control = flow_control;
-        self
-    }
-
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    pub fn slave_id(mut self, slave_id: u8) -> Self {
-        self.slave_id = slave_id;
-        self
-    }
-
-    pub fn operation_timeout(mut self, operation_timeout: Duration) -> Self {
-        self.operation_timeout = operation_timeout;
-        self
-    }
-
-    pub fn max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
-        self
-    }
-
-    pub fn initial_retry_delay(mut self, initial_retry_delay: Duration) -> Self {
-        self.initial_retry_delay = initial_retry_delay;
-        self
-    }
-
-    pub fn backoff_multiplier(mut self, backoff_multiplier: f64) -> Self {
-        self.backoff_multiplier = backoff_multiplier;
-        self
-    }
-
-    pub fn max_consecutive_failures(mut self, max_consecutive_failures: u32) -> Self {
-        self.max_consecutive_failures = max_consecutive_failures;
-        self
-    }
-
-    pub fn inter_request_gap(mut self, inter_request_gap: Duration) -> Self {
-        self.inter_request_gap = inter_request_gap;
         self
     }
 
