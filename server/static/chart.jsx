@@ -11,7 +11,8 @@ const levelColor = lvl => LEVEL_VAR[lvl] ?? "var(--text-3)";
 
 const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, scheduledRunMinutes = null, height = 200 }) => {
   const [hover, setHover] = React.useState(null);
-  const w = 1200;
+  const [containerRef, measuredW] = window.useElementSize();
+  const w = measuredW || 1200;
   const h = height;
   const padL = 40, padR = 20, padT = 16, padB = 26;
   const innerW = w - padL - padR;
@@ -96,7 +97,7 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
   const hoverCx = hover != null ? (xFor(hover) + xFor(hover + 1)) / 2 : 0;
 
   return (
-    <svg className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
+    <svg ref={containerRef} className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
       <defs>
         <linearGradient id="todayFill" x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%"   stopColor="var(--text-3)" stopOpacity="0.18"/>

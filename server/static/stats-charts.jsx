@@ -273,11 +273,12 @@ const RadialClock = ({ data }) => {
 /* ---------- Heating system: flow/return/ΔT trend + step response ---------- */
 const HeatingTrend = ({ data, height = 220 }) => {
   const [hov, setHov] = React.useState(null);
+  const [containerRef, measuredW] = window.useElementSize();
   if (!data || !Array.isArray(data.flow) || !Array.isArray(data.ret)
       || data.flow.length === 0 || data.ret.length === 0) {
     return <EmptyChart/>;
   }
-  const w = 1200, h = height, pad = 36;
+  const w = measuredW || 1200, h = height, pad = 36;
   // Slots are minute-resolution (length 1440 for 24h). X-axis tick labels
   // are wall-clock hours derived from each slot's actual end-of-slot time;
   // the hover label uses minute resolution since the data is dense enough
@@ -346,7 +347,7 @@ const HeatingTrend = ({ data, height = 220 }) => {
   const formatDeg = (v) => (v == null ? "—" : `${v.toFixed(1)}°`);
   return (
     <div className="heating-trend">
-      <svg viewBox={`0 0 ${w} ${h}`} className="ht-svg" onMouseLeave={() => setHov(null)}
+      <svg ref={containerRef} viewBox={`0 0 ${w} ${h}`} className="ht-svg" onMouseLeave={() => setHov(null)}
            onMouseMove={e => {
              const r = e.currentTarget.getBoundingClientRect();
              const px = ((e.clientX - r.left) / r.width) * w;
@@ -359,12 +360,12 @@ const HeatingTrend = ({ data, height = 220 }) => {
           return (
             <g key={j}>
               <line x1={pad} y1={y(v)} x2={w} y2={y(v)} stroke="var(--line)" strokeDasharray="2 4" opacity="0.5"/>
-              <text x={pad - 6} y={y(v) + 3} textAnchor="end" fontSize="10" fill="var(--text-3)" fontFamily="var(--font-mono)">{v.toFixed(0)}°</text>
+              <text className="axis-label" x={pad - 6} y={y(v) + 3} textAnchor="end">{v.toFixed(0)}°</text>
             </g>
           );
         })}
         {tickIndices.map((i, k) => (
-          <text key={i} x={x(i)} y={h - pad + 14} textAnchor="middle" fontSize="10" fill="var(--text-3)" fontFamily="var(--font-mono)">{tickLabels[k]}</text>
+          <text className="axis-label" key={i} x={x(i)} y={h - pad + 14} textAnchor="middle">{tickLabels[k]}</text>
         ))}
         {/* ΔT band */}
         <path d={bandPath} fill="var(--accent)" opacity="0.14"/>
@@ -405,8 +406,9 @@ const HeatingTrend = ({ data, height = 220 }) => {
 
 const StepResponse = ({ data }) => {
   const [active, setActive] = React.useState(0);
+  const [containerRef, measuredW] = window.useElementSize();
   if (!Array.isArray(data) || data.length === 0) return <EmptyChart/>;
-  const w = 1100, h = 280, pad = 38;
+  const w = measuredW || 1100, h = 280, pad = 38;
   const tMax = 1800;
   const allTemps = data.flatMap(e => e.samples.flatMap(s => [s.flow, s.ret]));
   const yMin = Math.floor(Math.min(...allTemps) - 1);
@@ -418,21 +420,21 @@ const StepResponse = ({ data }) => {
 
   return (
     <div className="step-response">
-      <svg viewBox={`0 0 ${w} ${h}`} className="sr-svg">
+      <svg ref={containerRef} viewBox={`0 0 ${w} ${h}`} className="sr-svg">
         {/* gridlines */}
         {Array.from({length: 5}).map((_, j) => {
           const v = yMin + ((yMax - yMin) / 4) * j;
           return (
             <g key={j}>
               <line x1={pad} y1={y(v)} x2={w} y2={y(v)} stroke="var(--line)" strokeDasharray="2 4" opacity="0.5"/>
-              <text x={pad - 6} y={y(v) + 3} textAnchor="end" fontSize="10" fill="var(--text-3)" fontFamily="var(--font-mono)">{v.toFixed(0)}°</text>
+              <text className="axis-label" x={pad - 6} y={y(v) + 3} textAnchor="end">{v.toFixed(0)}°</text>
             </g>
           );
         })}
         {[0, 300, 600, 900, 1200, 1500, 1800].map(t => (
           <g key={t}>
             <line x1={x(t)} y1={pad} x2={x(t)} y2={h - pad} stroke="var(--line)" strokeDasharray="2 4" opacity="0.3"/>
-            <text x={x(t)} y={h - pad + 14} textAnchor="middle" fontSize="10" fill="var(--text-3)" fontFamily="var(--font-mono)">
+            <text className="axis-label" x={x(t)} y={h - pad + 14} textAnchor="middle">
               {t === 0 ? "0" : `${(t/60).toFixed(0)}m`}
             </text>
           </g>

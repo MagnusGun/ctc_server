@@ -328,6 +328,27 @@ function useMediaQuery(query) {
 }
 const useIsNarrow = () => useMediaQuery("(max-width: 480px)");
 
+/* Measure a DOM element's width via ResizeObserver. Returns [ref, width].
+   Width is 0 before first measurement; charts fall back to a default
+   viewBox width until the observer fires. Uses a callback ref so the
+   observer re-attaches when the chart switches between empty- and full-
+   data render branches (different root DOM nodes). */
+function useElementSize() {
+    const [width, setWidth] = React.useState(0);
+    const [node, setNode] = React.useState(null);
+    const ref = React.useCallback(n => setNode(n), []);
+    React.useEffect(() => {
+        if (!node) return;
+        const ro = new ResizeObserver(entries => {
+            const cr = entries[0]?.contentRect;
+            if (cr) setWidth(Math.round(cr.width));
+        });
+        ro.observe(node);
+        return () => ro.disconnect();
+    }, [node]);
+    return [ref, width];
+}
+
 window.POLL_LIVE = POLL_LIVE;
 window.POLL_PRICES = POLL_PRICES;
 window.bucketMinutely = bucketMinutely;
@@ -350,3 +371,4 @@ window.useGrid = useGrid;
 window.usePrices = usePrices;
 window.usePump = usePump;
 window.useIsNarrow = useIsNarrow;
+window.useElementSize = useElementSize;

@@ -1455,11 +1455,18 @@ body {
   display: block;
 }
 .energy-chart .grid-line { stroke: var(--line); stroke-dasharray: 2 4; }
-.energy-chart .axis-label {
+.axis-label {
   font-family: var(--font-mono);
+  letter-spacing: 0.05em;
+}
+.energy-chart .axis-label {
   font-size: 9px;
   fill: var(--text-4);
-  letter-spacing: 0.05em;
+}
+.ht-svg .axis-label,
+.sr-svg .axis-label {
+  font-size: 10px;
+  fill: var(--text-3);
 }
 .energy-chart .now-line {
   stroke: var(--text-2);
@@ -1591,4 +1598,14 @@ body {
   }
   .trend-modal .tm-head { gap: 12px; }
   .trend-modal .tm-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+  /* Bump chart axis labels for legibility on phone — at default 9–10 px /
+     `--text-3..4` the units are visible but uncomfortably dim/small.
+     Selectors must match desktop specificity so the media rule wins. */
+  .energy-chart .axis-label,
+  .ht-svg .axis-label,
+  .sr-svg .axis-label {
+    font-size: 11px;
+    fill: var(--text-2);
+  }
 }

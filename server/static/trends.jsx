@@ -1,7 +1,8 @@
 /* Activity timeline + multi-series temperature trend */
 
 const ActivityTimeline = ({ segments, height = 60, hours = 24 }) => {
-  const w = 1200;
+  const [containerRef, measuredW] = window.useElementSize();
+  const w = measuredW || 1200;
   const h = height;
   const padL = 40, padR = 20, padT = 8, padB = 22;
   const innerW = w - padL - padR;
@@ -21,7 +22,7 @@ const ActivityTimeline = ({ segments, height = 60, hours = 24 }) => {
   }
 
   return (
-    <svg className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
+    <svg ref={containerRef} className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
       {/* lane labels + bg */}
       {lanes.map((lane, i) => {
         const y = padT + i * laneH;
@@ -75,7 +76,8 @@ const formatHr = (h) => {
 
 const TrendChart = ({ series, height = 200, yMin, yMax, hours = 24, unit = "°C" }) => {
   const [hover, setHover] = React.useState(null);
-  const w = 1200;
+  const [containerRef, measuredW] = window.useElementSize();
+  const w = measuredW || 1200;
   const h = height;
   const padL = 44, padR = 20, padT = 16, padB = 26;
   const innerW = w - padL - padR;
@@ -85,7 +87,7 @@ const TrendChart = ({ series, height = 200, yMin, yMax, hours = 24, unit = "°C"
   // the modal open without data.
   if (!Array.isArray(series) || series.length === 0 || !series[0]?.data?.length) {
     return (
-      <svg className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
+      <svg ref={containerRef} className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
         <text x={w / 2} y={h / 2} textAnchor="middle" dominantBaseline="middle"
               fill="var(--text-3)" fontSize="12" fontStyle="italic">
           No data yet
@@ -152,7 +154,7 @@ const TrendChart = ({ series, height = 200, yMin, yMax, hours = 24, unit = "°C"
   }
 
   return (
-    <svg className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
+    <svg ref={containerRef} className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
       {/* gridlines */}
       {ticks.map((t, i) => (
         <g key={`gy${i}`}>
