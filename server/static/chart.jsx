@@ -9,7 +9,7 @@ const LEVEL_VAR = {
 };
 const levelColor = lvl => LEVEL_VAR[lvl] ?? "var(--text-3)";
 
-const EnergyChart = ({ today, nowIndex, scheduledResumeAt = null, scheduledRunMinutes = null, height = 200 }) => {
+const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, scheduledRunMinutes = null, height = 200 }) => {
   const [hover, setHover] = React.useState(null);
   const w = 1200;
   const h = height;
@@ -56,18 +56,21 @@ const EnergyChart = ({ today, nowIndex, scheduledResumeAt = null, scheduledRunMi
 
   const buildArea = () => {
     let d = "";
-    let firstIdx = -1, lastIdx = -1;
+    let prevIdx = -1;
     slots.forEach((p, i) => {
       const v = p?.spot_sek;
       if (v == null) return;
-      if (firstIdx < 0) firstIdx = i;
-      lastIdx = i;
-      d += (d ? "L" : "M") + xFor(i) + "," + yFor(v) + " ";
+      if (prevIdx < 0) {
+        d = `M ${xFor(i)},${yFor(yMin)} L ${xFor(i)},${yFor(v)}`;
+      } else {
+        d += ` L ${xFor(i)},${yFor(slots[prevIdx].spot_sek)} L ${xFor(i)},${yFor(v)}`;
+      }
+      prevIdx = i;
     });
-    if (!d) return "";
-    return d
-      + ` L ${xFor(lastIdx)},${yFor(yMin)}`
-      + ` L ${xFor(firstIdx)},${yFor(yMin)} Z`;
+    if (prevIdx < 0) return "";
+    d += ` L ${xFor(prevIdx + 1)},${yFor(slots[prevIdx].spot_sek)}`;
+    d += ` L ${xFor(prevIdx + 1)},${yFor(yMin)} Z`;
+    return d;
   };
 
   const ticks = [];
@@ -90,6 +93,7 @@ const EnergyChart = ({ today, nowIndex, scheduledResumeAt = null, scheduledRunMi
   const nowSlot = hasData && nowIdxFloor < N ? slots[nowIdxFloor] : null;
   const nowVal = nowSlot?.spot_sek ?? null;
   const nowX = xFor(nowIndex);
+  const hoverCx = hover != null ? (xFor(hover) + xFor(hover + 1)) / 2 : 0;
 
   return (
     <svg className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
@@ -119,18 +123,29 @@ const EnergyChart = ({ today, nowIndex, scheduledResumeAt = null, scheduledRunMi
         <>
           <path d={buildArea()} fill="url(#todayFill)" />
           {resumeBand}
-          {slots.slice(0, -1).map((p, i) => {
-            const a = p?.spot_sek;
-            const b = slots[i + 1]?.spot_sek;
-            if (a == null || b == null) return null;
-            return (
-              <line key={`s${i}`}
-                    x1={xFor(i)}     y1={yFor(a)}
-                    x2={xFor(i + 1)} y2={yFor(b)}
+          {slots.map((p, i) => {
+            const v = p?.spot_sek;
+            if (v == null) return null;
+            const segs = [
+              <line key={`h${i}`}
+                    x1={xFor(i)}     y1={yFor(v)}
+                    x2={xFor(i + 1)} y2={yFor(v)}
                     stroke={levelColor(p.level)}
                     strokeWidth="2"
-                    strokeLinecap="round"/>
-            );
+                    strokeLinecap="butt"/>,
+            ];
+            const next = slots[i + 1];
+            if (next?.spot_sek != null) {
+              segs.push(
+                <line key={`v${i}`}
+                      x1={xFor(i + 1)} y1={yFor(v)}
+                      x2={xFor(i + 1)} y2={yFor(next.spot_sek)}
+                      stroke={levelColor(next.level)}
+                      strokeWidth="2"
+                      strokeLinecap="butt"/>
+              );
+            }
+            return segs;
           })}
         </>
       )}
@@ -166,14 +181,14 @@ const EnergyChart = ({ today, nowIndex, scheduledResumeAt = null, scheduledRunMi
 
       {hasData && hover != null && slots[hover]?.spot_sek != null && (
         <g pointerEvents="none">
-          <line x1={xFor(hover)} x2={xFor(hover)} y1={padT} y2={h-padB}
+          <line x1={hoverCx} x2={hoverCx} y1={padT} y2={h-padB}
                 stroke="var(--text-3)" strokeDasharray="2 3" strokeWidth="1"/>
-          <circle cx={xFor(hover)} cy={yFor(slots[hover].spot_sek)} r="5"
+          <circle cx={hoverCx} cy={yFor(slots[hover].spot_sek)} r="5"
                   fill={levelColor(slots[hover].level)}
                   stroke="var(--bg)" strokeWidth="2"/>
           {(() => {
             const p = slots[hover];
-            const tx = xFor(hover);
+            const tx = hoverCx;
             const ty = yFor(p.spot_sek) - 14;
             const timeRange = `${window.formatHM(p.starts_at)}–${window.formatHM(p.ends_at)}`;
             const levelTxt = window.PRICE_LEVEL_LABELS?.[p.level] ?? "";
@@ -196,6 +211,6 @@ const EnergyChart = ({ today, nowIndex, scheduledResumeAt = null, scheduledRunMi
       )}
     </svg>
   );
-};
+});
 
 window.EnergyChart = EnergyChart;
