@@ -341,25 +341,29 @@ Follow these standards for all commits:
    Update API response format to match spec
    ```
 
-### Git Operation Restrictions
+### Git Operation Policy
 
-**CRITICAL: Claude Code is NEVER allowed to perform the following Git operations:**
+**Hard rule: never edit or commit while HEAD is `main`.** If you find yourself on `main` and the user asks for code changes, refuse and create a sibling worktree on a `feature/<snake_case>` branch first. This applies even to "trivial" one-line changes.
 
-- `git add` - Adding files to staging area
-- `git commit` - Creating commits
-- `git push` - Pushing to remote repository
-- `git merge` - Merging branches
-- `git rebase` - Rebasing branches
-- Any other Git write operations
+**Allowed Git writes (run them yourself when needed):**
 
-**Allowed Git operations:**
-- `git status` - Check repository status
-- `git diff` - View changes
-- `git log` - View commit history
-- `git show` - View specific commits
-- Other read-only Git commands
+- `git worktree add ../ctc_server-<snake_case> -b feature/<snake_case> origin/main` — create the sibling worktree before any code work
+- `git worktree remove ../ctc_server-<snake_case>` and `git branch -D feature/<snake_case>` — cleanup after merge
+- `git switch -c feature/<snake_case>` / `git switch feature/<snake_case>` — branch create / switch
+- `git fetch origin` and `git rebase origin/main` — bracket rebases before starting work and before handing back
+- `git add <files>` and `git commit -m "..."` — stage and commit work, but **only** when HEAD is a `feature/<name>` branch inside a worktree
 
-**Rationale:** The user maintains full control over version control operations. Claude Code should prepare code and documentation but leave all commit decisions to the user.
+**Reserved for the user (Claude does not run these):**
+
+- `git push` (any form, incl. `-u origin feature/<name>`)
+- `git merge` / squash-merge into `main`
+- Any destructive rewrite of published history (`push --force`, `reset --hard` on `main`, etc.)
+
+**Read-only Git is always fine:** `status`, `diff`, `log`, `show`, `blame`, `worktree list`, etc.
+
+**Why:** Magnus deploys himself from feature worktrees onto `ctc.lan`. He keeps `main` clean as the deployable base and controls when work lands there. Agents owning the worktree/branch/rebase/commit loop unblocks routine work; reserving push and merge keeps the deployment gate with him.
+
+**Pre-commit checklist still applies** — see [Pre-Commit Checklist](#pre-commit-checklist) below. Run `cargo fmt`, `cargo clippy -- -W clippy::pedantic`, and `cargo test --all-targets` before each commit. Commit subject ≤50 chars, imperative verb, no body unless complex.
 
 ### Pre-Commit Checklist
 
