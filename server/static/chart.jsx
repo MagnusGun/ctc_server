@@ -41,8 +41,6 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
     return (
       <g pointerEvents="none">
         <rect className="resume-band" x={xLeft} y={padT} width={bandW} height={innerH} />
-        <line className="resume-edge" x1={xLeft} x2={xLeft} y1={padT} y2={h - padB} />
-        <text className="resume-label" x={xLeft + 4} y={padT + 11}>RESUME</text>
       </g>
     );
   })();
@@ -54,25 +52,6 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
 
   const xFor = i => padL + (N > 0 ? (i / N) * innerW : 0);
   const yFor = v => padT + innerH - ((v - yMin) / (yMax - yMin)) * innerH;
-
-  const buildArea = () => {
-    let d = "";
-    let prevIdx = -1;
-    slots.forEach((p, i) => {
-      const v = p?.spot_sek;
-      if (v == null) return;
-      if (prevIdx < 0) {
-        d = `M ${xFor(i)},${yFor(yMin)} L ${xFor(i)},${yFor(v)}`;
-      } else {
-        d += ` L ${xFor(i)},${yFor(slots[prevIdx].spot_sek)} L ${xFor(i)},${yFor(v)}`;
-      }
-      prevIdx = i;
-    });
-    if (prevIdx < 0) return "";
-    d += ` L ${xFor(prevIdx + 1)},${yFor(slots[prevIdx].spot_sek)}`;
-    d += ` L ${xFor(prevIdx + 1)},${yFor(yMin)} Z`;
-    return d;
-  };
 
   const ticks = [];
   const tickCount = 4;
@@ -99,10 +78,22 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
   return (
     <svg ref={containerRef} className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
       <defs>
-        <linearGradient id="todayFill" x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%"   stopColor="var(--text-3)" stopOpacity="0.18"/>
-          <stop offset="100%" stopColor="var(--text-3)" stopOpacity="0"/>
+        {["very_cheap","cheap","normal","expensive","very_expensive"].map(lvl => (
+          <linearGradient key={lvl} id={`fill-${lvl}`} x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%"   stopColor={LEVEL_VAR[lvl]} stopOpacity="0.55"/>
+            <stop offset="60%"  stopColor={LEVEL_VAR[lvl]} stopOpacity="0.18"/>
+            <stop offset="100%" stopColor={LEVEL_VAR[lvl]} stopOpacity="0"/>
+          </linearGradient>
+        ))}
+        <linearGradient id="resumeFill" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%"   stopColor="var(--price-expensive)" stopOpacity="0.30"/>
+          <stop offset="100%" stopColor="var(--price-expensive)" stopOpacity="0"/>
         </linearGradient>
+        <radialGradient id="nowGlow" cx="50%" cy="50%" r="50%">
+          <stop offset="0%"   stopColor="var(--price-expensive)" stopOpacity="0.55"/>
+          <stop offset="60%"  stopColor="var(--price-expensive)" stopOpacity="0.18"/>
+          <stop offset="100%" stopColor="var(--price-expensive)" stopOpacity="0"/>
+        </radialGradient>
       </defs>
 
       {ticks.map((t, i) => (
@@ -122,7 +113,20 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
 
       {hasData && (
         <>
-          <path d={buildArea()} fill="url(#todayFill)" />
+          {slots.map((p, i) => {
+            const v = p?.spot_sek;
+            if (v == null) return null;
+            const lvl = p.level;
+            const gradId = LEVEL_VAR[lvl] ? `url(#fill-${lvl})` : "none";
+            const y = yFor(v);
+            return (
+              <rect key={`f${i}`}
+                    x={xFor(i)} y={y}
+                    width={xFor(i + 1) - xFor(i)}
+                    height={Math.max(0, yFor(yMin) - y)}
+                    fill={gradId} />
+            );
+          })}
           {resumeBand}
           {slots.map((p, i) => {
             const v = p?.spot_sek;
@@ -141,7 +145,7 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
                 <line key={`v${i}`}
                       x1={xFor(i + 1)} y1={yFor(v)}
                       x2={xFor(i + 1)} y2={yFor(next.spot_sek)}
-                      stroke={levelColor(next.level)}
+                      stroke={levelColor((next.spot_sek > v ? next : p).level)}
                       strokeWidth="2"
                       strokeLinecap="butt"/>
               );
@@ -156,6 +160,7 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
         <>
           <line className="now-line" x1={nowX} x2={nowX} y1={padT} y2={h - padB} />
           <text className="now-label" x={nowX} y={padT - 4} textAnchor="middle">NOW</text>
+          <circle cx={xFor(nowIdxFloor)} cy={yFor(nowVal)} r="14" fill="url(#nowGlow)" />
           <circle cx={xFor(nowIdxFloor)} cy={yFor(nowVal)} r="4"
                   fill={levelColor(nowSlot.level)}
                   stroke="var(--bg)" strokeWidth="1.5"/>

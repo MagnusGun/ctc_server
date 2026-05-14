@@ -1481,21 +1481,7 @@ body {
   text-transform: uppercase;
 }
 .energy-chart .resume-band {
-  fill: var(--accent);
-  fill-opacity: 0.18;
-}
-.energy-chart .resume-edge {
-  stroke: var(--accent);
-  stroke-width: 1.5;
-  stroke-opacity: 0.85;
-}
-.energy-chart .resume-label {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 600;
-  fill: var(--accent);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  fill: url(#resumeFill);
 }
 
 /* ============================================================
