@@ -103,6 +103,15 @@ function formatSlotHour(ms) {
     return `${String(new Date(ms).getHours()).padStart(2, "0")}:00`;
 }
 
+// Compact form of formatSlotHour: just the hour as a 1- or 2-digit number,
+// for narrow charts where "HH:00" overlaps adjacent ticks.
+function formatSlotHourCompact(ms) {
+    return String(new Date(ms).getHours());
+}
+
+// Container-width threshold below which charts switch to compact axis labels.
+const COMPACT_CHART_WIDTH = 600;
+
 function formatSlotHourMinute(ms) {
     const d = new Date(ms);
     return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -354,7 +363,9 @@ window.POLL_PRICES = POLL_PRICES;
 window.bucketMinutely = bucketMinutely;
 window.minuteSlotTime = minuteSlotTime;
 window.formatSlotHour = formatSlotHour;
+window.formatSlotHourCompact = formatSlotHourCompact;
 window.formatSlotHourMinute = formatSlotHourMinute;
+window.COMPACT_CHART_WIDTH = COMPACT_CHART_WIDTH;
 window.buildStatsData = buildStatsData;
 window.useSeries = useSeries;
 window.useHeatPumpHistory = useHeatPumpHistory;

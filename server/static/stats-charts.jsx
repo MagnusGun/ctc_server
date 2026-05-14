@@ -289,8 +289,11 @@ const HeatingTrend = ({ data, height = 220 }) => {
   // Equivalent to indices [0, slotsTotal/4, slotsTotal/2, 3*slotsTotal/4, last].
   const tickIndices = [0, 6, 12, 18, 24].map(h6 =>
     Math.min(lastIdx, Math.round(h6 * 60 * slotsTotal / 1440)));
+  const labelOf = w < window.COMPACT_CHART_WIDTH
+    ? window.formatSlotHourCompact
+    : window.formatSlotHour;
   const tickLabels = tickIndices.map(i =>
-    window.formatSlotHour(window.minuteSlotTime(i, slotsTotal)));
+    labelOf(window.minuteSlotTime(i, slotsTotal)));
   // Filter nulls (gap minutes where the sensor was offline or cache missed)
   // out of axis computation; the chart paths render those slots as gaps.
   const finite = [...data.flow, ...data.ret].filter(v => v != null);
@@ -417,6 +420,7 @@ const StepResponse = ({ data }) => {
   const y = v => h - pad - ((v - yMin) / (yMax - yMin)) * (h - pad * 1.5);
   const avgT90 = data.reduce((a, e) => a + e.t90, 0) / data.length;
   const avgLag = data.reduce((a, e) => a + e.lag, 0) / data.length;
+  const compactLabels = w < window.COMPACT_CHART_WIDTH;
 
   return (
     <div className="step-response">
@@ -431,14 +435,18 @@ const StepResponse = ({ data }) => {
             </g>
           );
         })}
-        {[0, 300, 600, 900, 1200, 1500, 1800].map(t => (
-          <g key={t}>
-            <line x1={x(t)} y1={pad} x2={x(t)} y2={h - pad} stroke="var(--line)" strokeDasharray="2 4" opacity="0.3"/>
-            <text className="axis-label" x={x(t)} y={h - pad + 14} textAnchor="middle">
-              {t === 0 ? "0" : `${(t/60).toFixed(0)}m`}
-            </text>
-          </g>
-        ))}
+        {[0, 300, 600, 900, 1200, 1500, 1800].map(t => {
+          const m = (t / 60).toFixed(0);
+          const label = t === 0 ? "0" : (compactLabels ? m : `${m}m`);
+          return (
+            <g key={t}>
+              <line x1={x(t)} y1={pad} x2={x(t)} y2={h - pad} stroke="var(--line)" strokeDasharray="2 4" opacity="0.3"/>
+              <text className="axis-label" x={x(t)} y={h - pad + 14} textAnchor="middle">
+                {label}
+              </text>
+            </g>
+          );
+        })}
         {/* faint historical events */}
         {data.map((e, i) => {
           if (i === active) return null;

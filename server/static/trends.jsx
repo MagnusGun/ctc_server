@@ -16,9 +16,11 @@ const ActivityTimeline = ({ segments, height = 60, hours = 24 }) => {
     : lane === "DHW"   ? "var(--hot)"
     : "var(--cold)";
 
+  const compactLabels = w < window.COMPACT_CHART_WIDTH;
   const xTicks = [];
   for (let i = 0; i <= hours; i += 2) {
-    xTicks.push({ label: `${String(i).padStart(2,"0")}:00`, x: xFor(i) });
+    const label = compactLabels ? String(i) : `${String(i).padStart(2,"0")}:00`;
+    xTicks.push({ label, x: xFor(i) });
   }
 
   return (
@@ -139,16 +141,19 @@ const TrendChart = ({ series, height = 200, yMin, yMax, hours = 24, unit = "°C"
   const lastBucket = refLen - 1;
   const tickEveryHours = 4;
   const tickEvery = Math.max(1, Math.round(tickEveryHours * 60 * refLen / (hours * 60)));
+  const labelOf = w < window.COMPACT_CHART_WIDTH
+    ? window.formatSlotHourCompact
+    : window.formatSlotHour;
   const xTicks = [];
   for (let i = 0; i <= lastBucket; i += tickEvery) {
     xTicks.push({
-      label: window.formatSlotHour(window.minuteSlotTime(i, refLen)),
+      label: labelOf(window.minuteSlotTime(i, refLen)),
       x: padL + (i / lastBucket) * innerW,
     });
   }
   if (xTicks[xTicks.length - 1].x < padL + innerW) {
     xTicks.push({
-      label: window.formatSlotHour(window.minuteSlotTime(lastBucket, refLen)),
+      label: labelOf(window.minuteSlotTime(lastBucket, refLen)),
       x: padL + innerW,
     });
   }
