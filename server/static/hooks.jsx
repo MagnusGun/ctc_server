@@ -103,10 +103,10 @@ function formatSlotHour(ms) {
     return `${String(new Date(ms).getHours()).padStart(2, "0")}:00`;
 }
 
-// Compact form of formatSlotHour: just the hour as a 1- or 2-digit number,
-// for narrow charts where "HH:00" overlaps adjacent ticks.
+// Compact form of formatSlotHour: zero-padded 2-digit hour, no ":00" suffix.
+// For narrow charts where "HH:00" overlaps adjacent ticks.
 function formatSlotHourCompact(ms) {
-    return String(new Date(ms).getHours());
+    return String(new Date(ms).getHours()).padStart(2, "0");
 }
 
 // Container-width threshold below which charts switch to compact axis labels.

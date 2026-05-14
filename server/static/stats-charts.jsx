@@ -437,7 +437,8 @@ const StepResponse = ({ data }) => {
         })}
         {[0, 300, 600, 900, 1200, 1500, 1800].map(t => {
           const m = (t / 60).toFixed(0);
-          const label = t === 0 ? "0" : (compactLabels ? m : `${m}m`);
+          const mm = m.padStart(2, "0");
+          const label = compactLabels ? mm : (t === 0 ? "0" : `${m}m`);
           return (
             <g key={t}>
               <line x1={x(t)} y1={pad} x2={x(t)} y2={h - pad} stroke="var(--line)" strokeDasharray="2 4" opacity="0.3"/>

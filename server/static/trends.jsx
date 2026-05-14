@@ -19,7 +19,8 @@ const ActivityTimeline = ({ segments, height = 60, hours = 24 }) => {
   const compactLabels = w < window.COMPACT_CHART_WIDTH;
   const xTicks = [];
   for (let i = 0; i <= hours; i += 2) {
-    const label = compactLabels ? String(i) : `${String(i).padStart(2,"0")}:00`;
+    const hh = String(i).padStart(2, "0");
+    const label = compactLabels ? hh : `${hh}:00`;
     xTicks.push({ label, x: xFor(i) });
   }
 

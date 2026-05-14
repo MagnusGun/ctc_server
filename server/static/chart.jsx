@@ -61,14 +61,14 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
   }
 
   // X labels every 2h. Final tick reads "00:00" (next day), not "24:00".
-  // Compact form ("6" instead of "06:00") kicks in when the chart is narrow
+  // Compact form ("06" instead of "06:00") kicks in when the chart is narrow
   // enough that the wide form would collide; the tick count stays at 13.
   const compactLabels = w < window.COMPACT_CHART_WIDTH;
   const xTicks = [];
   for (let i = 0; i <= 24; i += 2) {
-    const hr = i % 24;
+    const hh = String(i % 24).padStart(2, "0");
     xTicks.push({
-      label: compactLabels ? String(hr) : `${String(hr).padStart(2, "0")}:00`,
+      label: compactLabels ? hh : `${hh}:00`,
       x: padL + (i / 24) * innerW,
     });
   }
