@@ -1,4 +1,5 @@
 mod config;
+mod dhw;
 mod energy;
 mod error;
 mod heatpump;
@@ -51,6 +52,7 @@ struct HomeyBundle {
     cache: std::sync::Arc<crate::homey::cache::HomeyPumpCache>,
     client: crate::homey::HomeyClient,
     desired_rx: tokio::sync::watch::Receiver<bool>,
+    boost_override_rx: tokio::sync::watch::Receiver<Option<bool>>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -308,16 +310,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Placeholder; the actor's spawn() overrides synchronously
                 // with the real initial mode.
                 let (desired_tx, desired_rx) = tokio::sync::watch::channel(true);
+                // Boost-override lane: DhwActor (Task 14) will write
+                // `Some(false)` here during a Bath boost to force the pump
+                // off regardless of SG mode. `None` (default) defers to
+                // `desired_tx` so behaviour is unchanged today.
+                let (boost_override_tx, boost_override_rx) =
+                    tokio::sync::watch::channel::<Option<bool>>(None);
                 let hooks = crate::smartgrid::actor::HomeyHooks {
                     client: client.clone(),
                     cache: cache.clone(),
                     desired_tx,
+                    boost_override_tx,
                 };
                 Some(HomeyBundle {
                     hooks,
                     cache,
                     client,
                     desired_rx,
+                    boost_override_rx,
                 })
             }
             Err(e) => {
@@ -334,6 +344,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let homey_hooks_for_actor = homey.as_ref().map(|b| b.hooks.clone());
     let pump_cache_for_route = homey.as_ref().map(|b| b.cache.clone());
+    // Sender clone for the DhwActor's boost-override lane. Held here so the
+    // channel survives `homey` being moved into the poller arm below.
+    let boost_override_tx_for_dhw = homey.as_ref().map(|b| b.hooks.boost_override_tx.clone());
 
     // Spawn the SmartGrid actor (required for SmartGrid control). Owns the
     // GpioController and processes all set-mode / read-mode / scheduled-
@@ -391,13 +404,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client = bundle.client;
             let cache = bundle.cache;
             let desired_rx = bundle.desired_rx;
+            let boost_override_rx = bundle.boost_override_rx;
             let cancel_for_poller = cancel.clone();
             background_tasks.push(supervisor::spawn_with_shutdown(
                 "homey-poller",
                 cancel.clone(),
                 async move {
-                    crate::homey::poller::run(client, cache, desired_rx, period, cancel_for_poller)
-                        .await;
+                    crate::homey::poller::run(
+                        client,
+                        cache,
+                        desired_rx,
+                        boost_override_rx,
+                        period,
+                        cancel_for_poller,
+                    )
+                    .await;
                 },
             ));
         } else {
@@ -434,6 +455,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         debug!("Price tracking disabled");
     }
+
+    // Spawn the DHW actor when we have everything it needs: a SmartGrid
+    // handle (Overcapacity write during Bath), a boost-override sender
+    // (Homey reconciler lane), and the price state (Bath cheap-band gate).
+    // When any of those is absent we skip the actor and don't mount the
+    // routes — the dashboard's DHW controls degrade gracefully.
+    let dhw_handle = if let (Some(sg_handle), Some(boost_tx)) =
+        (smartgrid_handle.clone(), boost_override_tx_for_dhw.clone())
+    {
+        let modbus_writer: Arc<dyn dhw::actor::ModbusWriter> =
+            Arc::new(dhw::adapters::CtcActorModbus::new(
+                tx.clone(),
+                Duration::from_secs(config.modbus.request_timeout_secs),
+            ));
+        let sg_controller: Arc<dyn dhw::actor::SgController> =
+            Arc::new(dhw::adapters::SmartGridAdapter::new(sg_handle));
+        let handle = dhw::actor::DhwActor::spawn(
+            modbus_writer,
+            sg_controller,
+            boost_tx,
+            store.clone(),
+            Arc::new(price_state.clone()),
+            config.dhw.clone(),
+        );
+        info!("DHW actor started");
+        Some(handle)
+    } else {
+        debug!("DHW actor not started: requires SmartGrid handle and Homey boost-override lane");
+        None
+    };
 
     let app = Router::new()
         // .route("/ctc", get(ctx_handler))
@@ -474,7 +525,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(routes::pump::routes(pump_cache_for_route))
         .merge(routes::series::routes(store.clone()))
         .merge(routes::activity::routes(store.clone()))
-        .merge(routes::step_response::routes(store.clone()))
+        .merge(routes::step_response::routes(store.clone()));
+
+    // Mount DHW router only if the actor came up. Otherwise the endpoints
+    // would have nothing to talk to.
+    let app = if let Some(handle) = dhw_handle.clone() {
+        app.merge(routes::dhw::routes(routes::dhw::DhwRouterState { handle }))
+    } else {
+        app
+    };
+
+    let app = app
         .route(
             "/api/v1/version",
             get(|| async { concat!("{\"version\": \"", env!("CARGO_PKG_VERSION"), "\"}\n") }),
@@ -494,11 +555,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle SIGTERM so `docker compose stop|down|restart` triggers the final flush.
     let store_for_shutdown = store.clone();
     let cancel_for_shutdown = cancel.clone();
+    let dhw_handle_for_shutdown = dhw_handle.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             info!("Shutdown signal received — cancelling background tasks");
             cancel_for_shutdown.cancel();
+            // Snapshot the DHW state before tearing down background tasks so
+            // a Bath in progress survives the restart (crash recovery on next
+            // boot will then run its own cleanup).
+            if let Some(h) = dhw_handle_for_shutdown.as_ref()
+                && let Err(e) = h.shutdown_save().await
+            {
+                error!("DHW shutdown_save failed: {e:?}");
+            }
             // 5 s is generous next to the longest operation (Modbus read ~1 s,
             // elpris HTTP fetch ~5 s with our timeout).
             let shutdown_wait = Duration::from_secs(5);

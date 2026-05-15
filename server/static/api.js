@@ -164,6 +164,54 @@ async function setSmartGridMode(mode, scheduleResume = false) {
 async function getGrid()   { return fetchJson(`${API_BASE}/grid`); }
 async function getPrices() { return fetchJson(`${API_BASE}/prices`); }
 
+/* ---------- DHW ----------
+ * Snapshot shape: { comfort_level: "economy|normal|komfort|manuell",
+ *                   boost: null | { preset: { kind, hours? }, started_at,
+ *                                   scheduled_end, elapsed_s, remaining_s,
+ *                                   immersion_engaged } }
+ */
+async function getDhwState() { return fetchJson(`${API_BASE}/dhw/state`); }
+
+async function setDhwComfort(level) {
+    const r = await fetch(`${API_BASE}/dhw/comfort?level=${encodeURIComponent(level)}`,
+                         { method: 'POST' });
+    if (!r.ok) {
+        const body = await r.text();
+        throw new Error(body || `HTTP ${r.status}`);
+    }
+    return r.status;
+}
+
+async function startDhwBoost(preset, hours = null) {
+    let url = `${API_BASE}/dhw/boost?preset=${encodeURIComponent(preset)}`;
+    if (hours != null) url += `&hours=${hours}`;
+    const r = await fetch(url, { method: 'POST' });
+    if (!r.ok) {
+        let body;
+        try { body = await r.json(); }
+        catch { body = { error: `HTTP ${r.status}` }; }
+        const err = new Error(body.error || `HTTP ${r.status}`);
+        err.status = r.status;
+        err.body = body;
+        throw err;
+    }
+    return r.json();
+}
+
+async function cancelDhwBoost() {
+    const r = await fetch(`${API_BASE}/dhw/boost`, { method: 'DELETE' });
+    if (!r.ok) {
+        let body;
+        try { body = await r.json(); }
+        catch { body = { error: `HTTP ${r.status}` }; }
+        const err = new Error(body.error || `HTTP ${r.status}`);
+        err.status = r.status;
+        err.body = body;
+        throw err;
+    }
+    return r.status;
+}
+
 // Cirkulationspump state via Homey. 503 means the Homey integration is
 // disabled — the badge should hide itself when this resolves to null.
 async function getPump() {
@@ -181,5 +229,6 @@ window.api = {
     getAlarms,
     getSmartGrid, getSmartGridResume, setSmartGridMode,
     getGrid, getPrices, getPump,
+    getDhwState, setDhwComfort, startDhwBoost, cancelDhwBoost,
     getVersion,
 };

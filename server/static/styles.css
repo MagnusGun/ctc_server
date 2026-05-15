@@ -1409,6 +1409,123 @@ body {
 .btn.primary.warm { background: oklch(0.85 0.13 60); border-color: oklch(0.85 0.13 60); color: oklch(0.2 0.05 60); }
 .btn.primary.cool { background: var(--cold); border-color: var(--cold); color: oklch(0.15 0.04 240); }
 
+/* DHW control trigger — reuses .chip framing; warm-orange when boost active. */
+.dhw-wrap { position: relative; display: inline-flex; }
+.dhw-trigger {
+  cursor: pointer;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  border: 1px solid var(--line);
+}
+.dhw-trigger:hover { border-color: var(--line-2); }
+.dhw-trigger.active {
+  border-color: color-mix(in oklch, oklch(0.78 0.16 50) 40%, var(--line));
+  color: oklch(0.78 0.16 50);
+}
+.dhw-trigger.active .value { color: oklch(0.78 0.16 50); }
+.dhw-pop { min-width: 260px; }
+.dhw-submenu {
+  margin-left: 18px;
+  border-left: 1px solid var(--line);
+  padding-left: 4px;
+  display: flex; flex-direction: column;
+}
+.sg-opt:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.sg-opt:disabled:hover { background: transparent; }
+
+/* DHW toast — transient inline error/info from boost actions. */
+.dhw-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+  padding: 10px 16px;
+  background: color-mix(in oklch, oklch(0.78 0.16 50) 18%, var(--surface));
+  border: 1px solid color-mix(in oklch, oklch(0.78 0.16 50) 40%, var(--line));
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 12px 32px -8px rgba(0,0,0,0.5);
+  cursor: pointer;
+  max-width: 90vw;
+  text-align: center;
+}
+
+/* DHW bath confirm modal */
+.dhw-bath-dialog .dhw-slider-row {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 12px 0 6px;
+}
+.dhw-bath-dialog .dhw-slider-label {
+  font-size: 13px; color: var(--text-2);
+}
+.dhw-bath-dialog .dhw-slider-label strong {
+  color: oklch(0.78 0.16 50);
+  font-weight: 600;
+  margin-left: 4px;
+}
+.dhw-bath-dialog input[type="range"] {
+  width: 100%;
+  accent-color: oklch(0.78 0.16 50);
+}
+.dhw-bath-dialog .dhw-slider-ticks {
+  display: flex; justify-content: space-between;
+  font-size: 11px; color: var(--text-3);
+  font-family: var(--font-mono);
+}
+.dhw-bath-dialog .dhw-gate-note {
+  margin: 10px 0 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--surface) 70%, var(--bg));
+  font-size: 12px;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+}
+.dhw-bath-dialog .dhw-bath-error {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--hot) 14%, var(--surface));
+  border: 1px solid color-mix(in oklch, var(--hot) 35%, var(--line));
+  color: var(--hot);
+  font-size: 12.5px;
+}
+
+/* Charging-DHW chip — non-clickable indicator when SystemStatus (62005)
+   reports the heater is directing capacity to the DHW tank. Subtle
+   warm-orange so it doesn't compete with the boost badge. */
+.chip.dhw-charging {
+  background: color-mix(in oklch, oklch(0.78 0.16 50) 10%, var(--surface));
+  border-color: color-mix(in oklch, oklch(0.78 0.16 50) 30%, var(--line));
+  color: oklch(0.78 0.16 50);
+}
+.chip.dhw-charging .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: oklch(0.78 0.16 50);
+  box-shadow: 0 0 0 0 oklch(0.78 0.16 50);
+  animation: pulse 2s ease-out infinite;
+}
+.chip.dhw-charging .value { color: oklch(0.78 0.16 50); font-weight: 500; }
+
+/* DHW boost — warm orange, distinct from SmartGrid green / Powersave amber. */
+.chip.dhw-boost {
+  background: color-mix(in oklch, oklch(0.78 0.16 50) 18%, var(--surface));
+  border-color: color-mix(in oklch, oklch(0.78 0.16 50) 40%, var(--line));
+  color: oklch(0.78 0.16 50);
+}
+.chip.dhw-boost .value {
+  color: oklch(0.78 0.16 50);
+  font-weight: 600;
+}
+
 .chip.alert-chip {
   background: color-mix(in oklch, var(--hot) 22%, var(--surface));
   border-color: color-mix(in oklch, var(--hot) 45%, var(--line));
@@ -1482,6 +1599,14 @@ body {
 }
 .energy-chart .resume-band {
   fill: url(#resumeFill);
+}
+/* DHW boost band — overlay drawn whenever a DHW boost interval overlaps
+   the chart range. When this band coincides with a SmartGrid resume band
+   the two translucent fills blend additively (warm orange + expensive
+   red) over the affected slot; this is intentional — the user sees both
+   schedules layered without one masking the other. */
+.energy-chart .dhw-boost-band {
+  fill: oklch(0.78 0.16 50 / 0.18);
 }
 
 /* ============================================================

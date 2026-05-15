@@ -314,6 +314,16 @@ ctc_parameter!(
     5
 );
 ctc_parameter!(
+    CTC_BOILER_DHW_C,
+    61636,
+    "Boiler DHW °C (Elpanna extra VV) — temperature at which immersion engages during Extra DHW",
+    0.1,
+    Access::RW,
+    60408,
+    62508,
+    8
+);
+ctc_parameter!(
     CTC_SETPOINT_LOWER_TANK,
     62274,
     "Setpoint lower tank",
@@ -634,6 +644,7 @@ fn all_ctc_parameters() -> &'static [&'static CTCModbusParameter] {
                 &CTC_EXTRA_HOT_WATER_TIMER,
                 &CTC_MAX_TIME_HEATING_HP,
                 &CTC_MAX_TIME_HOT_WATER,
+                &CTC_BOILER_DHW_C,
                 &CTC_SETPOINT_LOWER_TANK,
                 &CTC_ACTUAL_TEMP_DHW,
                 // Immersion heater parameters
@@ -709,5 +720,22 @@ pub fn get_custom_ctc_parameter_by_addr(addr: u16, factor: Option<f32>) -> CTCMo
         bit: 0,
         factor: factor.unwrap_or(1.0),
         description: "Custom CTC Parameter",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctc_boiler_dhw_c_metadata_matches_service_doc() {
+        assert_eq!(CTC_BOILER_DHW_C.id, 61636);
+        assert!((CTC_BOILER_DHW_C.factor - 0.1).abs() < f32::EPSILON);
+        assert_eq!(CTC_BOILER_DHW_C.reg_max, Some(60408));
+        assert_eq!(CTC_BOILER_DHW_C.reg_min, Some(60409));
+        assert_eq!(CTC_BOILER_DHW_C.reg_step, Some(60410));
+        assert_eq!(CTC_BOILER_DHW_C.visible, 62508);
+        assert_eq!(CTC_BOILER_DHW_C.bit, 8);
+        assert!(matches!(CTC_BOILER_DHW_C.access, Access::RW));
     }
 }

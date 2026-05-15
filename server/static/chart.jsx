@@ -9,7 +9,7 @@ const LEVEL_VAR = {
 };
 const levelColor = lvl => LEVEL_VAR[lvl] ?? "var(--text-3)";
 
-const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, scheduledRunMinutes = null, height = 200 }) => {
+const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, scheduledRunMinutes = null, dhwBoost = null, height = 200 }) => {
   const [hover, setHover] = React.useState(null);
   const [containerRef, measuredW] = window.useElementSize();
   const w = measuredW || 1200;
@@ -41,6 +41,35 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
     return (
       <g pointerEvents="none">
         <rect className="resume-band" x={xLeft} y={padT} width={bandW} height={innerH} />
+      </g>
+    );
+  })();
+
+  // DHW boost overlay. Renders whenever an active boost's [started_at,
+  // scheduled_end] interval has any overlap with the chart's slot range,
+  // clipped to the chart bounds. Visual is OKLCH warm-orange fill at
+  // alpha 0.18; CSS comment in styles.css notes the SmartGrid overlap.
+  const dhwBand = (() => {
+    if (!hasData || !dhwBoost || N < 1) return null;
+    const slotStart = Date.parse(slots[0]?.starts_at);
+    const slotEnd = Date.parse(slots[N - 1]?.ends_at);
+    const boostStart = Date.parse(dhwBoost.started_at);
+    const boostEnd = Date.parse(dhwBoost.scheduled_end);
+    if (!Number.isFinite(slotStart) || !Number.isFinite(slotEnd)
+        || !Number.isFinite(boostStart) || !Number.isFinite(boostEnd)) return null;
+    // Clip the boost interval to the chart's domain. If they don't overlap,
+    // skip rendering — the badge already communicates the boost.
+    const left = Math.max(boostStart, slotStart);
+    const right = Math.min(boostEnd, slotEnd);
+    if (!(right > left) || !(slotEnd > slotStart)) return null;
+    const span = slotEnd - slotStart;
+    const xLeft = padL + ((left - slotStart) / span) * innerW;
+    const xRight = padL + ((right - slotStart) / span) * innerW;
+    const bandW = Math.max(2, xRight - xLeft);
+    return (
+      <g pointerEvents="none">
+        <rect className="dhw-boost-band" x={xLeft} y={padT}
+              width={bandW} height={innerH} />
       </g>
     );
   })();
@@ -132,6 +161,7 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
             );
           })}
           {resumeBand}
+          {dhwBand}
           {slots.map((p, i) => {
             const v = p?.spot_sek;
             if (v == null) return null;

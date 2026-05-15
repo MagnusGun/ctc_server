@@ -135,6 +135,48 @@ fn format_value_json(json_key: &str, value: f32) -> Result<String, ApiError> {
     })
 }
 
+/// Write a Modbus parameter and return Ok on success.
+///
+/// Lower-level twin of `write_parameter`: bypasses the JSON formatter for
+/// callers that just need to know the write landed (e.g. the DHW actor's
+/// adapter trait). Errors mirror `write_parameter` exactly.
+///
+/// # Errors
+/// Returns `ApiError::ServiceUnavailable` if the actor channel is closed,
+/// `ApiError::Timeout` if the actor doesn't respond in time, or the converted
+/// underlying Modbus error.
+pub async fn write_parameter_value(
+    tx: &ModbusSender,
+    param: CTCModbusParameter,
+    value: f32,
+    log_context: &str,
+    request_timeout: Duration,
+) -> Result<(), ApiError> {
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    tx.send((ParameterOperation::Write(param, value), response_tx))
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable)?;
+    match timeout(request_timeout, response_rx).await {
+        Ok(Ok(Ok(ModbusResponse::Stats(_)))) => {
+            error!("{log_context}: unexpected Stats response from actor");
+            Err(ApiError::InternalError)
+        }
+        Ok(Ok(Ok(_))) => Ok(()),
+        Ok(Ok(Err(e))) => {
+            error!("{log_context}: write error: {e}");
+            Err(ApiError::from(e))
+        }
+        Ok(Err(e)) => {
+            error!("{log_context}: failed to receive response: {e}");
+            Err(ApiError::ServiceUnavailable)
+        }
+        Err(_) => {
+            error!("Request timeout in {log_context} after {request_timeout:?}");
+            Err(ApiError::Timeout)
+        }
+    }
+}
+
 /// Generic helper function to write a Modbus parameter
 ///
 /// # Arguments

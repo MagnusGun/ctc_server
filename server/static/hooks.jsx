@@ -18,6 +18,10 @@ function usePolledFetch(fetcher, intervalMs) {
     const [data, setData] = React.useState(null);
     const [error, setError] = React.useState(null);
     const [loading, setLoading] = React.useState(true);
+    // Bumping this state schedules an immediate tick. Used by callers that
+    // want to refresh after a user-initiated mutation without waiting for
+    // the next 5s poll.
+    const [refreshCounter, setRefreshCounter] = React.useState(0);
 
     React.useEffect(() => {
         let mounted = true;
@@ -37,9 +41,10 @@ function usePolledFetch(fetcher, intervalMs) {
         tick();
         const id = setInterval(tick, intervalMs);
         return () => { mounted = false; clearInterval(id); };
-    }, [fetcher, intervalMs]);
+    }, [fetcher, intervalMs, refreshCounter]);
 
-    return [data, { error, loading }];
+    const refetch = React.useCallback(() => setRefreshCounter(c => c + 1), []);
+    return [data, { error, loading, refetch }];
 }
 
 /* Server-derived 24h activity timeline. Backend returns UTC ISO times;
@@ -321,6 +326,7 @@ const useSmartGrid      = () => usePolledFetch(window.api.getSmartGrid, POLL_LIV
 const useGrid           = () => usePolledFetch(window.api.getGrid, POLL_LIVE);
 const usePrices         = () => usePolledFetch(window.api.getPrices, POLL_PRICES);
 const usePump           = () => usePolledFetch(window.api.getPump, POLL_LIVE);
+const useDhwState       = () => usePolledFetch(window.api.getDhwState, POLL_LIVE);
 
 /* Match a media query and re-render on viewport change. Used to retune
    chart heights at the 480 px phone breakpoint — CSS handles every other
@@ -381,5 +387,6 @@ window.useSmartGrid = useSmartGrid;
 window.useGrid = useGrid;
 window.usePrices = usePrices;
 window.usePump = usePump;
+window.useDhwState = useDhwState;
 window.useIsNarrow = useIsNarrow;
 window.useElementSize = useElementSize;

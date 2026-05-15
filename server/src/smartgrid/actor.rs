@@ -42,6 +42,10 @@ pub struct HomeyHooks {
     /// poller so it always uses the current mode's intent, not whatever it
     /// captured at startup.
     pub desired_tx: watch::Sender<bool>,
+    /// Boost-priority override lane. `Some(v)` masks `desired_tx`; `None`
+    /// defers to SG-derived intent. Written by `DhwActor` (in Task 11) when
+    /// a Bath boost wants to force pump off regardless of SG mode.
+    pub boost_override_tx: watch::Sender<Option<bool>>,
 }
 
 /// Compute the pump's desired state from the `SmartGrid` mode.
@@ -52,19 +56,44 @@ pub fn pump_on_for(mode: SmartGridMode) -> bool {
     !matches!(mode, SmartGridMode::Blocking)
 }
 
+/// Resolve the pump target from boost-override and SG-derived intent.
+///
+/// Boost-override wins when `Some(_)`; otherwise SG applies. Pure helper so
+/// both the poller (`tick`) and `push_pump_to_homey` use the same rule.
+#[must_use]
+pub fn resolve_pump_target(boost_override: Option<bool>, sg_on: bool) -> bool {
+    boost_override.unwrap_or(sg_on)
+}
+
+/// Receiver-friendly wrapper used by the Homey reconciler poller.
+#[must_use]
+pub fn reconciler_target(
+    boost_rx: &tokio::sync::watch::Receiver<Option<bool>>,
+    sg_rx: &tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    resolve_pump_target(*boost_rx.borrow(), *sg_rx.borrow())
+}
+
 /// Fire-and-forget: push the pump state implied by `mode` to Homey, and
 /// publish the desired state synchronously so the reconciliation poller
 /// observes it immediately. On push failure the cache is marked stale; the
 /// poller's next tick retries.
+///
+/// Honors an active boost-override lane: when DHW has set
+/// `boost_override_tx = Some(v)` (Bath active), this push uses `v` as the
+/// target — same resolution rule the reconciler poller uses. Without this
+/// the eager SG-driven push would race the override and briefly flip the
+/// pump to the SG-derived state until the next poller tick reconciles.
 pub fn push_pump_to_homey(hooks: Option<&HomeyHooks>, mode: SmartGridMode) {
     let Some(hooks) = hooks else { return };
-    let on = pump_on_for(mode);
-    let _ = hooks.desired_tx.send(on);
+    let sg_on = pump_on_for(mode);
+    let _ = hooks.desired_tx.send(sg_on);
+    let target = resolve_pump_target(*hooks.boost_override_tx.borrow(), sg_on);
     let client = hooks.client.clone();
     let cache = hooks.cache.clone();
     tokio::spawn(async move {
-        match client.set_pump_onoff(on).await {
-            Ok(()) => cache.write_fresh(on).await,
+        match client.set_pump_onoff(target).await {
+            Ok(()) => cache.write_fresh(target).await,
             Err(e) => {
                 tracing::warn!("Homey pump push failed: {e}");
                 cache.mark_stale().await;
@@ -491,11 +520,13 @@ mod tests {
         let client = make_client(addr);
         let cache = Arc::new(HomeyPumpCache::new());
         let (desired_tx, desired_rx) = watch::channel(true);
+        let (boost_override_tx, _boost_override_rx) = watch::channel(None::<bool>);
         (
             HomeyHooks {
                 client,
                 cache,
                 desired_tx,
+                boost_override_tx,
             },
             desired_rx,
         )
@@ -706,6 +737,32 @@ mod tests {
         assert!(pump_on_for(SmartGridMode::LowPrice));
         assert!(pump_on_for(SmartGridMode::Overcapacity));
         assert!(!pump_on_for(SmartGridMode::Blocking));
+    }
+
+    #[test]
+    fn reconciler_target_prefers_boost_override_over_sg_intent() {
+        use tokio::sync::watch;
+        let (sg_tx, sg_rx) = watch::channel(true);
+        let (boost_tx, boost_rx) = watch::channel(None::<bool>);
+
+        // No override: target = sg intent.
+        assert!(super::reconciler_target(&boost_rx, &sg_rx));
+
+        // Override Some(false) wins.
+        boost_tx.send(Some(false)).unwrap();
+        assert!(!super::reconciler_target(&boost_rx, &sg_rx));
+
+        // SG intent flips to false; override still wins (still Some(false)).
+        sg_tx.send(false).unwrap();
+        assert!(!super::reconciler_target(&boost_rx, &sg_rx));
+
+        // Override cleared: target falls back to sg intent.
+        boost_tx.send(None).unwrap();
+        assert!(!super::reconciler_target(&boost_rx, &sg_rx));
+
+        // SG intent back to true; no override → target true.
+        sg_tx.send(true).unwrap();
+        assert!(super::reconciler_target(&boost_rx, &sg_rx));
     }
 
     use crate::energy::price::test_support::{make_run, slot as isolated_slot};

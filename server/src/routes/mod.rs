@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod alarms;
 pub mod ctc;
+pub mod dhw;
 pub mod grid;
 pub mod heatpump_stats;
 pub mod modbus;

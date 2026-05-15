@@ -14,7 +14,7 @@ gpiocdev.workspace = true
 
 # Local-only dependencies
 axum = "0.8.8"
-chrono = { version = "0.4.42", default-features = false, features = ["std", "clock"] }
+chrono = { version = "0.4.42", default-features = false, features = ["std", "clock", "serde"] }
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 tokio-modbus = { version = "0.17.0", default-features = false, features = ["rtu"] }
 tokio-serial = "5.4.5"
@@ -30,6 +30,8 @@ rustls = { version = "0.23.35", default-features = false, features = ["aws-lc-rs
 redb = "2.2"
 thiserror = "2.0"
 hdrhistogram = "7"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3.13"
+tokio = { workspace = true, features = ["test-util"] }

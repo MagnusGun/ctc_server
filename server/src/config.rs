@@ -38,6 +38,8 @@ pub struct Config {
     pub homey: HomeyConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub dhw: DhwConfig,
     /// IANA timezone used for local-time conversions (e.g. daily-stats keying,
     /// price-fetch schedule). The Göteborg Energi tariff calendar is always
     /// Swedish and ignores this setting.
@@ -342,6 +344,46 @@ impl Default for HomeyConfig {
     }
 }
 
+/// Domestic-hot-water (DHW) boost controller configuration.
+///
+/// Consumed by the DHW actor (added in later tasks). Defaults come from
+/// `Default::default()` so missing fields fall back to the documented values.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DhwConfig {
+    /// Shower preset duration in minutes (heater-side timer matched by watcher).
+    pub shower_duration_minutes: u32,
+    /// Bath slider upper bound (hours). Range \[0.5, `bath_max_hours`\] in 0.5 steps.
+    pub bath_max_hours: f32,
+    /// Cancel Bath if `CTC_ROOM_TEMP` drops below this (°C).
+    pub boost_room_temp_bail_c: f32,
+    /// Spot price ceiling (SEK/kWh) for Bath immersion gate, centre value.
+    pub immersion_allow_price_sek_per_kwh: f32,
+    /// Hysteresis around the immersion gate (SEK/kWh).
+    pub immersion_hysteresis_sek_per_kwh: f32,
+    /// Power cap written to 61591 while the immersion gate is engaged (kW).
+    pub immersion_kw_when_allowed: f32,
+    /// `61636` value written while a Bath is active (°C).
+    pub immersion_engage_temp_c: f32,
+    /// Path to the persistence JSON. `None` = no persistence.
+    pub persist_path: Option<std::path::PathBuf>,
+}
+
+impl Default for DhwConfig {
+    fn default() -> Self {
+        Self {
+            shower_duration_minutes: 30,
+            bath_max_hours: 2.0,
+            boost_room_temp_bail_c: 17.0,
+            immersion_allow_price_sek_per_kwh: 0.50,
+            immersion_hysteresis_sek_per_kwh: 0.05,
+            immersion_kw_when_allowed: 3.0,
+            immersion_engage_temp_c: 50.0,
+            persist_path: None,
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from file, environment variables, and defaults
     ///
@@ -468,6 +510,17 @@ impl Config {
                 ));
             }
         }
+
+        // Explicit env override for the DHW persistence path. The implicit
+        // `Environment` source above splits on every `_`, so it cannot route
+        // `CTC_DHW_PERSIST_PATH` to `dhw.persist_path` reliably; read it
+        // directly here instead.
+        if let Ok(path) = std::env::var("CTC_DHW_PERSIST_PATH")
+            && !path.is_empty()
+        {
+            cfg.dhw.persist_path = Some(std::path::PathBuf::from(path));
+        }
+
         Ok(cfg)
     }
 
@@ -794,5 +847,42 @@ mod tests {
         // Defaults: enabled=false, all fields empty/None. Must still validate.
         let cfg = Config::load_with_env(None, |_| None).expect("load");
         assert!(!cfg.homey.enabled);
+    }
+
+    #[test]
+    fn dhw_config_defaults() {
+        let cfg: DhwConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.shower_duration_minutes, 30);
+        assert!((cfg.bath_max_hours - 2.0).abs() < f32::EPSILON);
+        assert!((cfg.boost_room_temp_bail_c - 17.0).abs() < f32::EPSILON);
+        assert!((cfg.immersion_allow_price_sek_per_kwh - 0.50).abs() < f32::EPSILON);
+        assert!((cfg.immersion_hysteresis_sek_per_kwh - 0.05).abs() < f32::EPSILON);
+        assert!((cfg.immersion_kw_when_allowed - 3.0).abs() < f32::EPSILON);
+        assert!((cfg.immersion_engage_temp_c - 50.0).abs() < f32::EPSILON);
+        assert!(cfg.persist_path.is_none());
+    }
+
+    #[test]
+    fn dhw_config_overrides_parse() {
+        let cfg: DhwConfig = toml::from_str(
+            r#"
+            shower_duration_minutes = 20
+            bath_max_hours = 3.0
+            boost_room_temp_bail_c = 18.5
+            immersion_allow_price_sek_per_kwh = 0.40
+            immersion_hysteresis_sek_per_kwh = 0.10
+            immersion_kw_when_allowed = 5.5
+            immersion_engage_temp_c = 45.0
+            persist_path = "/var/lib/ctc/dhw.json"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.shower_duration_minutes, 20);
+        assert!((cfg.bath_max_hours - 3.0).abs() < f32::EPSILON);
+        assert!((cfg.immersion_kw_when_allowed - 5.5).abs() < f32::EPSILON);
+        assert_eq!(
+            cfg.persist_path.as_deref(),
+            Some(std::path::Path::new("/var/lib/ctc/dhw.json"))
+        );
     }
 }

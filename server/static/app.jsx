@@ -111,6 +111,304 @@ const formatHM = (iso) => {
 };
 window.formatHM = formatHM;
 
+/* ---------- DHW control ---------- */
+
+// Comfort-level labels for the trigger button.
+const COMFORT_LEVEL_LABELS = {
+  economy: "Economy",
+  normal:  "Normal",
+  komfort: "Komfort",
+  manuell: "Manuell",
+};
+
+// Writable comfort levels (Manuell is read-only; the heater derives it from
+// 61500=3 with a custom stop-temp). UI surfaces only the three the backend
+// route accepts.
+const COMFORT_OPTIONS = [
+  { value: "economy", label: "Economy" },
+  { value: "normal",  label: "Normal"  },
+  { value: "komfort", label: "Komfort" },
+];
+
+// Format a remaining-seconds value as either "{m} min" (≤60min) or
+// "{h} h {m} min". Always rounds up to the next minute so the user sees
+// "1 min" until the boost is fully done rather than "0 min" mid-final-tick.
+const formatBoostRemaining = (remainingS) => {
+  const remMin = Math.ceil(Math.max(0, remainingS ?? 0) / 60);
+  if (remMin < 60) return `${remMin} min`;
+  const h = Math.floor(remMin / 60);
+  const m = remMin % 60;
+  return `${h} h ${m} min`;
+};
+
+/* DhwControl — closed-state trigger + dropdown menu with three rows:
+ *  • Shower (30 min)
+ *  • Bath (custom)  — opens a modal owned by the parent via `onOpenBath`
+ *  • Comfort level submenu
+ *
+ * Active-boost handling:
+ *  • Shower and Bath rows disable while a boost is active.
+ *  • A "Cancel boost" row appears only for an active Bath (Shower has no
+ *    cancel — the backend rejects it with 409 shower_runs_to_completion).
+ *  • A transient toast string is returned via `onToast(text)` for
+ *    `started: false` / 409 paths.
+ *
+ * The component is parent-controlled for the bath modal so the modal can
+ * render at app-root z-index and the component can stay focused on the
+ * dropdown affordance.
+ */
+function DhwControl({ dhwResp, sysStatus, onRefetch, onOpenBath, onToast }) {
+  const [open, setOpen] = React.useState(false);
+  const [submenuOpen, setSubmenuOpen] = React.useState(false);
+
+  const boost = dhwResp?.boost;
+  const comfortLevel = dhwResp?.comfort_level ?? "normal";
+  const comfortLabel = COMFORT_LEVEL_LABELS[comfortLevel] ?? comfortLevel;
+  const presetKind = boost?.preset?.kind;
+  const bathActive = presetKind === "bath";
+  const showerActive = presetKind === "shower";
+  const boostActive = !!boost;
+  // Shower is also implicitly "active" when the heater is already in DHW
+  // (Sensor::SystemStatus = 5) — pressing Shower would return
+  // {started:false, already_at_target} so we disable it as a courtesy hint.
+  const dhwCharging = sysStatus === 5;
+
+  const triggerLabel = boostActive
+    ? (showerActive
+        ? `⚡ Shower · ${formatBoostRemaining(boost.remaining_s)}`
+        : `⚡ Bath · ${formatBoostRemaining(boost.remaining_s)}`)
+    // TODO: surface comfort stop_temp from /dhw/state once the snapshot
+    // exposes it; for now just show the comfort label.
+    : `DHW · ${comfortLabel}`;
+
+  const close = () => { setOpen(false); setSubmenuOpen(false); };
+
+  const handleShower = async () => {
+    close();
+    try {
+      const r = await window.api.startDhwBoost("shower");
+      if (r?.outcome === "already_at_target") {
+        onToast?.(`Already at target (${r.dhw_c?.toFixed?.(1) ?? "—"} ≥ ${r.target_c?.toFixed?.(1) ?? "—"} °C)`);
+      }
+    } catch (e) {
+      onToast?.(e?.body?.error || e?.message || "Failed to start shower boost");
+    } finally {
+      onRefetch?.();
+    }
+  };
+
+  const handleComfort = async (level) => {
+    close();
+    try {
+      await window.api.setDhwComfort(level);
+    } catch (e) {
+      onToast?.(e?.message || `Failed to set comfort: ${level}`);
+    } finally {
+      onRefetch?.();
+    }
+  };
+
+  const handleCancelBath = async () => {
+    close();
+    try {
+      await window.api.cancelDhwBoost();
+    } catch (e) {
+      onToast?.(e?.body?.error || e?.message || "Failed to cancel bath boost");
+    } finally {
+      onRefetch?.();
+    }
+  };
+
+  return (
+    <div className="dhw-wrap">
+      <button className={`chip dhw-trigger ${boostActive ? "active" : ""}`}
+              onClick={() => setOpen(o => !o)}
+              aria-expanded={open}
+              title={boostActive ? "Active DHW boost" : "Hot water control"}>
+        <span className="label">Hot Water</span>
+        <span className="value">{triggerLabel}</span>
+        <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
+             stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"
+             style={{ marginLeft: 6, opacity: 0.6, transform: open ? "rotate(180deg)" : "" }}>
+          <path d="M3 4.5l3 3 3-3"/>
+        </svg>
+      </button>
+      {open && (
+        <>
+          <div className="sg-back" onClick={() => close()}/>
+          <div className="sg-pop dhw-pop" onClick={e => e.stopPropagation()}>
+            <div className="sg-pop-head">Hot water</div>
+
+            <button className="sg-opt"
+                    disabled={boostActive || dhwCharging}
+                    onClick={handleShower}>
+              <span className="sg-dot"/>
+              <span className="sg-text">
+                <span className="t">⚡ Shower (30 min)</span>
+                <span className="d">Boost DHW to target for 30 minutes.</span>
+              </span>
+            </button>
+
+            <button className="sg-opt"
+                    disabled={boostActive}
+                    onClick={() => { close(); onOpenBath?.(); }}>
+              <span className="sg-dot"/>
+              <span className="sg-text">
+                <span className="t">⚡ Bath (custom hours)</span>
+                <span className="d">Plan a longer DHW boost with immersion safety gate.</span>
+              </span>
+            </button>
+
+            <button className="sg-opt"
+                    onClick={() => setSubmenuOpen(o => !o)}
+                    aria-expanded={submenuOpen}>
+              <span className="sg-dot"/>
+              <span className="sg-text">
+                <span className="t">🌡 Comfort level ▸</span>
+                <span className="d">Active: {comfortLabel}</span>
+              </span>
+            </button>
+
+            {submenuOpen && (
+              <div className="dhw-submenu">
+                {COMFORT_OPTIONS.map(o => (
+                  <button key={o.value}
+                          className={`sg-opt ${comfortLevel === o.value ? "active" : ""}`}
+                          onClick={() => handleComfort(o.value)}>
+                    <span className="sg-dot"/>
+                    <span className="sg-text">
+                      <span className="t">{o.label}</span>
+                    </span>
+                    {comfortLevel === o.value && (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                           stroke="currentColor" strokeWidth="2.5"
+                           strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M5 12l5 5L20 7"/>
+                      </svg>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {bathActive && (
+              <button className="sg-exit"
+                      onClick={handleCancelBath}>
+                Cancel boost
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* DhwBathModal — confirm-and-apply dialog for the Bath preset.
+ *
+ * Slider range: [0.5, max] in 0.5 steps. `max` comes from `dhwResp.bath_max_hours`
+ * when present (future snapshot extension), else falls back to 2.0 — the
+ * server's current default (`DhwConfig::default::bath_max_hours = 2.0`).
+ *
+ * Error handling: 409 price_not_cheap and 422 out_of_range keep the modal
+ * open with an inline error; the user can adjust hours and retry.
+ *
+ * TODO: surface the immersion-gate price ceiling
+ * (`cfg.immersion_allow_price_sek_per_kwh`) from the snapshot or a future
+ * config endpoint instead of hardcoding 0.50.
+ */
+function DhwBathModal({ open, dhwResp, onClose, onApplied }) {
+  const [hours, setHours] = React.useState(1.0);
+  const [busy, setBusy] = React.useState(false);
+  const [inlineError, setInlineError] = React.useState(null);
+  const maxHours = dhwResp?.bath_max_hours ?? 2.0;
+  const minHours = 0.5;
+  const step = 0.5;
+  const priceCeiling = dhwResp?.immersion_allow_price_sek_per_kwh ?? 0.50;
+
+  // Reset slider + clear error every time the modal opens so a previous
+  // failed attempt's state doesn't bleed into the next open.
+  React.useEffect(() => {
+    if (!open) return;
+    setHours(1.0);
+    setInlineError(null);
+    setBusy(false);
+  }, [open]);
+
+  if (!open) return null;
+
+  const apply = async () => {
+    setBusy(true);
+    setInlineError(null);
+    try {
+      await window.api.startDhwBoost("bath", hours);
+      onApplied?.();
+      onClose?.();
+    } catch (e) {
+      const body = e?.body || {};
+      if (e?.status === 409 && body.error === "price_not_cheap") {
+        const lvl = body.current_level || "current";
+        setInlineError(`Price is currently not cheap (${lvl}).`);
+      } else if (e?.status === 422 && body.error === "out_of_range") {
+        const min = body.min ?? minHours;
+        const max = body.max ?? maxHours;
+        setInlineError(`Hours out of range (${min}–${max}).`);
+      } else {
+        setInlineError(body.error || e?.message || "Failed to start bath boost.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="scrim" onClick={onClose}>
+      <div className="dialog dhw-bath-dialog" onClick={e => e.stopPropagation()}>
+        <div className="head">
+          <div className="glyph warm"><Icon name="bolt" size={16}/></div>
+          <h3>Plan a bath boost</h3>
+        </div>
+        <div className="body">
+          <p style={{ margin: "0 0 12px 0" }}>
+            Boost the hot-water tank for a custom duration. The immersion
+            heater will engage only while spot price is below the gate.
+          </p>
+          <div className="dhw-slider-row">
+            <label htmlFor="dhw-bath-hours" className="dhw-slider-label">
+              Duration <strong>{hours.toFixed(1)} h</strong>
+            </label>
+            <input id="dhw-bath-hours"
+                   type="range"
+                   min={minHours}
+                   max={maxHours}
+                   step={step}
+                   value={hours}
+                   onChange={e => setHours(Number(e.target.value))}/>
+            <div className="dhw-slider-ticks">
+              <span>{minHours.toFixed(1)} h</span>
+              <span>{maxHours.toFixed(1)} h</span>
+            </div>
+          </div>
+          <div className="dhw-gate-note">
+            Immersion gate: ≤ {priceCeiling.toFixed(2)} SEK/kWh
+          </div>
+          {inlineError && (
+            <div className="dhw-bath-error">{inlineError}</div>
+          )}
+        </div>
+        <div className="actions">
+          <button className="btn" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="btn primary warm"
+                  onClick={apply}
+                  disabled={busy}>
+            {busy ? "Applying…" : `Apply ${hours.toFixed(1)} h`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------- App ---------- */
 
 function App() {
@@ -148,6 +446,15 @@ function App() {
   const [alarmsResp]   = useAlarms();
   const [sgResp, sgMeta] = useSmartGrid();
   const [pumpResp, pumpMeta] = usePump();
+  const [dhwResp, dhwMeta] = useDhwState();
+  const [dhwToast, setDhwToast] = useState(null);
+  const [bathModalOpen, setBathModalOpen] = useState(false);
+  // Auto-clear toast after 4s.
+  useEffect(() => {
+    if (!dhwToast) return undefined;
+    const id = setTimeout(() => setDhwToast(null), 4000);
+    return () => clearTimeout(id);
+  }, [dhwToast]);
   const [stepEvents]   = useStepResponse(6);
   const stepData = useMemo(() => window.transformStepEvents(stepEvents), [stepEvents]);
 
@@ -394,6 +701,46 @@ function App() {
               </>
             )}
           </div>
+          <DhwControl
+            dhwResp={dhwResp}
+            sysStatus={hp?.sysStatus}
+            onRefetch={dhwMeta?.refetch}
+            onOpenBath={() => setBathModalOpen(true)}
+            onToast={setDhwToast}/>
+          {/* "Charging DHW" chip — visible when SystemStatus (62005) == 5
+              (heater is currently directing capacity to the DHW tank,
+              boost or no boost). Sourced from useHeatPump (existing fetch). */}
+          {hp?.sysStatus === 5 && (
+            <span className="chip dhw-charging" title="Heater is currently charging the DHW tank">
+              <span className="dot"/>
+              <span className="value">Charging DHW</span>
+            </span>
+          )}
+          {(() => {
+            // DHW boost badge — only renders when an active boost is reported
+            // by /api/v1/dhw/state. The badge auto-refreshes on the same 5s
+            // cadence as the rest of the dashboard (via useDhwState).
+            // remaining_min rounds UP from remaining_s so "1 min" shows until
+            // the final tick rather than flashing "0 min" near the end.
+            const boost = dhwResp?.boost;
+            if (!boost) return null;
+            const remSec = Math.max(0, boost.remaining_s ?? 0);
+            const remMin = Math.ceil(remSec / 60);
+            const presetKind = boost.preset?.kind;
+            const txt = presetKind === "shower"
+              ? `⚡ DHW Boost · ${remMin} min`
+              : (() => {
+                  const h = Math.floor(remMin / 60);
+                  const m = remMin % 60;
+                  const base = `⚡ DHW Boost · ${h} h ${m} min`;
+                  return boost.immersion_engaged ? `${base} · ⚙ immersion` : base;
+                })();
+            return (
+              <span id="dhw-boost-badge" className="chip dhw-boost" title="Active DHW boost">
+                <span className="value">{txt}</span>
+              </span>
+            );
+          })()}
           {(() => {
             // Pump badge only renders when /api/v1/pump is reachable (Homey
             // integration enabled on the server). 503 → pumpResp stays null
@@ -730,6 +1077,7 @@ function App() {
                   nowIndex={nowIdx}
                   scheduledResumeAt={sgResp?.scheduled_resume_at}
                   scheduledRunMinutes={sgResp?.run_minutes ?? proposedResume?.run_minutes}
+                  dhwBoost={dhwResp?.boost}
                   height={narrow ? 140 : 200}
                 />
               </>
@@ -1091,6 +1439,19 @@ function App() {
           </div>
         );
       })()}
+
+      <DhwBathModal
+        open={bathModalOpen}
+        dhwResp={dhwResp}
+        onClose={() => setBathModalOpen(false)}
+        onApplied={() => { setBathModalOpen(false); dhwMeta?.refetch?.(); }}/>
+
+      {dhwToast && (
+        <div className="dhw-toast" role="status" aria-live="polite"
+             onClick={() => setDhwToast(null)}>
+          {dhwToast}
+        </div>
+      )}
 
       {/* Tweaks */}
       <TweaksPanel title="Tweaks">

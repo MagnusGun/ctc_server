@@ -30,6 +30,7 @@ pub async fn run(
     client: HomeyClient,
     cache: Arc<HomeyPumpCache>,
     desired_rx: watch::Receiver<bool>,
+    boost_override_rx: watch::Receiver<Option<bool>>,
     period: Duration,
     cancel: CancellationToken,
 ) {
@@ -46,6 +47,8 @@ pub async fn run(
         period.as_secs()
     );
 
+    let mut desired_rx = desired_rx;
+    let mut boost_override_rx = boost_override_rx;
     loop {
         tokio::select! {
             biased;
@@ -54,13 +57,20 @@ pub async fn run(
                 return;
             }
             _ = ticker.tick() => {}
+            _ = desired_rx.changed() => {}
+            _ = boost_override_rx.changed() => {}
         }
-        tick(&client, &cache, &desired_rx).await;
+        tick(&client, &cache, &desired_rx, &boost_override_rx).await;
     }
 }
 
-async fn tick(client: &HomeyClient, cache: &HomeyPumpCache, desired_rx: &watch::Receiver<bool>) {
-    let desired = *desired_rx.borrow();
+async fn tick(
+    client: &HomeyClient,
+    cache: &HomeyPumpCache,
+    desired_rx: &watch::Receiver<bool>,
+    boost_override_rx: &watch::Receiver<Option<bool>>,
+) {
+    let desired = crate::smartgrid::actor::reconciler_target(boost_override_rx, desired_rx);
     match client.get_pump_onoff().await {
         Ok(actual) => {
             cache.write_fresh(actual).await;
@@ -102,7 +112,8 @@ mod tests {
         let cache = Arc::new(HomeyPumpCache::new());
         let (_tx, rx) = watch::channel(false);
 
-        tick(&client, &cache, &rx).await;
+        let (_boost_tx, boost_rx) = watch::channel(None::<bool>);
+        tick(&client, &cache, &rx, &boost_rx).await;
 
         {
             let s = state.lock().unwrap();
@@ -130,7 +141,8 @@ mod tests {
         let cache = Arc::new(HomeyPumpCache::new());
         let (_tx, rx) = watch::channel(true);
 
-        tick(&client, &cache, &rx).await;
+        let (_boost_tx, boost_rx) = watch::channel(None::<bool>);
+        tick(&client, &cache, &rx, &boost_rx).await;
 
         {
             let s = state.lock().unwrap();
@@ -157,7 +169,8 @@ mod tests {
         cache.write_fresh(true).await;
         let (_tx, rx) = watch::channel(true);
 
-        tick(&client, &cache, &rx).await;
+        let (_boost_tx, boost_rx) = watch::channel(None::<bool>);
+        tick(&client, &cache, &rx, &boost_rx).await;
 
         {
             let s = state.lock().unwrap();
@@ -181,16 +194,25 @@ mod tests {
         let cache = Arc::new(HomeyPumpCache::new());
         let (tx, rx) = watch::channel(true);
 
-        tick(&client, &cache, &rx).await; // desired=true, actual=true → no push
+        let (_boost_tx, boost_rx) = watch::channel(None::<bool>);
+        tick(&client, &cache, &rx, &boost_rx).await; // desired=true, actual=true → no push
         {
             let s = state.lock().unwrap();
             assert!(s.set_calls.is_empty());
         }
 
         tx.send(false).unwrap();
-        tick(&client, &cache, &rx).await; // desired=false, actual still true → push
+        let (_boost_tx, boost_rx) = watch::channel(None::<bool>);
+        tick(&client, &cache, &rx, &boost_rx).await; // desired=false, actual still true → push
 
         let s = state.lock().unwrap();
         assert_eq!(s.set_calls, vec![false]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs HomeyClient mock; manual ctc.lan test covers this for now"]
+    async fn poller_respects_boost_override() {
+        // Documented in spec §4.7. Real integration with a fake HomeyClient
+        // lands when we add a generic HomeyClient mock helper.
     }
 }
