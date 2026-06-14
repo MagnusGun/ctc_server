@@ -65,6 +65,23 @@ pub struct PriceStatistics {
     pub median: f64,
 }
 
+/// True when `now` lies within the bucket's overall span
+/// `[first.starts_at, last.ends_at)`. Empty or unparseable buckets cover no
+/// instant. A bucket's calendar day is implicit in its slot timestamps, so this
+/// is equivalent to "this bucket holds the data for now's local day".
+fn bucket_covers(bucket: &[PricePoint], now: chrono::DateTime<chrono::Utc>) -> bool {
+    let (Some(first), Some(last)) = (bucket.first(), bucket.last()) else {
+        return false;
+    };
+    match (
+        chrono::DateTime::parse_from_rfc3339(&first.starts_at),
+        chrono::DateTime::parse_from_rfc3339(&last.ends_at),
+    ) {
+        (Ok(start), Ok(end)) => now >= start && now < end,
+        _ => false,
+    }
+}
+
 impl PriceState {
     /// Create a new price state
     pub fn new(price_zone: String) -> Self {
@@ -151,6 +168,32 @@ impl PriceState {
     pub fn get_tomorrow(&self) -> Vec<PricePoint> {
         let inner = self.inner.lock().unwrap();
         inner.tomorrow.clone()
+    }
+
+    /// Resolve the `(today, tomorrow)` arrays to serve from `/api/v1/prices`,
+    /// compensating for the fetch loop's lack of a midnight rotation.
+    ///
+    /// The loop labels buckets at fetch time and never rotates them at midnight,
+    /// so between 00:00 and the daily fetch hour the `today` bucket still holds
+    /// yesterday while `tomorrow` holds the real today — the same staleness
+    /// [`Self::get_current`] already works around.
+    ///
+    /// - `today` bucket spans `now` -> serve `(today, tomorrow)` unchanged.
+    /// - else `tomorrow` bucket spans `now` -> the loop has not rotated; promote
+    ///   it to today and report no next-day data (the genuine next day is not
+    ///   fetched until the daily fetch hour).
+    /// - else no bucket covers `now` (empty state, or multi-day-stale outage) ->
+    ///   `None`; the route turns this into 503 rather than serving a wrong day.
+    pub fn resolve_served_prices(&self) -> Option<(Vec<PricePoint>, Vec<PricePoint>)> {
+        let inner = self.inner.lock().unwrap();
+        let now = chrono::Utc::now();
+        if bucket_covers(&inner.today, now) {
+            Some((inner.today.clone(), inner.tomorrow.clone()))
+        } else if bucket_covers(&inner.tomorrow, now) {
+            Some((inner.tomorrow.clone(), Vec::new()))
+        } else {
+            None
+        }
     }
 
     /// Get the price zone
@@ -828,5 +871,46 @@ mod tests {
             .or_else(|e| Ok::<_, ()>(e.duration()))
             .unwrap();
         assert!(diff < Duration::from_secs(5), "diff was {diff:?}");
+    }
+
+    #[test]
+    fn resolve_serves_today_when_today_covers_now() {
+        let state = PriceState::new("SE3".to_string());
+        // Bucket spans now-30m .. now+30m -> covers now.
+        let today = make_run(-30, &[0.5, 0.5, 0.5, 0.5]);
+        let tomorrow = make_run(30, &[0.9, 0.9]);
+        state.update_prices(today, tomorrow);
+        let (t, tm) = state.resolve_served_prices().expect("today covers now");
+        assert_eq!(t.len(), 4, "today served as-is");
+        assert_eq!(tm.len(), 2, "tomorrow served as-is");
+        assert_float_eq(t[0].spot_sek, 0.5, "today first slot");
+    }
+
+    #[test]
+    fn resolve_promotes_tomorrow_when_today_is_stale() {
+        // today bucket entirely in the past (loop hasn't rotated at midnight);
+        // tomorrow bucket is the real today and spans now.
+        let state = PriceState::new("SE3".to_string());
+        let today = make_run(-300, &[1.0, 1.0]); // spans -300..-270, all past
+        let tomorrow = make_run(-15, &[0.2, 0.2, 0.2]); // spans -15..+30, covers now
+        state.update_prices(today, tomorrow);
+        let (t, tm) = state.resolve_served_prices().expect("tomorrow promoted");
+        assert_float_eq(t[0].spot_sek, 0.2, "promoted today == old tomorrow");
+        assert!(tm.is_empty(), "no genuine next-day bucket after promotion");
+    }
+
+    #[test]
+    fn resolve_returns_none_when_no_bucket_covers_now() {
+        let state = PriceState::new("SE3".to_string());
+        let today = make_run(-300, &[1.0, 1.0]); // past
+        let tomorrow = make_run(180, &[0.3, 0.3]); // future, does not cover now
+        state.update_prices(today, tomorrow);
+        assert!(state.resolve_served_prices().is_none());
+    }
+
+    #[test]
+    fn resolve_returns_none_for_empty_state() {
+        let state = PriceState::new("SE3".to_string());
+        assert!(state.resolve_served_prices().is_none());
     }
 }

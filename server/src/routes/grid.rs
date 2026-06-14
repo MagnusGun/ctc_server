@@ -199,8 +199,10 @@ struct OptimalHoursResponse {
 async fn get_prices(State(state): State<GridRouteState>) -> Result<String, ApiError> {
     debug!("get_prices: START");
 
-    let today = state.price_state.get_today();
-    let tomorrow = state.price_state.get_tomorrow();
+    let (today, tomorrow) = state
+        .price_state
+        .resolve_served_prices()
+        .ok_or(ApiError::ServiceUnavailable)?;
     let current = state.price_state.get_current();
     let price_zone = state.price_state.price_zone();
 
@@ -220,7 +222,7 @@ async fn get_prices(State(state): State<GridRouteState>) -> Result<String, ApiEr
         current,
         today: DayPrices {
             prices: today,
-            available: true,
+            available: today_spot_stats.is_some(),
             spot_statistics: today_spot_stats,
         },
         tomorrow: DayPrices {
@@ -370,16 +372,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_prices_empty() {
+    async fn test_get_prices_stale_returns_503() {
+        // No price data covers "now" -> the route must refuse rather than serve
+        // a wrong/empty day. Rollover-safety contract (Magnus's requirement).
         let state = create_test_state();
+        let err = get_prices(State(state)).await.unwrap_err();
+        assert!(matches!(err, ApiError::ServiceUnavailable));
+    }
+
+    #[tokio::test]
+    async fn test_get_prices_serves_day_covering_now() {
+        let state = create_test_state();
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::minutes(30);
+        let end = now + chrono::Duration::minutes(30);
+        let today = vec![PricePoint::from_spot(
+            start.to_rfc3339(),
+            end.to_rfc3339(),
+            0.42,
+            0.0,
+            0.0,
+        )];
+        state.price_state.update_prices(today, vec![]);
 
         let json = get_prices(State(state)).await.expect("get_prices");
         let v = parse(&json);
         assert_eq!(v["price_zone"].as_str(), Some("SE3"));
-        assert!(v["today"].is_object());
-        assert!(v["today"]["prices"].is_array());
-        assert!(v["tomorrow"].is_object());
-        assert!(v["tomorrow"]["prices"].is_array());
+        assert_eq!(v["today"]["available"].as_bool(), Some(true));
+        assert_eq!(v["today"]["prices"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["tomorrow"]["available"].as_bool(), Some(false));
     }
 
     #[tokio::test]
