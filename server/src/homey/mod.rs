@@ -100,7 +100,13 @@ impl HomeyClient {
             .send()
             .await?;
         if !resp.status().is_success() {
-            return Err(HomeyError::Status(resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "Homey PUT {url} returned {status}: {body}",
+                body = body.chars().take(300).collect::<String>()
+            );
+            return Err(HomeyError::Status(status));
         }
         Ok(())
     }

@@ -6,7 +6,9 @@ const API_BASE = '/api/v1';
 
 const REG = {
     DHW_UPPER:        { addr: 62276, factor: 0.1 }, // DHW actual temp
+    DHW_STOP_TEMP:    { addr: 62001, factor: 0.1 }, // DHW stop temp (target)
     LOWER_TANK:       { addr: 62006, factor: 0.1 }, // Lower tank / radiator
+    HEAT_OFF_OUT_TEMP:{ addr: 61546, factor: 0.1 }, // Heating off, outdoor °C
     HEATING_MODE:     { addr: 61542, factor: 1   }, // 0 Auto, 1 On, 2 Off
     HEATING_STATUS:   { addr: 62246, factor: 1   }, // 0 Off, 1 Vacation, 2 Night, 3 Normal
     FLOW_SETPOINT:    { addr: 62007, factor: 0.1 }, // Heating system 1 supply-flow setpoint (heat curve)
@@ -25,7 +27,7 @@ const REG = {
 };
 
 const HEATING_MODE_LABELS = { 0: 'Auto', 1: 'On', 2: 'Off' };
-const HEATING_STATUS_LABELS = { 0: 'Off', 1: 'Vacation', 2: 'Night', 3: 'Normal' };
+const HEATING_STATUS_LABELS = { 0: 'Off', 1: 'Vacation', 2: 'Night', 3: 'On' };
 const HP_STATUS_LABELS = {
     0: 'Start Delay', 1: 'Ready', 2: 'Wait Flow', 3: 'Heating',
     4: 'Defrost', 5: 'Cooling', 6: 'Blocked', 7: 'Alarm', 8: 'Test',
@@ -67,17 +69,19 @@ const settledError = r => (r.status === 'rejected'  ? r.reason : null);
 /* High-level fetchers — one per card. Each returns a plain object the card consumes. */
 
 async function getTemperatures() {
-    const [room, outdoor, setpoint, dhwUpper, lower] = await Promise.allSettled([
+    const [room, outdoor, setpoint, dhwUpper, lower, dhwStopTemp, heatOffTemp] = await Promise.allSettled([
         fetchJson(`${API_BASE}/temperature/room`).then(d => d.room_temperature),
         fetchJson(`${API_BASE}/temperature/outdoor`).then(d => d.outdoor_temperature),
         fetchJson(`${API_BASE}/temperature/room/setpoint`).then(d => d.room_temperature_setpoint),
         readRegister(REG.DHW_UPPER),
         readRegister(REG.LOWER_TANK),
+        readRegister(REG.DHW_STOP_TEMP),
+        readRegister(REG.HEAT_OFF_OUT_TEMP),
     ]);
     // Plain string messages so usePolledFetch's JSON.stringify change-detection
     // can compare them; Error instances serialize to {} and look identical even
     // when the underlying message differs.
-    const errors = [room, outdoor, setpoint, dhwUpper, lower]
+    const errors = [room, outdoor, setpoint, dhwUpper, lower, dhwStopTemp, heatOffTemp]
         .map(settledError).filter(e => e != null)
         .map(e => e?.message ?? String(e));
     return {
@@ -86,6 +90,8 @@ async function getTemperatures() {
         setpoint: settledValue(setpoint),
         dhwUpper: settledValue(dhwUpper),
         lower: settledValue(lower),
+        dhwStopTemp: settledValue(dhwStopTemp),
+        heatOffTemp: settledValue(heatOffTemp),
         errors,
     };
 }
@@ -212,7 +218,7 @@ async function cancelDhwBoost() {
     return r.status;
 }
 
-// Cirkulationspump state via Homey. 503 means the Homey integration is
+// Circulation-pump state via Homey. 503 means the Homey integration is
 // disabled — the badge should hide itself when this resolves to null.
 async function getPump() {
     try { return await fetchJson(`${API_BASE}/pump`); }

@@ -38,9 +38,23 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
     const widthRaw = (scheduledRunMinutes * 60_000 / span) * innerW;
     const xRight = Math.min(padL + innerW, xLeft + widthRaw);
     const bandW = Math.max(2, xRight - xLeft);
+    const resumeHM = window.formatHM(scheduledResumeAt);
+    const endIso = new Date(resumeMs + scheduledRunMinutes * 60_000).toISOString();
+    const endHM = window.formatHM(endIso);
+    const labelX = xLeft + 4;
+    const showLabel = bandW > 40;
     return (
-      <g pointerEvents="none">
+      <g className="resume-band-group">
+        <title>{`Heat pump resumes at ${resumeHM} · runs ${scheduledRunMinutes} min (until ~${endHM})\nCheapest contiguous window picked by auto-resume scheduler.`}</title>
         <rect className="resume-band" x={xLeft} y={padT} width={bandW} height={innerH} />
+        <rect className="resume-band-stripe" x={xLeft} y={padT} width={bandW} height={innerH} />
+        <line className="resume-band-edge" x1={xLeft} x2={xLeft} y1={padT} y2={h - padB} />
+        {showLabel && (
+          <>
+            <rect className="resume-band-label-bg" x={labelX - 3} y={padT + 2} width={Math.min(bandW - 4, 64)} height={14} rx="2"/>
+            <text className="resume-band-label" x={labelX} y={padT + 12}>▶ {resumeHM}</text>
+          </>
+        )}
       </g>
     );
   })();
@@ -111,17 +125,10 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
   return (
     <svg ref={containerRef} className="energy-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ height }}>
       <defs>
-        {["very_cheap","cheap","normal","expensive","very_expensive"].map(lvl => (
-          <linearGradient key={lvl} id={`fill-${lvl}`} x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%"   stopColor={LEVEL_VAR[lvl]} stopOpacity="0.55"/>
-            <stop offset="60%"  stopColor={LEVEL_VAR[lvl]} stopOpacity="0.18"/>
-            <stop offset="100%" stopColor={LEVEL_VAR[lvl]} stopOpacity="0"/>
-          </linearGradient>
-        ))}
-        <linearGradient id="resumeFill" x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%"   stopColor="var(--price-expensive)" stopOpacity="0.30"/>
-          <stop offset="100%" stopColor="var(--price-expensive)" stopOpacity="0"/>
-        </linearGradient>
+        <pattern id="resumeStripe" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+          <rect width="6" height="6" fill="transparent"/>
+          <line x1="0" y1="0" x2="0" y2="6" stroke="var(--good)" strokeWidth="1.5" strokeOpacity="0.55"/>
+        </pattern>
         <radialGradient id="nowGlow" cx="50%" cy="50%" r="50%">
           <stop offset="0%"   stopColor="var(--price-expensive)" stopOpacity="0.55"/>
           <stop offset="60%"  stopColor="var(--price-expensive)" stopOpacity="0.18"/>
@@ -146,20 +153,6 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
 
       {hasData && (
         <>
-          {slots.map((p, i) => {
-            const v = p?.spot_sek;
-            if (v == null) return null;
-            const lvl = p.level;
-            const gradId = LEVEL_VAR[lvl] ? `url(#fill-${lvl})` : "none";
-            const y = yFor(v);
-            return (
-              <rect key={`f${i}`}
-                    x={xFor(i)} y={y}
-                    width={xFor(i + 1) - xFor(i)}
-                    height={Math.max(0, yFor(yMin) - y)}
-                    fill={gradId} />
-            );
-          })}
           {resumeBand}
           {dhwBand}
           {slots.map((p, i) => {
@@ -190,16 +183,26 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
       )}
 
       {/* now line — only when we have a real value to anchor to */}
-      {hasData && nowVal != null && (
-        <>
-          <line className="now-line" x1={nowX} x2={nowX} y1={padT} y2={h - padB} />
-          <text className="now-label" x={nowX} y={padT - 4} textAnchor="middle">NOW</text>
-          <circle cx={xFor(nowIdxFloor)} cy={yFor(nowVal)} r="14" fill="url(#nowGlow)" />
-          <circle cx={xFor(nowIdxFloor)} cy={yFor(nowVal)} r="4"
-                  fill={levelColor(nowSlot.level)}
-                  stroke="var(--bg)" strokeWidth="1.5"/>
-        </>
-      )}
+      {hasData && nowVal != null && (() => {
+        const priceTxt = `${nowVal.toFixed(2)} kr/kWh`;
+        const lbl = `NOW · ${priceTxt}`;
+        const tw = lbl.length * 5.8 + 8;
+        const lx = Math.max(padL + tw/2, Math.min(w - padR - tw/2, nowX));
+        return (
+          <>
+            <line className="now-line" x1={nowX} x2={nowX} y1={padT} y2={h - padB} />
+            <rect className="now-label-bg" x={lx - tw/2} y={padT - 13} width={tw} height={12} rx="2"/>
+            <text className="now-label" x={lx} y={padT - 4} textAnchor="middle">
+              <tspan className="now-label-tag">NOW</tspan>
+              <tspan dx="4" fill={levelColor(nowSlot.level)} style={{ textTransform: "none", letterSpacing: "0.02em" }}>{priceTxt}</tspan>
+            </text>
+            <circle cx={xFor(nowIdxFloor)} cy={yFor(nowVal)} r="14" fill="url(#nowGlow)" />
+            <circle cx={xFor(nowIdxFloor)} cy={yFor(nowVal)} r="4"
+                    fill={levelColor(nowSlot.level)}
+                    stroke="var(--bg)" strokeWidth="1.5"/>
+          </>
+        );
+      })()}
 
       {!hasData && (
         <text x={w / 2} y={h / 2} textAnchor="middle" dominantBaseline="middle"
@@ -210,13 +213,29 @@ const EnergyChart = React.memo(({ today, nowIndex, scheduledResumeAt = null, sch
 
       <rect x={padL} y={padT} width={innerW} height={innerH}
         fill="transparent"
-        onMouseLeave={() => setHover(null)}
-        onMouseMove={(e) => {
+        style={{ touchAction: "none" }}
+        onPointerDown={(e) => {
           if (N === 0) return;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          const rect = e.currentTarget.getBoundingClientRect();
+          const ratio = (e.clientX - rect.left) / rect.width;
+          const i = Math.max(0, Math.min(N - 1, Math.round(ratio * (N - 1))));
+          setHover(i);
+        }}
+        onPointerMove={(e) => {
+          if (N === 0) return;
+          if (e.pointerType !== "mouse" && e.buttons === 0 && !e.currentTarget.hasPointerCapture?.(e.pointerId)) return;
           const rect = e.currentTarget.getBoundingClientRect();
           const ratio = (e.clientX - rect.left) / rect.width;
           const i = Math.max(0, Math.min(N - 1, Math.round(ratio * (N - 1))));
           if (i !== hover) setHover(i);
+        }}
+        onPointerUp={(e) => {
+          if (e.pointerType !== "mouse") setHover(null);
+        }}
+        onPointerCancel={() => setHover(null)}
+        onPointerLeave={(e) => {
+          if (e.pointerType === "mouse") setHover(null);
         }}/>
 
       {hasData && hover != null && slots[hover]?.spot_sek != null && (

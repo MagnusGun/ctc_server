@@ -12,9 +12,9 @@ const ActivityTimeline = ({ segments, height = 60, hours = 24 }) => {
 
   const xFor = (hour) => padL + (hour / hours) * innerW;
   const colorFor = (lane) =>
-    lane === "Heating" ? "var(--accent)"
-    : lane === "DHW"   ? "var(--hot)"
-    : "var(--cold)";
+    lane === "Heating" ? "var(--cat-heating)"
+    : lane === "DHW"   ? "var(--cat-dhw)"
+    : "var(--cat-brine)";
 
   const compactLabels = w < window.COMPACT_CHART_WIDTH;
   const xTicks = [];

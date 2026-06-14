@@ -343,6 +343,34 @@ function useMediaQuery(query) {
 }
 const useIsNarrow = () => useMediaQuery("(max-width: 480px)");
 
+/* Per-device open/closed state for collapsible UI (chart `<details>`, card
+   bodies). Stores one JSON object per `storageKey` in localStorage; merges
+   `defaults` for keys the user has not yet touched. Returns [state, set]
+   where set(key, value) updates that one key and re-persists. Reads/writes
+   are wrapped in try/catch — Safari private mode or quota errors fall back
+   to in-memory state without breaking the UI. */
+function useCollapseState(storageKey, defaults) {
+    const [state, setState] = React.useState(() => {
+        try {
+            const raw = window.localStorage.getItem(storageKey);
+            if (!raw) return { ...defaults };
+            const parsed = JSON.parse(raw);
+            return { ...defaults, ...parsed };
+        } catch (_e) {
+            return { ...defaults };
+        }
+    });
+    const set = React.useCallback((key, value) => {
+        setState(prev => {
+            const next = { ...prev, [key]: value };
+            try { window.localStorage.setItem(storageKey, JSON.stringify(next)); }
+            catch (_e) { /* ignore quota / private-mode errors */ }
+            return next;
+        });
+    }, [storageKey]);
+    return [state, set];
+}
+
 /* Measure a DOM element's width via ResizeObserver. Returns [ref, width].
    Width is 0 before first measurement; charts fall back to a default
    viewBox width until the observer fires. Uses a callback ref so the
@@ -390,3 +418,4 @@ window.usePump = usePump;
 window.useDhwState = useDhwState;
 window.useIsNarrow = useIsNarrow;
 window.useElementSize = useElementSize;
+window.useCollapseState = useCollapseState;

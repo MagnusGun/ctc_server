@@ -21,19 +21,30 @@ const Icon = ({ name, size = 16 }) => {
   );
 };
 
-const Card = ({ icon, title, actions, banner, children, className = "" }) => (
-  <section className={`card ${className}`}>
+const Card = ({
+  icon, title, actions, banner, children, className = "",
+  collapsible = false, collapsed = false, onToggleCollapse,
+}) => (
+  <section className={`card ${collapsed ? "collapsed" : ""} ${className}`}>
     <header className="card-head">
       <h2 className="card-title">
         {icon ? <span className="ico"><Icon name={icon} size={15}/></span> : null}
         {title}
       </h2>
       <div className="card-actions">
-        {banner ? <span className="stats-banner">{banner}</span> : null}
-        {actions}
+        {banner && !collapsed ? <span className="stats-banner">{banner}</span> : null}
+        {!collapsed && actions}
+        {collapsible && (
+          <button type="button" className="card-toggle"
+                  onClick={onToggleCollapse}
+                  aria-expanded={!collapsed}
+                  aria-label={`${collapsed ? "Expand" : "Collapse"} ${title}`}>
+            <span className="chev" aria-hidden="true"/>
+          </button>
+        )}
       </div>
     </header>
-    {children}
+    <div className="card-body">{children}</div>
   </section>
 );
 
@@ -99,14 +110,14 @@ const SPARK_TONE_STROKE = {
   good: "var(--good)",
 };
 
-const Sparkline = ({ data, tone }) => {
+const Sparkline = ({ data, tone, color }) => {
   const w = 200, h = 22;
   const values = (data || []).filter(v => v != null && !Number.isNaN(v));
   if (values.length === 0) return null;
   const min = Math.min(...values), max = Math.max(...values);
   const range = max - min || 1;
   const segments = sparkSegments(data, w, h, min, range);
-  const stroke = SPARK_TONE_STROKE[tone] ?? "var(--text-3)";
+  const stroke = color ?? SPARK_TONE_STROKE[tone] ?? "var(--text-3)";
   return (
     <svg className="spark" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
       {segments.map((seg, i) => (
@@ -148,20 +159,26 @@ const PumpBar = ({ label, pct }) => (
   </div>
 );
 
-const Brand = () => (
-  <div className="brand">
-    <div className="brand-mark">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
-           stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-           style={{ color: "var(--accent)" }}>
-        <path d="M11 2 4 13h6l-1 7 7-11h-6l1-7Z" />
-      </svg>
-    </div>
-    <div className="brand-text">
-      <span className="product">CTC</span>
-      <span className="model">EcoHeat 410</span>
-    </div>
-  </div>
-);
+const Brand = ({ state = "connected" }) => {
+  const label = state === "offline" ? "Offline"
+              : state === "connecting" ? "Connecting"
+              : "Connected";
+  return (
+    <Tip hint={`CTC EcoHeat 410 · ${label}`}>
+      <div className="brand" data-state={state} role="status" aria-label={`CTC EcoHeat 410, ${label}`}>
+        <div className="brand-mark">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M11 2 4 13h6l-1 7 7-11h-6l1-7Z" />
+          </svg>
+        </div>
+        <div className="brand-text">
+          <span className="product">CTC</span>
+          <span className="model">EcoHeat 410</span>
+        </div>
+      </div>
+    </Tip>
+  );
+};
 
 Object.assign(window, { Icon, Card, Metric, Sparkline, MultiSparkline, Pill, PumpBar, Brand, Tip });

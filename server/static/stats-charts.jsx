@@ -634,7 +634,7 @@ const StartsVsTemp = ({ data: rawData }) => {
         {hover != null
           ? `${data[hover].outdoor.toFixed(1)}°C — ${data[hover].starts} starts on ${data[hover].date.toLocaleDateString("en-GB",{day:"numeric",month:"short"})}`
           : hasTrend
-          ? `Trend: ${slope.toFixed(2)} starts per °C colder · R² is left as an exercise`
+          ? `Trend: ${slope.toFixed(2)} starts per °C colder`
           : "Not enough outdoor variance for a trend line"}
       </div>
     </div>

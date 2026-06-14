@@ -65,7 +65,37 @@ const STATS_TAB_TITLES = {
   heating: "Heating system",
 };
 
-const HEATING_STATUS_CLASS = { 1: "warn", 2: "warn", 3: "" };
+// HEATING_STATUS register (62246) — operating regime, not live heat delivery.
+// 0 Off (grey) · 1 Vacation, 2 Night (amber — limited operation) · 3 On (green — regular regime, heat-curve in effect).
+const HEATING_STATUS_CLASS = { 0: "off", 1: "warn", 2: "warn", 3: "on" };
+// Derive a human-readable explanation of the current heating state.
+// Cross-references status (62246) with outdoor temp and the heat-off threshold
+// so the user sees *why* heating is currently in this state, not just the label.
+const whyHeating = (status, outdoor, heatOff) => {
+  const haveBoth = outdoor != null && heatOff != null;
+  switch (status) {
+    case 0:
+      return (haveBoth && outdoor > heatOff)
+        ? `Off · Outdoor ${outdoor.toFixed(1)}°C > heat-off threshold ${heatOff.toFixed(1)}°C`
+        : "Off · heat curve disabled (manual or hysteresis pending)";
+    case 1:
+      return "Vacation reduction active";
+    case 2:
+      return "Night-time reduction active";
+    case 3:
+      if (haveBoth && outdoor >= heatOff) {
+        return `On · heat-off pending (outdoor ${outdoor.toFixed(1)}°C ≥ threshold ${heatOff.toFixed(1)}°C, timer not yet elapsed)`;
+      }
+      return heatOff != null
+        ? `On · outdoor below heat-off threshold (${heatOff.toFixed(1)}°C)`
+        : "On · heat curve in effect";
+    default:
+      return "Status · Off / Vacation / Night / On";
+  }
+};
+// Mode label (Auto/On/Off) → tone. Auto and On both indicate the controller
+// is actively driving the heating circuit; Off mutes it.
+const HEATING_MODE_CLASS = { "Auto": "on", "On": "on", "Off": "off" };
 
 const PRICE_LEVEL_LABELS = {
   very_cheap:     "Very Cheap",
@@ -117,8 +147,8 @@ window.formatHM = formatHM;
 const COMFORT_LEVEL_LABELS = {
   economy: "Economy",
   normal:  "Normal",
-  komfort: "Komfort",
-  manuell: "Manuell",
+  komfort: "Comfort",
+  manuell: "Manual",
 };
 
 // Writable comfort levels (Manuell is read-only; the heater derives it from
@@ -127,7 +157,7 @@ const COMFORT_LEVEL_LABELS = {
 const COMFORT_OPTIONS = [
   { value: "economy", label: "Economy" },
   { value: "normal",  label: "Normal"  },
-  { value: "komfort", label: "Komfort" },
+  { value: "komfort", label: "Comfort" },
 ];
 
 // Format a remaining-seconds value as either "{m} min" (≤60min) or
@@ -177,9 +207,7 @@ function DhwControl({ dhwResp, sysStatus, onRefetch, onOpenBath, onToast }) {
     ? (showerActive
         ? `⚡ Shower · ${formatBoostRemaining(boost.remaining_s)}`
         : `⚡ Bath · ${formatBoostRemaining(boost.remaining_s)}`)
-    // TODO: surface comfort stop_temp from /dhw/state once the snapshot
-    // exposes it; for now just show the comfort label.
-    : `DHW · ${comfortLabel}`;
+    : comfortLabel;
 
   const close = () => { setOpen(false); setSubmenuOpen(false); };
 
@@ -430,6 +458,37 @@ function App() {
   const [sgOpen, setSgOpen] = useState(false);
   const narrow = useIsNarrow();
 
+  // Per-device collapse state. Defaults: charts open on desktop, closed on
+  // phone (`narrow` snapshot used only at first mount; the user's localStorage
+  // override sticks across reloads). Cards default open everywhere.
+  const [chartCollapse, setChartCollapse] = window.useCollapseState("ctc.collapsibles", {
+    energyChart: !narrow,
+    heatingTrend: !narrow,
+    activityTimeline: !narrow,
+  });
+  const [cardCollapse, setCardCollapse] = window.useCollapseState("ctc.cards", {
+    prices:        false,
+    heatingSystem: false,
+    heatPump:      false,
+    stats:         true,
+    energy:        false,
+    activity:      false,
+    messages:      false,
+  });
+  // Per-device "hide entire card" visibility. Separate from `cardCollapse`
+  // (which just hides the body) — invisible cards aren't rendered at all.
+  // Persisted in localStorage so the choice survives reloads without an
+  // editor host (tweak EDITMODE persistence only fires when the host is up).
+  const [cardVis, setCardVis] = window.useCollapseState("ctc.cardVisibility", {
+    prices:        true,
+    heatingSystem: true,
+    heatPump:      true,
+    stats:         true,
+    energy:        true,
+    activity:      true,
+    messages:      true,
+  });
+
   /* ---------- Live data from backend ---------- */
   const [activitySegs] = useActivity();
   const [temps, tempsMeta] = useTemperatures();
@@ -466,7 +525,9 @@ function App() {
     out:    hpOutdoor      ? window.bucketMinutely(hpOutdoor)      : null,
     upper:  dhwUpperSeries ? window.bucketMinutely(dhwUpperSeries) : null,
     lower:  lowerSeries    ? window.bucketMinutely(lowerSeries)    : null,
-  }), [roomSeries, hpOutdoor, dhwUpperSeries, lowerSeries]);
+    flow:   hpFlow         ? window.bucketMinutely(hpFlow)         : null,
+    ret:    hpReturn       ? window.bucketMinutely(hpReturn)       : null,
+  }), [roomSeries, hpOutdoor, dhwUpperSeries, lowerSeries, hpFlow, hpReturn]);
 
   // Stats data shapes derived from history + series fetches. `null` until
   // history arrives; the chart components fall back to their synth defaults
@@ -536,10 +597,20 @@ function App() {
   }, [t.theme, t.density, t.cards, t.accent]);
 
   const clockStr = now.toLocaleTimeString("sv-SE", { hour12: false });
+  const clockHM  = now.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", hour12: false });
   const dateStr = now.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
 
   // Now index for chart — fractional 0..96 (one unit = 15 min).
   const nowIdx = (now.getHours() * 60 + now.getMinutes()) / 15;
+
+  // Price-chart data — hoisted to App scope so both the Heating System card
+  // (where the chart now lives) and the Energy & Prices card (live price box)
+  // can read from a single source of truth.
+  const todayPrices = pricesResp?.today?.prices || [];
+  const nowSlotIdx  = findPriceSlotAt(todayPrices, now);
+  const nowSlot     = nowSlotIdx >= 0 ? todayPrices[nowSlotIdx] : null;
+  const nowPrice    = pricesResp?.current?.spot_sek ?? nowSlot?.spot_sek ?? null;
+  const nowLevel    = pricesResp?.current?.level ?? nowSlot?.level ?? null;
 
   // System messages — fed by /api/v1/alarms.
   // Backend shape: { alarms: AlarmMessage[], infos: AlarmMessage[] }.
@@ -554,7 +625,7 @@ function App() {
         tone: "error",
         code: codeOrRef(a, "E"),
         title: a.message_en || a.message || "Alarm",
-        desc: [a.description_sv, a.description].filter(Boolean).join(" "),
+        desc: a.description || a.description_sv || "",
         when: stamp(a.first_seen),
       });
     });
@@ -563,7 +634,7 @@ function App() {
         tone: "info",
         code: codeOrRef(m, "I"),
         title: m.message_en || m.message || "Info",
-        desc: [m.description_sv, m.description].filter(Boolean).join(" "),
+        desc: m.description || m.description_sv || "",
         when: stamp(m.first_seen),
       });
     });
@@ -626,11 +697,26 @@ function App() {
   const openTrend = (key) => setTrendKey(key);
   const closeTrend = () => { setTrendKey(null); setTrendData(null); setTrendError(null); };
 
+  // Per-card collapsible-card props. `cardVisibility` defaults to true so
+  // older persisted tweak objects don't accidentally hide everything.
+  const cardProps = (key) => ({
+    collapsible: true,
+    collapsed: !!cardCollapse[key],
+    onToggleCollapse: () => setCardCollapse(key, !cardCollapse[key]),
+  });
+  const visible = (key) => cardVis[key] !== false;
+
   return (
     <div className="app" data-screen-label="01 Dashboard">
       {/* Topbar */}
       <header className="topbar">
-        <Brand />
+        <div className="topbar-lead">
+          <Brand state={tempsMeta?.error ? "offline" : (tempsMeta?.loading && !temps) ? "connecting" : "connected"} />
+          <div className="topbar-clock" aria-label={`${dateStr} ${clockHM}`}>
+            <span className="d">{dateStr}</span>
+            <span className="t">{clockHM}</span>
+          </div>
+        </div>
         <div className="status-strip">
           <div className="sg-wrap">
             {(() => {
@@ -741,29 +827,6 @@ function App() {
               </span>
             );
           })()}
-          {(() => {
-            // Pump badge only renders when /api/v1/pump is reachable (Homey
-            // integration enabled on the server). 503 → pumpResp stays null
-            // → chip is hidden. Stale flag → amber tone + tooltip.
-            if (!pumpResp || pumpMeta?.error) return null;
-            const on = pumpResp.on;
-            const stale = !!pumpResp.stale;
-            const valueLabel = on == null ? "?" : (on ? "Aktiv" : "Av");
-            const tone = stale ? "warn" : "";
-            const stamp = pumpResp.last_observed_unix_secs;
-            const ageText = stamp == null
-              ? "ej observerad ännu"
-              : `uppdaterad för ${Math.max(0, Math.floor(Date.now() / 1000 - stamp))} s sedan`;
-            const tip = stale
-              ? `Homey ej tillgänglig (${ageText})`
-              : `Cirkulationspump · ${ageText}`;
-            return (
-              <span className={`chip ${tone}`} title={tip}>
-                <span className="label">Pump</span>
-                <span className="value">{valueLabel}</span>
-              </span>
-            );
-          })()}
           {errorCount > 0 && (
             <span className="chip alert-chip"
                   onClick={() => document.getElementById("messages-section")?.scrollIntoView()}
@@ -773,61 +836,69 @@ function App() {
               <span className="value">{messages.find(m => m.tone === "error").code}</span>
             </span>
           )}
-          <span className="chip clock">
-            <span className="label">{dateStr}</span>
-            <span className="value">{clockStr}</span>
-          </span>
-
-          {(() => {
-            // Reflect HTTP heartbeat to the server. useTemperatures polls every
-            // POLL_LIVE; if it has errored we're not getting fresh data.
-            const offline = !!tempsMeta?.error;
-            const connecting = !!tempsMeta?.loading && !temps;
-            const cls = offline ? "chip live offline" : connecting ? "chip live connecting" : "chip live";
-            const label = offline ? "Offline" : connecting ? "Connecting" : "Connected";
-            return (
-              <span className={cls}><span className="dot"/><span className="value">{label}</span></span>
-            );
-          })()}
         </div>
       </header>
 
-      {/* Row 1 — Temperatures + Heating system */}
-      <div className="row split-58">
-        <Card icon="thermo" title="Temperatures">
-          <div className="metric-grid cols-2">
-            <Metric label="Room"    tone="warm" value={f1(temps?.room)} unit="°C"
-                    hint="Indoor room temperature"
-                    sub={temps?.setpoint != null ? `setpoint ${f1(temps.setpoint)}°C` : "setpoint —"}
-                    onClick={() => openTrend("room")}
-                    sparkData={t.showSparklines ? sparks.room : null}/>
-            <Metric label="Outdoor" tone="cool" value={f1(temps?.outdoor)} unit="°C"
-                    hint="Outdoor air temperature"
-                    onClick={() => openTrend("outdoor")}
-                    sparkData={t.showSparklines ? sparks.out : null}/>
-            <Metric label="Upper (DHW)" tone="hot" value={f1(temps?.dhwUpper)} unit="°C"
-                    hint="Domestic hot water tank · upper sensor"
-                    sub="hot water tank"
-                    onClick={() => openTrend("dhw")}
-                    sparkData={t.showSparklines ? sparks.upper : null}/>
-            <Metric label="Lower (RAD)" tone="warm" value={f1(temps?.lower)} unit="°C"
-                    hint="Radiator buffer tank · lower sensor"
-                    sub="radiator buffer"
-                    onClick={() => openTrend("dhw")}
-                    sparkData={t.showSparklines ? sparks.lower : null}/>
-          </div>
+      {/* Row 0 — Spot Prices · tariff + price level + chart */}
+      {visible("prices") && (
+      <div className="row full">
+        <Card icon="zap" title="Energy & Prices" {...cardProps("prices")}>
+          {(() => {
+            const tariffMode = gridResp?.tariff_mode;
+            const tariffVal  = tariffMode === "high" ? "High"
+                              : tariffMode === "low"  ? "Low"
+                              : "—";
+            const levelLabel = PRICE_LEVEL_LABELS[nowLevel] ?? "—";
+            const stats = pricesResp?.today?.spot_statistics;
+            const f2v   = v => (v != null ? v.toFixed(2) : "—");
+            return (
+              <>
+                <div className="mode-strip price-strip">
+                  <div className="status">
+                    <span className="lbl">Grid Tariff</span>
+                    <span className="sep">·</span>
+                    <span className={`val tariff-${tariffMode || "unknown"}`}>{tariffVal}</span>
+                  </div>
+                  <div className="status">
+                    <span className="lbl">Price Level</span>
+                    <span className="sep">·</span>
+                    <span className={`val price-level-${nowLevel || "unknown"}`}>{levelLabel}</span>
+                  </div>
+                  <div className="status">
+                    <span className="lbl">Min</span>
+                    <span className="sep">·</span>
+                    <span className="val">{f2v(stats?.min)}</span>
+                  </div>
+                  <div className="status">
+                    <span className="lbl">Max</span>
+                    <span className="sep">·</span>
+                    <span className="val">{f2v(stats?.max)}</span>
+                  </div>
+                  <div className="status">
+                    <span className="lbl">Avg</span>
+                    <span className="sep">·</span>
+                    <span className="val">{f2v(stats?.mean)}</span>
+                  </div>
+                </div>
+                <EnergyChart
+                  today={todayPrices}
+                  nowIndex={nowIdx}
+                  scheduledResumeAt={sgResp?.scheduled_resume_at}
+                  scheduledRunMinutes={sgResp?.run_minutes ?? proposedResume?.run_minutes}
+                  dhwBoost={dhwResp?.boost}
+                  height={narrow ? 140 : 200}
+                />
+              </>
+            );
+          })()}
         </Card>
+      </div>
+      )}
 
-        <Card icon="cog" title="Heating System"
-              actions={
-                <button className="sb-link" onClick={() => setStatsTab("heating")} aria-label="Open heating charts">
-                  <MultiSparkline series={[
-                    { data: hpFlow    ? window.bucketMinutely(hpFlow)    : null, color: "var(--hot)"   },
-                    { data: hpReturn  ? window.bucketMinutely(hpReturn)  : null, color: "var(--cold)"  },
-                    { data: hpOutdoor ? window.bucketMinutely(hpOutdoor) : null, color: "var(--text-3)"},
-                  ]}/>
-                </button>
-              }>
+      {/* Row 1 — Heating System (temperatures merged in) */}
+      {visible("heatingSystem") && (
+      <div className="row full">
+        <Card icon="cog" title="Heating System" {...cardProps("heatingSystem")}>
           {(() => {
             const dt = (heating?.flow != null && heating?.ret != null)
               ? heating.flow - heating.ret : null;
@@ -835,55 +906,152 @@ function App() {
             const statusClass = HEATING_STATUS_CLASS[heating?.status] ?? "off";
             return (
               <>
-                <div className="mode-row">
-                  <div className="left">
-                    <span className="lbl">Mode</span>
-                    <Tip hint="Auto / On / Off · controls heating circuit operation">
-                      <span className="mode-name">{heating?.modeLabel || "—"}</span>
-                    </Tip>
-                  </div>
-                  <div className={`status ${statusClass}`}>
-                    <span className="dot"/>
-                    <Tip hint="Status · Off / Vacation / Night / Heating">
-                      <span>{`Status · ${heating?.statusLabel || "—"}`}</span>
-                    </Tip>
-                  </div>
+                <div className="mode-strip">
+                  <Tip hint="Auto / On / Off · controls heating circuit operation">
+                    <div className={`status ${HEATING_MODE_CLASS[heating?.modeLabel] || ""}`}>
+                      <span className="lbl">Mode</span>
+                      <span className="sep">·</span>
+                      <span className="val">{heating?.modeLabel || "—"}</span>
+                    </div>
+                  </Tip>
+                  <Tip hint={whyHeating(heating?.status, temps?.outdoor, temps?.heatOffTemp)}>
+                    <div className={`status ${statusClass}`}>
+                      <span className="lbl">Status</span>
+                      <span className="sep">·</span>
+                      <span className="val">{heating?.statusLabel || "—"}</span>
+                    </div>
+                  </Tip>
+                  {pumpResp && !pumpMeta?.error && (() => {
+                    // Circulation pump state from the Homey integration. Hidden
+                    // when /pump returns 503 (Homey integration disabled).
+                    const on = pumpResp.on;
+                    const stale = !!pumpResp.stale;
+                    const valueLabel = on == null ? "?" : (on ? "On" : "Off");
+                    const stamp = pumpResp.last_observed_unix_secs;
+                    const ageText = stamp == null
+                      ? "not yet observed"
+                      : `updated ${Math.max(0, Math.floor(Date.now() / 1000 - stamp))} s ago`;
+                    const tip = stale
+                      ? `Circulation Pump · Homey unreachable (${ageText})`
+                      : `Circulation Pump · ${ageText}`;
+                    const cls = stale ? "warn" : on ? "on" : "off";
+                    return (
+                      <div className={`status ${cls}`} title={tip}>
+                        <span className="lbl">Circ. Pump</span>
+                        <span className="sep">·</span>
+                        <span className="val">{valueLabel}</span>
+                      </div>
+                    );
+                  })()}
                 </div>
                 <div className="kv-rows">
-                  <div className="kv-row">
-                    <Tip hint="Supply flow temperature to the heating circuit">
+                  <div className={`kv-row ${t.showSparklines && sparks.upper ? "with-spark" : ""}`}
+                       onClick={() => openTrend("dhw")} role="button" tabIndex={0}
+                       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("dhw"); } }}>
+                    <Tip hint="Domestic hot water tank · upper sensor">
+                      <span className="k">Upper (DHW)</span>
+                    </Tip>
+                    <span className="v">
+                      {f1(temps?.dhwUpper)}<span className="unit">°C</span>
+                      {temps?.dhwStopTemp != null && (
+                        <Tip hint="Setpoint (target)"><span className="v-sub">→ {f1(temps.dhwStopTemp)}°C</span></Tip>
+                      )}
+                    </span>
+                    {t.showSparklines && sparks.upper && (
+                      <span className="kv-spark"><Sparkline data={sparks.upper} color="var(--temp-dhw-upper)"/></span>
+                    )}
+                  </div>
+                  <div className={`kv-row ${t.showSparklines && sparks.lower ? "with-spark" : ""}`}
+                       onClick={() => openTrend("dhw")} role="button" tabIndex={0}
+                       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("dhw"); } }}>
+                    <Tip hint="Radiator buffer tank · lower sensor">
+                      <span className="k">Lower (RAD)</span>
+                    </Tip>
+                    <span className="v">{f1(temps?.lower)}<span className="unit">°C</span></span>
+                    {t.showSparklines && sparks.lower && (
+                      <span className="kv-spark"><Sparkline data={sparks.lower} color="var(--temp-dhw-lower)"/></span>
+                    )}
+                  </div>
+                  <div className={`kv-row ${t.showSparklines && sparks.room ? "with-spark" : ""}`}
+                       onClick={() => openTrend("room")} role="button" tabIndex={0}
+                       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("room"); } }}>
+                    <Tip hint="Indoor room temperature">
+                      <span className="k">Room</span>
+                    </Tip>
+                    <span className="v">
+                      {f1(temps?.room)}<span className="unit">°C</span>
+                      {temps?.setpoint != null && (
+                        <Tip hint="Setpoint (target)"><span className="v-sub">→ {f1(temps.setpoint)}°C</span></Tip>
+                      )}
+                    </span>
+                    {t.showSparklines && sparks.room && (
+                      <span className="kv-spark"><Sparkline data={sparks.room} color="var(--temp-room)"/></span>
+                    )}
+                  </div>
+                  <div className={`kv-row ${t.showSparklines && sparks.out ? "with-spark" : ""}`}
+                       onClick={() => openTrend("outdoor")} role="button" tabIndex={0}
+                       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("outdoor"); } }}>
+                    <Tip hint="Outdoor air temperature · heat turns off above the threshold">
+                      <span className="k">Outdoor</span>
+                    </Tip>
+                    <span className="v">
+                      {f1(temps?.outdoor)}<span className="unit">°C</span>
+                      {temps?.heatOffTemp != null && (
+                        <Tip hint="Heat-off threshold · heating disables above this outdoor temp"><span className="v-sub">Heat off above {f1(temps.heatOffTemp)}°C</span></Tip>
+                      )}
+                    </span>
+                    {t.showSparklines && sparks.out && (
+                      <span className="kv-spark"><Sparkline data={sparks.out} color="var(--temp-outdoor)"/></span>
+                    )}
+                  </div>
+                  <div className={`kv-row ${t.showSparklines && sparks.flow ? "with-spark" : ""}`}
+                       onClick={() => setStatsTab("heating")} role="button" tabIndex={0}
+                       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setStatsTab("heating"); } }}>
+                    <Tip hint="Supply flow temperature to the heating circuit · click for trend">
                       <span className="k">Flow</span>
                     </Tip>
-                    <span className="v">{f1(heating?.flow)}<span className="unit">°C</span></span>
+                    <span className="v">
+                      {f1(heating?.flow)}<span className="unit">°C</span>
+                      {heating?.flowSp != null && (
+                        <Tip hint="Heat-curve calculated supply target"><span className="v-sub">→ {f1(heating.flowSp)}°C</span></Tip>
+                      )}
+                    </span>
+                    {t.showSparklines && sparks.flow && (
+                      <span className="kv-spark"><Sparkline data={sparks.flow} color="var(--temp-flow)"/></span>
+                    )}
                   </div>
-                  <div className="kv-row">
-                    <Tip hint="Return temperature from the heating circuit">
+                  <div className={`kv-row ${t.showSparklines && sparks.ret ? "with-spark" : ""}`}
+                       onClick={() => setStatsTab("heating")} role="button" tabIndex={0}
+                       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setStatsTab("heating"); } }}>
+                    <Tip hint="Return temperature from the heating circuit · click for trend">
                       <span className="k">Return</span>
                     </Tip>
                     <span className="v">{f1(heating?.ret)}<span className="unit">°C</span></span>
+                    {t.showSparklines && sparks.ret && (
+                      <span className="kv-spark"><Sparkline data={sparks.ret} color="var(--temp-return)"/></span>
+                    )}
                   </div>
-                  <div className="kv-row">
-                    <Tip hint="Calculated supply setpoint based on heat curve">
-                      <span className="k">Flow SP</span>
-                    </Tip>
-                    <span className="v">{f1(heating?.flowSp)}<span className="unit">°C</span></span>
-                  </div>
-                  <div className="kv-row">
-                    <Tip hint="Difference between flow and return">
-                      <span className="k">ΔT</span>
-                    </Tip>
-                    <span className="v">{f1(dt)}<span className="unit">°C</span></span>
-                  </div>
+                  {!narrow && (
+                    <div className="kv-row">
+                      <Tip hint="Difference between flow and return">
+                        <span className="k">ΔT</span>
+                      </Tip>
+                      <span className="v">{f1(dt)}<span className="unit">°C</span></span>
+                    </div>
+                  )}
                 </div>
               </>
             );
           })()}
         </Card>
       </div>
+      )}
 
       {/* Row 2 — Heat Pump */}
+      {visible("heatPump") && (
       <div className="row full">
         <Card icon="bolt" title="Heat Pump"
+              {...cardProps("heatPump")}
               actions={
                 <div className="hp-state">
                   <Tip hint="Heat pump state"><Pill tone="on">{hp?.hpStatusLabel || "—"}</Pill></Tip>
@@ -895,35 +1063,68 @@ function App() {
                   </Tip>
                 </div>
               }>
-          <div className="metric-grid cols-4">
-            <Metric label="HP In"      tone="warm" value={f1(hp?.hpIn)}      unit="°C"
-                    hint="Heat pump inlet temperature (return from system)"
-                    onClick={() => openTrend("hp")}/>
-            <Metric label="HP Out"     tone="hot"  value={f1(hp?.hpOut)}     unit="°C"
-                    hint="Heat pump outlet temperature (supply to system)"
-                    onClick={() => openTrend("hp")}/>
-            <Metric label="Discharge"  tone="hot"  value={f1(hp?.discharge)} unit="°C"
-                    hint="Hot gas leaving the compressor"
-                    onClick={() => openTrend("gas")}/>
-            <Metric label="Suction"    tone="cool" value={f1(hp?.suction)}   unit="°C"
-                    hint="Cold gas returning to the compressor"
-                    onClick={() => openTrend("gas")}/>
-          </div>
-          <div style={{ height: 1, background: "var(--line)", margin: "12px 0" }}/>
-          <div className="metric-grid cols-3">
-            <Metric label="High P" value={f2(hp?.highP)} unit="bar"
-                    hint="Refrigerant high pressure (condenser side)"
-                    onClick={() => openTrend("pressure")}/>
-            <Metric label="Low P"  value={f2(hp?.lowP)}  unit="bar"
-                    hint="Refrigerant low pressure (evaporator side)"
-                    onClick={() => openTrend("pressure")}/>
-            <Metric label="Brine In → Out (ΔT)"
-                    value={(hp?.brineIn != null && hp?.brineOut != null)
-                      ? `${f1(hp.brineIn)} → ${f1(hp.brineOut)}` : "—"}
-                    unit={hp?.brineDelta != null ? `°C  · ΔT ${f1(hp.brineDelta)}°` : "°C"}
-                    hint="Brine loop · collector return → supply"
-                    onClick={() => openTrend("brine")}
-                    featured/>
+          <div className="kv-rows">
+            <div className="kv-row" onClick={() => openTrend("hp")} role="button" tabIndex={0}
+                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("hp"); } }}>
+              <Tip hint="Heat pump inlet temperature (return from system) · click for trend">
+                <span className="k">HP In</span>
+              </Tip>
+              <span className="v">{f1(hp?.hpIn)}<span className="unit">°C</span></span>
+            </div>
+            <div className="kv-row" onClick={() => openTrend("hp")} role="button" tabIndex={0}
+                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("hp"); } }}>
+              <Tip hint="Heat pump outlet temperature (supply to system) · click for trend">
+                <span className="k">HP Out</span>
+              </Tip>
+              <span className="v">{f1(hp?.hpOut)}<span className="unit">°C</span></span>
+            </div>
+            <div className="kv-row" onClick={() => openTrend("gas")} role="button" tabIndex={0}
+                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("gas"); } }}>
+              <Tip hint="Hot gas leaving the compressor · click for trend">
+                <span className="k">Discharge</span>
+              </Tip>
+              <span className="v">{f1(hp?.discharge)}<span className="unit">°C</span></span>
+            </div>
+            <div className="kv-row" onClick={() => openTrend("gas")} role="button" tabIndex={0}
+                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("gas"); } }}>
+              <Tip hint="Cold gas returning to the compressor · click for trend">
+                <span className="k">Suction</span>
+              </Tip>
+              <span className="v">{f1(hp?.suction)}<span className="unit">°C</span></span>
+            </div>
+            <div className="kv-row" onClick={() => openTrend("pressure")} role="button" tabIndex={0}
+                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("pressure"); } }}>
+              <Tip hint="Refrigerant high pressure (condenser side) · click for trend">
+                <span className="k">High P</span>
+              </Tip>
+              <span className="v">{f2(hp?.highP)}<span className="unit">bar</span></span>
+            </div>
+            <div className="kv-row" onClick={() => openTrend("pressure")} role="button" tabIndex={0}
+                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("pressure"); } }}>
+              <Tip hint="Refrigerant low pressure (evaporator side) · click for trend">
+                <span className="k">Low P</span>
+              </Tip>
+              <span className="v">{f2(hp?.lowP)}<span className="unit">bar</span></span>
+            </div>
+            <div className="kv-row" onClick={() => openTrend("brine")} role="button" tabIndex={0}
+                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("brine"); } }}>
+              <Tip hint="Brine loop · collector return → supply · click for trend">
+                <span className="k">Brine In</span>
+              </Tip>
+              <span className="v">{f1(hp?.brineIn)}<span className="unit">°C</span></span>
+            </div>
+            <div className="kv-row" onClick={() => openTrend("brine")} role="button" tabIndex={0}
+                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrend("brine"); } }}>
+              <Tip hint="Brine loop · supply temperature · click for trend">
+                <span className="k">
+                  Brine Out
+                  {hp?.brineDelta != null && (
+                    <span className="kv-note">ΔT {f1(hp.brineDelta)}°C</span>
+                  )}
+                </span>
+              </Tip>
+              <span className="v">{f1(hp?.brineOut)}<span className="unit">°C</span></span>
+            </div>
           </div>
           <div className="pumps">
             <PumpBar label="Charge Pump" pct={Math.round(hp?.chargePump ?? 0)}/>
@@ -931,10 +1132,13 @@ function App() {
           </div>
         </Card>
       </div>
+      )}
 
       {/* Row 3 — Statistics */}
+      {visible("stats") && (
       <div className="row full">
         <Card icon="chart" title="Heat Pump Statistics"
+              {...cardProps("stats")}
               banner={(() => {
                 const trk = hpStats?.tracking;
                 if (!trk) return "heating · — / — starts";
@@ -1006,10 +1210,12 @@ function App() {
           })()}
         </Card>
       </div>
+      )}
 
       {/* Row 4 — Energy & Prices */}
+      {visible("energy") && (
       <div className="row full">
-        <Card icon="zap" title="Energy & Prices">
+        <Card icon="zap" title="Consumption" {...cardProps("energy")}>
           {(() => {
             const tariffMode = gridResp?.tariff_mode;
             const tariffPill = tariffMode === "high" ? "High Tariff"
@@ -1017,16 +1223,14 @@ function App() {
                               : "—";
             const currentQuarterKwh = gridResp?.current_quarter_kwh;
             const peakAvg = gridResp?.monthly_peak_avg_kwh;
+            // Rolling-quarter kWh history for the inline sparkline. Backend
+            // emits up to 96 entries (24 h). Null until /grid lands.
+            const quarterSpark = gridResp?.consumption_15min?.length
+              ? gridResp.consumption_15min.map(e => e.kwh)
+              : null;
 
-            const todayPrices = pricesResp?.today?.prices || [];
-
-            const stats = pricesResp?.today?.spot_statistics;
-            const cur   = pricesResp?.current;
-            const nowSlotIdx = findPriceSlotAt(todayPrices, now);
-            const nowSlot = nowSlotIdx >= 0 ? todayPrices[nowSlotIdx] : null;
-            const nowHour = now.getHours();
-            const nowPrice = cur?.spot_sek ?? nowSlot?.spot_sek ?? null;
-            const nowLevel = cur?.level ?? nowSlot?.level;
+            const stats      = pricesResp?.today?.spot_statistics;
+            const nowHour    = now.getHours();
             const levelLabel = PRICE_LEVEL_LABELS[nowLevel] ?? "—";
 
             return (
@@ -1037,9 +1241,12 @@ function App() {
                     <span className="tariff-pill">{tariffPill}</span>
                   </div>
                   <div className="divider"/>
-                  <div className="energy-stat">
+                  <div className={`energy-stat ${t.showSparklines && quarterSpark ? "with-spark" : ""}`}>
                     <div className="lbl">Current Quarter</div>
                     <div className="val">{currentQuarterKwh != null ? currentQuarterKwh.toFixed(2) : "—"}<span className="unit">kWh</span></div>
+                    {t.showSparklines && quarterSpark && (
+                      <span className="es-spark"><Sparkline data={quarterSpark} tone="good"/></span>
+                    )}
                   </div>
                   <div className="energy-stat">
                     <div className="lbl">Peak Avg (top 3)</div>
@@ -1068,44 +1275,44 @@ function App() {
                   </div>
                 </div>
 
-                <div className="chart-head">
-                  <span>Spot · Nord Pool</span>
-                  <span className="nowprice">{`${clockStr.slice(0,5)} · ${nowPrice != null ? nowPrice.toFixed(2) : "—"} kr/kWh`}</span>
-                </div>
-                <EnergyChart
-                  today={todayPrices}
-                  nowIndex={nowIdx}
-                  scheduledResumeAt={sgResp?.scheduled_resume_at}
-                  scheduledRunMinutes={sgResp?.run_minutes ?? proposedResume?.run_minutes}
-                  dhwBoost={dhwResp?.boost}
-                  height={narrow ? 140 : 200}
-                />
               </>
             );
           })()}
         </Card>
       </div>
+      )}
 
       {/* Row 5 — Activity Timeline */}
+      {visible("activity") && (
       <div className="row full">
         <Card icon="pump" title="Activity · Last 24 h"
+              {...cardProps("activity")}
               banner={(() => {
                 const segs = activitySegs || [];
                 const totalH = segs.reduce((s, seg) => s + (seg.end - seg.start), 0);
                 return `compressor on ${totalH.toFixed(1)} h today`;
               })()}>
-          <ActivityTimeline segments={activitySegs || []} height={narrow ? 48 : 60}/>
-          <div className="legend">
-            <span className="leg"><i style={{ background: "var(--accent)" }}/> Heating circuit</span>
-            <span className="leg"><i style={{ background: "var(--hot)" }}/> Domestic hot water</span>
-            <span className="leg"><i style={{ background: "var(--cold)" }}/> Brine pump</span>
-          </div>
+          <details
+            className="chart-collapse"
+            open={chartCollapse.activityTimeline}
+            onToggle={e => setChartCollapse("activityTimeline", e.currentTarget.open)}
+          >
+            <summary><span>Compressor activity · 24h</span></summary>
+            <ActivityTimeline segments={activitySegs || []} height={narrow ? 48 : 60}/>
+            <div className="legend">
+              <span className="leg"><i style={{ background: "var(--cat-heating)" }}/> Heating circuit</span>
+              <span className="leg"><i style={{ background: "var(--cat-dhw)" }}/> Domestic hot water</span>
+              <span className="leg"><i style={{ background: "var(--cat-brine)" }}/> Brine pump</span>
+            </div>
+          </details>
         </Card>
       </div>
+      )}
 
       {/* Row 7 — Messages */}
+      {visible("messages") && (
       <div className="row full" id="messages-section">
-        <Card icon="msg" title="System Messages">
+        <Card icon="msg" title="System Messages" {...cardProps("messages")}>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {messages.length === 0 ? (
               <div className="alert info">
@@ -1130,6 +1337,7 @@ function App() {
           </div>
         </Card>
       </div>
+      )}
 
       <footer className="footer">
         <div>Last updated · {clockStr}</div>
@@ -1488,6 +1696,21 @@ function App() {
           <TweakToggle label="Sparklines on temperatures"
             value={t.showSparklines}
             onChange={v => setTweak("showSparklines", v)}/>
+        </TweakSection>
+        <TweakSection title="Cards on screen">
+          {[
+            ["prices",        "Energy & Prices"],
+            ["heatingSystem", "Heating System"],
+            ["heatPump",      "Heat Pump"],
+            ["stats",         "Statistics"],
+            ["energy",        "Consumption"],
+            ["activity",      "Activity timeline"],
+            ["messages",      "System messages"],
+          ].map(([key, label]) => (
+            <TweakToggle key={key} label={label}
+              value={cardVis[key] !== false}
+              onChange={v => setCardVis(key, v)}/>
+          ))}
         </TweakSection>
       </TweaksPanel>
     </div>
