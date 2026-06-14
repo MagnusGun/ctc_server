@@ -573,11 +573,7 @@ mod tests {
     #[test]
     fn test_cheapest_within_empty_state() {
         let state = PriceState::new("SE3".to_string());
-        assert!(
-            state
-                .cheapest_within(Duration::from_secs(8 * 3600))
-                .is_none()
-        );
+        assert!(state.cheapest_within(Duration::from_hours(8)).is_none());
     }
 
     #[test]
@@ -590,9 +586,7 @@ mod tests {
             slot(240, 0.30),
         ];
         state.update_prices(today, vec![]);
-        let pick = state
-            .cheapest_within(Duration::from_secs(8 * 3600))
-            .unwrap();
+        let pick = state.cheapest_within(Duration::from_hours(8)).unwrap();
         assert_float_eq(pick.spot_sek, 0.20, "cheapest spot");
     }
 
@@ -605,9 +599,7 @@ mod tests {
             slot(60, 0.40),
         ];
         state.update_prices(today, vec![]);
-        let pick = state
-            .cheapest_within(Duration::from_secs(8 * 3600))
-            .unwrap();
+        let pick = state.cheapest_within(Duration::from_hours(8)).unwrap();
         assert_float_eq(pick.spot_sek, 0.40, "ignores past, picks future min");
     }
 
@@ -620,9 +612,7 @@ mod tests {
             slot(600, 0.10), // 10h ahead — outside the 8h window even though cheapest
         ];
         state.update_prices(today, vec![]);
-        let pick = state
-            .cheapest_within(Duration::from_secs(8 * 3600))
-            .unwrap();
+        let pick = state.cheapest_within(Duration::from_hours(8)).unwrap();
         assert_float_eq(pick.spot_sek, 0.80, "stays inside window");
     }
 
@@ -632,9 +622,7 @@ mod tests {
         let today = vec![slot(30, 1.20), slot(60, 0.90)];
         let tomorrow = vec![slot(180, 0.25), slot(240, 0.75)];
         state.update_prices(today, tomorrow);
-        let pick = state
-            .cheapest_within(Duration::from_secs(8 * 3600))
-            .unwrap();
+        let pick = state.cheapest_within(Duration::from_hours(8)).unwrap();
         assert_float_eq(pick.spot_sek, 0.25, "tomorrow slot wins");
     }
 
@@ -655,8 +643,7 @@ mod tests {
     #[test]
     fn test_cheapest_run_within_empty_state() {
         let state = PriceState::new("SE3".to_string());
-        let result =
-            state.cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60));
+        let result = state.cheapest_run_within(Duration::from_hours(8), Duration::from_mins(30));
         assert!(result.is_none());
     }
 
@@ -674,7 +661,7 @@ mod tests {
         state.update_prices(today, vec![]);
 
         let pick = state
-            .cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60))
+            .cheapest_run_within(Duration::from_hours(8), Duration::from_mins(30))
             .unwrap();
         assert_float_eq(pick.spot_sek, 0.10, "run-B start should win");
     }
@@ -689,8 +676,7 @@ mod tests {
             slot(75, 0.10), // 75..90 — 30-min gap
         ];
         state.update_prices(today, vec![]);
-        let result =
-            state.cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60));
+        let result = state.cheapest_run_within(Duration::from_hours(8), Duration::from_mins(30));
         assert!(
             result.is_none(),
             "non-contiguous cheap slots must not combine"
@@ -709,7 +695,7 @@ mod tests {
         let today = make_run(30, &[0.10, 1.00, 0.10]);
         state.update_prices(today, vec![]);
         let pick = state
-            .cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60))
+            .cheapest_run_within(Duration::from_hours(8), Duration::from_mins(30))
             .unwrap();
         assert_float_eq(pick.spot_sek, 0.10, "first contiguous run wins on tie");
     }
@@ -720,8 +706,7 @@ mod tests {
         let state = PriceState::new("SE3".to_string());
         let today = make_run(30, &[0.20]);
         state.update_prices(today, vec![]);
-        let result =
-            state.cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60));
+        let result = state.cheapest_run_within(Duration::from_hours(8), Duration::from_mins(30));
         assert!(
             result.is_none(),
             "single 15-min slot cannot host 30-min run"
@@ -742,7 +727,7 @@ mod tests {
         )];
         state.update_prices(today, vec![]);
         let pick = state
-            .cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60))
+            .cheapest_run_within(Duration::from_hours(8), Duration::from_mins(30))
             .unwrap();
         assert_float_eq(pick.spot_sek, 0.15, "wider slot satisfies run on its own");
     }
@@ -756,7 +741,7 @@ mod tests {
         today.extend(make_run(30, &[0.20, 0.30])); // contiguous future run
         state.update_prices(today, vec![]);
         let pick = state
-            .cheapest_run_within(Duration::from_secs(8 * 3600), Duration::from_secs(30 * 60))
+            .cheapest_run_within(Duration::from_hours(8), Duration::from_mins(30))
             .unwrap();
         assert_float_eq(
             pick.spot_sek,
@@ -768,11 +753,7 @@ mod tests {
     #[test]
     fn test_cheap_window_end_no_data() {
         let state = PriceState::new("SE3".to_string());
-        assert!(
-            state
-                .cheap_window_end(Duration::from_secs(8 * 3600))
-                .is_none()
-        );
+        assert!(state.cheap_window_end(Duration::from_hours(8)).is_none());
     }
 
     #[test]
@@ -784,7 +765,7 @@ mod tests {
             slot_with_level(120, 0.11, PriceLevel::VeryCheap),
         ];
         state.update_prices(today, vec![]);
-        let window = Duration::from_secs(4 * 3600);
+        let window = Duration::from_hours(4);
         let result = state.cheap_window_end(window).unwrap();
         // Should be ~now + 4h. Allow small slack for test execution time.
         let now = SystemTime::now();
@@ -803,9 +784,7 @@ mod tests {
             slot_with_level(105, 0.80, PriceLevel::Expensive),
         ];
         state.update_prices(today, vec![]);
-        let result = state
-            .cheap_window_end(Duration::from_secs(4 * 3600))
-            .unwrap();
+        let result = state.cheap_window_end(Duration::from_hours(4)).unwrap();
         // Should be the start of the +75min slot.
         let target = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(75));
         let diff = result
@@ -823,9 +802,7 @@ mod tests {
             slot_with_level(45, 0.60, PriceLevel::Expensive),
         ];
         state.update_prices(today, vec![]);
-        let result = state
-            .cheap_window_end(Duration::from_secs(4 * 3600))
-            .unwrap();
+        let result = state.cheap_window_end(Duration::from_hours(4)).unwrap();
         let target = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(15));
         let diff = result
             .duration_since(target)
@@ -844,9 +821,7 @@ mod tests {
             slot(45, 0.30), // level = None
         ];
         state.update_prices(today, vec![]);
-        let result = state
-            .cheap_window_end(Duration::from_secs(4 * 3600))
-            .unwrap();
+        let result = state.cheap_window_end(Duration::from_hours(4)).unwrap();
         let target = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(45));
         let diff = result
             .duration_since(target)

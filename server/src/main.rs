@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = store_for_flush.flush() {
                     error!("First-boot store flush failed: {e}");
                 }
-                let mut tick = tokio::time::interval(Duration::from_secs(3600));
+                let mut tick = tokio::time::interval(Duration::from_hours(1));
                 tick.tick().await; // consume the immediate first tick
                 loop {
                     tokio::select! {
@@ -625,7 +625,7 @@ async fn shutdown_signal() {
 /// `fetch_hour_local` (default 14:00, one-hour cushion), and on failure
 /// retry every 15 min until both today + tomorrow populate or local
 /// midnight, whichever comes first.
-const PRICE_FETCH_RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const PRICE_FETCH_RETRY_INTERVAL: Duration = Duration::from_mins(15);
 
 /// Background task for fetching electricity spot prices from elprisetjustnu.se.
 ///

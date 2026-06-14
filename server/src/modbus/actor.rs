@@ -230,7 +230,7 @@ struct RateWindow {
 }
 
 impl RateWindow {
-    const MAX_AGE: Duration = Duration::from_secs(300);
+    const MAX_AGE: Duration = Duration::from_mins(5);
 
     pub fn push(&mut self, now: Instant) {
         // Evict anything outside the longest window. Use checked_duration_since
@@ -355,8 +355,7 @@ pub(crate) struct ModbusStats {
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Saturating cast of a `Duration` to a `u32` count of milliseconds.
@@ -2207,8 +2206,8 @@ mod tests {
 
         // Counts grow with window size, monotone.
         let c10 = win.count_within(Duration::from_secs(10));
-        let c60 = win.count_within(Duration::from_secs(60));
-        let c300 = win.count_within(Duration::from_secs(300));
+        let c60 = win.count_within(Duration::from_mins(1));
+        let c300 = win.count_within(Duration::from_mins(5));
         assert!(c10 <= c60, "count_within must be monotone (10s <= 60s)");
         assert!(c60 <= c300, "count_within must be monotone (60s <= 300s)");
         assert!(c10 >= 10, "10s window should see the ten ≤5s entries");
@@ -2219,7 +2218,7 @@ mod tests {
         // Eviction: push a timestamp 6 min ahead and confirm all old
         // entries fall off. (Using "now + 6min" via push to drive eviction
         // against the ceiling.)
-        let future = now + Duration::from_secs(360);
+        let future = now + Duration::from_mins(6);
         win.push(future);
         // After eviction, only entries from `future` minus 5 min onward
         // remain. The injected entries (clustered around `now`) are all

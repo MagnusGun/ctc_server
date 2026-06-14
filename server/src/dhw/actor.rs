@@ -1982,7 +1982,7 @@ mod tests {
         // watcher's 60s ticks (consume immediate first + tick) need a couple
         // of yields to evaluate, but a single large advance + yield works
         // because the timer-expiry check fires on the first real tick.
-        tokio::time::advance(std::time::Duration::from_secs(2 * 1800)).await;
+        tokio::time::advance(std::time::Duration::from_hours(1)).await;
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 

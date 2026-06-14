@@ -22,7 +22,7 @@ const TIBBER_API_URL: &str = "https://api.tibber.com/v1-beta/gql";
 const USER_AGENT: &str = "CTC-Server/1.0";
 /// Read timeout for WebSocket messages. Tibber sends keep-alive every ~30-60s,
 /// so 120s allows 2-4 missed keep-alives before declaring connection dead.
-const WS_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const WS_READ_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// GraphQL subscription message format
 #[derive(Debug, Serialize)]
@@ -152,7 +152,7 @@ pub async fn run_websocket_loop(
     // Exponential backoff for connection failures, capped at 5 minutes.
     // Resets to the base delay after any successful connect.
     let base_delay = Duration::from_secs(10);
-    let max_delay = Duration::from_secs(300);
+    let max_delay = Duration::from_mins(5);
     let mut delay = base_delay;
     loop {
         if cancel.is_cancelled() {

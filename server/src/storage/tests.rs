@@ -90,7 +90,7 @@ fn record_sample_drops_non_finite() {
 fn ring_drops_older_than_retention() {
     let (_dir, store) = tmp_db();
     let now = SystemTime::now();
-    let old = now - std::time::Duration::from_secs(25 * 3600);
+    let old = now - std::time::Duration::from_hours(25);
     store.record_sample(Sensor::Room, old, 10.0).unwrap();
     store.record_sample(Sensor::Room, now, 20.0).unwrap();
     let pts = store.series_range(Sensor::Room, 0, i64::MAX);
@@ -423,7 +423,7 @@ fn open_bucket_not_finalized_until_minute_closes() {
     // wall-clock minute boundary rolling over between record_sample and
     // flush. flush() must leave this open bucket in pending and write
     // nothing to SERIES_MINUTES.
-    let future = SystemTime::now() + std::time::Duration::from_secs(60);
+    let future = SystemTime::now() + std::time::Duration::from_mins(1);
     {
         let store = Store::open(&path).unwrap();
         store.record_sample(Sensor::Room, future, 19.0).unwrap();

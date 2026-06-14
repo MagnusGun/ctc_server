@@ -79,7 +79,7 @@ pub async fn run_bath_watcher(
     event_tx: mpsc::Sender<BathWatcherEvent>,
     notify_done: oneshot::Sender<CancelReason>,
 ) {
-    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    let mut tick = tokio::time::interval(Duration::from_mins(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consume the immediate first tick so the first eval lands at +60s.
     let _ = tick.tick().await;
@@ -182,7 +182,7 @@ mod tests {
         let (done_tx, done_rx) = oneshot::channel();
         let handle = tokio::spawn(run_shower_watcher(
             boost_tx.clone(),
-            Duration::from_secs(1800),
+            Duration::from_mins(30),
             done_tx,
         ));
         tokio::time::advance(Duration::from_secs(1801)).await;
@@ -300,7 +300,7 @@ mod tests {
         let started_at = tokio::time::Instant::now();
 
         let handle = tokio::spawn(run_bath_watcher(
-            Duration::from_secs(120), // 2 minutes
+            Duration::from_mins(2), // 2 minutes
             started_at,
             false,
             modbus,
@@ -338,7 +338,7 @@ mod tests {
         let started_at = tokio::time::Instant::now();
 
         let handle = tokio::spawn(run_bath_watcher(
-            Duration::from_secs(3600), // 1h — well beyond first tick
+            Duration::from_hours(1), // 1h — well beyond first tick
             started_at,
             false,
             modbus,
@@ -376,7 +376,7 @@ mod tests {
         let started_at = tokio::time::Instant::now();
 
         let handle = tokio::spawn(run_bath_watcher(
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             started_at,
             false,
             modbus,
@@ -414,7 +414,7 @@ mod tests {
 
         // Initial gate state: disengaged. The first tick should engage it.
         let handle = tokio::spawn(run_bath_watcher(
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             started_at,
             false,
             modbus,
@@ -467,7 +467,7 @@ mod tests {
 
         // Initial gate state: engaged. The first tick should disengage it.
         let handle = tokio::spawn(run_bath_watcher(
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             started_at,
             true,
             modbus,

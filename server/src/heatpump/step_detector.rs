@@ -141,8 +141,7 @@ pub async fn run_recorder_loop(store: Store, poll_interval_secs: u64, cancel: Ca
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Seconds elapsed since `start_unix`. Returns [`u32::MAX`] as a sentinel when

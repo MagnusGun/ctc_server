@@ -425,7 +425,7 @@ impl SmartGridActor {
                 if remaining.is_zero() {
                     break;
                 }
-                let step = remaining.min(Duration::from_secs(60));
+                let step = remaining.min(Duration::from_mins(1));
                 tokio::time::sleep(step).await;
             }
             // If the channel is closed (actor shut down) or this task has
