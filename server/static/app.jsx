@@ -507,7 +507,7 @@ function App() {
   // Fetch server version once on mount.
   useEffect(() => {
     window.api.getVersion()
-      .then(r => setVersion(r?.version))
+      .then(r => setVersion(r))
       .catch(() => {});
   }, []);
 
@@ -1135,10 +1135,10 @@ function App() {
         <div>Last updated · {clockStr}</div>
         <div className="right">
           <span className="refresh"><span className="ring"/> Auto-refresh {Math.round(window.POLL_LIVE / 1000)}s</span>
-          {version && (
+          {version?.version && (
             <>
               <span style={{ color: "var(--line-2)" }}>·</span>
-              <span>v{version}</span>
+              <span>v{version.version}{version.git_hash ? ` (${version.git_hash})` : ""}</span>
             </>
           )}
         </div>

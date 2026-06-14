@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
       platforms:
         - linux/arm64
+      args:
+        GIT_HASH: ${GIT_HASH:-unknown}
     image: ctc_server:latest
     container_name: ctc_server
     platform: linux/arm64

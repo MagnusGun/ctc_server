@@ -538,7 +538,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = app
         .route(
             "/api/v1/version",
-            get(|| async { concat!("{\"version\": \"", env!("CARGO_PKG_VERSION"), "\"}\n") }),
+            get(|| async {
+                concat!(
+                    "{\"version\": \"",
+                    env!("CARGO_PKG_VERSION"),
+                    "\", \"git_hash\": \"",
+                    env!("GIT_HASH"),
+                    "\"}\n"
+                )
+            }),
         )
         // Static file serving for web dashboard
         .nest_service("/static", ServeDir::new(static_dir()))

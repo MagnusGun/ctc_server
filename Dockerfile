@@ -63,6 +63,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY server/Cargo.toml ./server/
 COPY server/src ./server/src
 
+# Inject the git short hash — the .git dir is not in the build context, so
+# build.rs cannot run `git rev-parse` here; the deploy passes it via --build-arg.
+ARG GIT_HASH=unknown
+ENV GIT_HASH=${GIT_HASH}
+
 # Build the release binary and strip it
 RUN cargo build --release --target aarch64-unknown-linux-gnu -p server \
     && aarch64-linux-gnu-strip /app/target/aarch64-unknown-linux-gnu/release/server
