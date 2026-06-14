@@ -145,6 +145,14 @@ The server serves a real-time status dashboard from `server/static/`:
 - **app.js**: JavaScript for fetching API data, updating the DOM, and handling user interactions
 - **style.css**: Dark theme styling with responsive design for mobile
 
+**Mobile is the canonical experience.** The compact mobile layout (the `≤480px`
+`useIsNarrow` path) is the primary target: design and verify dashboard changes at a phone
+viewport first. The wide desktop multi-column layout is a progressive enhancement that must
+never regress the mobile view. The dashboard ships PWA install metadata
+(`manifest.webmanifest`, theme-color + apple meta, `icon-*.png`) so the mobile view installs
+as a standalone home-screen webview; there is intentionally **no service worker** (a
+live-data dashboard must not serve stale cached readings).
+
 ### Persistence
 
 Heat-pump statistics survive restarts when `[heatpump_stats] persist_path` is set (or via `CTC_HEATPUMP_STATS_PERSIST_PATH`):
