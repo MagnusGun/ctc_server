@@ -1,4 +1,5 @@
 {
+  "id": "ctc-heating",
   "name": "CTC Heating",
   "short_name": "CTC",
   "start_url": "/static/index.html",
