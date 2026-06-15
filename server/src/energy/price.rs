@@ -25,6 +25,13 @@ struct PriceStateInner {
     price_zone: String,
 }
 
+/// A scored contiguous run produced by `runs_within`.
+struct RunInfo {
+    start: PricePoint,
+    end: chrono::DateTime<chrono::FixedOffset>,
+    avg: f64,
+}
+
 /// A single spot price point
 #[derive(Clone, Debug, Serialize)]
 pub struct PricePoint {
@@ -54,6 +61,20 @@ pub enum PriceLevel {
     Normal,
     Expensive,
     VeryExpensive,
+}
+
+/// One candidate auto-resume run for the picker: a contiguous stretch of
+/// length `run_duration` whose start the user may schedule a resume at.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResumeCandidate {
+    /// Run start (ISO 8601) — the schedulable resume instant.
+    pub starts_at: String,
+    /// Run end (ISO 8601) — start + accumulated slot durations.
+    pub ends_at: String,
+    /// Duration-weighted mean spot price over the run (SEK/kWh).
+    pub avg_spot_sek: f64,
+    /// Start slot's price level (drives the dashboard badge color).
+    pub level: Option<PriceLevel>,
 }
 
 /// Statistics for a set of prices
@@ -324,24 +345,39 @@ impl PriceState {
     /// Used for Blocking-mode `SmartGrid` auto-resume: we want the heater to
     /// resume into a cheap stretch that lasts long enough for an actual
     /// recovery cycle, not just the single cheapest 15-min tick.
-    // i64 seconds → f64 for the weighted-average accumulation. Slot
-    // durations are bounded (a day's worth fits in ~86_400 s, well inside
-    // f64's 2^53 exact-integer range), so the precision-loss lint is moot.
-    #[allow(clippy::cast_precision_loss)]
     pub fn cheapest_run_within(
         &self,
         window: Duration,
         run_duration: Duration,
     ) -> Option<PricePoint> {
-        let inner = self.inner.lock().unwrap();
+        self.runs_within(window, run_duration)
+            .into_iter()
+            .min_by(|a, b| {
+                a.avg
+                    .partial_cmp(&b.avg)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|r| r.start)
+    }
 
+    /// All qualifying runs of length `run_duration` whose start is inside
+    /// `window`, each scored by duration-weighted average `spot_sek`. Shared
+    /// by `cheapest_run_within` (single best) and `cheapest_runs_within`
+    /// (ranked list). Adjacency is exact (`slots[i].ends_at == slots[i+1].starts_at`).
+    #[allow(clippy::cast_precision_loss)]
+    fn runs_within(&self, window: Duration, run_duration: Duration) -> Vec<RunInfo> {
+        let inner = self.inner.lock().unwrap();
         let now = chrono::Utc::now();
-        let cutoff = now + chrono::Duration::from_std(window).ok()?;
-        let target_secs = i64::try_from(run_duration.as_secs()).ok()?;
+        let Ok(chrono_window) = chrono::Duration::from_std(window) else {
+            return Vec::new();
+        };
+        let cutoff = now + chrono_window;
+        let Ok(target_secs) = i64::try_from(run_duration.as_secs()) else {
+            return Vec::new();
+        };
 
         let slots: Vec<&PricePoint> = inner.today.iter().chain(inner.tomorrow.iter()).collect();
-
-        let mut best: Option<(f64, PricePoint)> = None;
+        let mut runs: Vec<RunInfo> = Vec::new();
         for i in 0..slots.len() {
             let start_slot = slots[i];
             let Ok(start) = chrono::DateTime::parse_from_rfc3339(&start_slot.starts_at) else {
@@ -354,8 +390,8 @@ impl PriceState {
             let mut total_secs: i64 = 0;
             let mut weighted_sum: f64 = 0.0;
             let mut prev_end: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+            let mut run_end: Option<chrono::DateTime<chrono::FixedOffset>> = None;
             let mut covered = false;
-
             for slot in &slots[i..] {
                 let (Ok(s), Ok(e)) = (
                     chrono::DateTime::parse_from_rfc3339(&slot.starts_at),
@@ -375,22 +411,66 @@ impl PriceState {
                 total_secs += secs;
                 weighted_sum += slot.spot_sek * (secs as f64);
                 prev_end = Some(e);
+                run_end = Some(e);
                 if total_secs >= target_secs {
                     covered = true;
                     break;
                 }
             }
 
-            if covered && total_secs > 0 {
-                let avg = weighted_sum / (total_secs as f64);
-                let better = best.as_ref().is_none_or(|(best_avg, _)| avg < *best_avg);
-                if better {
-                    best = Some((avg, start_slot.clone()));
-                }
+            if let (true, Some(end)) = (covered && total_secs > 0, run_end) {
+                runs.push(RunInfo {
+                    start: start_slot.clone(),
+                    end,
+                    avg: weighted_sum / (total_secs as f64),
+                });
             }
         }
+        runs
+    }
 
-        best.map(|(_, slot)| slot)
+    /// Top-`k` cheapest **non-overlapping** runs of length `run_duration`
+    /// inside `window`, cheapest first. Greedy: take the cheapest run, drop
+    /// every run overlapping it, repeat. Backs the dashboard resume picker.
+    pub fn cheapest_runs_within(
+        &self,
+        window: Duration,
+        run_duration: Duration,
+        k: usize,
+    ) -> Vec<ResumeCandidate> {
+        let mut runs = self.runs_within(window, run_duration);
+        runs.sort_by(|a, b| {
+            a.avg
+                .partial_cmp(&b.avg)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut chosen: Vec<(
+            chrono::DateTime<chrono::FixedOffset>,
+            chrono::DateTime<chrono::FixedOffset>,
+        )> = Vec::new();
+        let mut out: Vec<ResumeCandidate> = Vec::new();
+        for run in runs {
+            if out.len() >= k {
+                break;
+            }
+            let Ok(start) = chrono::DateTime::parse_from_rfc3339(&run.start.starts_at) else {
+                continue;
+            };
+            let end = run.end;
+            let overlaps = chosen.iter().any(|(s, e)| start < *e && *s < end);
+            if overlaps {
+                continue;
+            }
+            chosen.push((start, end));
+            out.push(ResumeCandidate {
+                starts_at: run.start.starts_at.clone(),
+                ends_at: end.to_rfc3339(),
+                avg_spot_sek: run.avg,
+                level: run.start.level,
+            });
+        }
+        out
     }
 }
 
@@ -790,6 +870,73 @@ mod tests {
             pick.spot_sek,
             0.20,
             "run must start at first future slot, not the past one",
+        );
+    }
+
+    #[test]
+    fn cheapest_runs_within_returns_non_overlapping_ranked() {
+        let state = PriceState::new("SE3".to_string());
+        let mut today = make_run(60, &[0.30, 0.30]); // run A avg 0.30
+        today.extend(make_run(180, &[0.10, 0.10])); // run B avg 0.10 (cheapest)
+        today.extend(make_run(300, &[0.20, 0.20])); // run C avg 0.20
+        state.update_prices(today, vec![]);
+
+        let runs = state.cheapest_runs_within(Duration::from_hours(12), Duration::from_mins(30), 6);
+        assert_eq!(runs.len(), 3);
+        assert_float_eq(runs[0].avg_spot_sek, 0.10, "cheapest first");
+        assert_float_eq(runs[1].avg_spot_sek, 0.20, "second cheapest");
+        assert_float_eq(runs[2].avg_spot_sek, 0.30, "third");
+        assert!(runs.iter().all(|r| !r.starts_at.is_empty()));
+    }
+
+    #[test]
+    fn cheapest_runs_within_collapses_overlaps_and_caps_k() {
+        let state = PriceState::new("SE3".to_string());
+        let today = make_run(30, &[0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]);
+        state.update_prices(today, vec![]);
+
+        let runs = state.cheapest_runs_within(Duration::from_hours(12), Duration::from_mins(30), 6);
+        assert_eq!(runs.len(), 4); // 120 min / 30 min = 4 disjoint runs
+        for w in runs.windows(2) {
+            assert!(w[0].ends_at <= w[1].starts_at, "runs must be disjoint");
+        }
+    }
+
+    #[test]
+    fn cheapest_runs_within_empty_when_no_prices() {
+        let state = PriceState::new("SE3".to_string());
+        let runs = state.cheapest_runs_within(Duration::from_hours(12), Duration::from_mins(30), 6);
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn cheapest_runs_within_caps_at_k() {
+        let state = PriceState::new("SE3".to_string());
+        // 7 disjoint 30-min runs (14 contiguous 15-min slots); request k=3.
+        let today = make_run(30, &[0.10; 14]);
+        state.update_prices(today, vec![]);
+        let runs = state.cheapest_runs_within(Duration::from_hours(12), Duration::from_mins(30), 3);
+        assert_eq!(runs.len(), 3, "k cap must be respected");
+    }
+
+    #[test]
+    fn cheapest_runs_within_skips_cheaper_overlapping_run() {
+        let state = PriceState::new("SE3".to_string());
+        // Contiguous block where the two cheapest 30-min runs overlap each
+        // other: [60-90]=avg 0.055 and [75-105]=avg 0.065.
+        let mut today = make_run(60, &[0.05, 0.06, 0.07]);
+        // Plus a disjoint, more expensive run: [180-210]=avg 0.20.
+        today.extend(make_run(180, &[0.20, 0.20]));
+        state.update_prices(today, vec![]);
+        let runs = state.cheapest_runs_within(Duration::from_hours(12), Duration::from_mins(30), 6);
+        // Greedy picks [60-90]=0.055, skips the overlapping [75-105]=0.065,
+        // then keeps the disjoint 0.20 run.
+        assert_eq!(runs.len(), 2);
+        assert_float_eq(runs[0].avg_spot_sek, 0.055, "cheapest non-overlap first");
+        assert_float_eq(
+            runs[1].avg_spot_sek,
+            0.20,
+            "overlapping 0.065 skipped for disjoint 0.20",
         );
     }
 

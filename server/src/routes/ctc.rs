@@ -174,7 +174,7 @@ async fn set_power_save(
     };
 
     let fires_at = handle
-        .set_mode(mode, params.schedule_resume)
+        .set_mode(mode, params.schedule_resume, None)
         .await
         .map_err(map_smartgrid_error)?;
 

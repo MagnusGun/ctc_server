@@ -55,6 +55,10 @@ pub fn routes(
             get(get_proposed_resume),
         )
         .route(
+            "/api/v1/smartgrid/resume_candidates",
+            get(get_resume_candidates),
+        )
+        .route(
             "/api/v1/smartgrid/scheduled_resume",
             delete(delete_scheduled_resume),
         )
@@ -66,6 +70,11 @@ struct SmartGridQuery {
     mode: String,
     #[serde(default)]
     schedule_resume: bool,
+    /// Optional explicit resume instant (ISO 8601). When present with
+    /// `schedule_resume=true`, schedules the auto-flip at exactly this time
+    /// instead of the cheapest-run auto-pick. Must be in the future.
+    #[serde(default)]
+    resume_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +108,11 @@ struct ProposedResumeResponse {
     run_minutes: u16,
 }
 
+#[derive(Debug, Serialize)]
+struct ResumeCandidatesResponse {
+    candidates: Vec<crate::energy::price::ResumeCandidate>,
+}
+
 /// Set `SmartGrid` mode via GPIO.
 ///
 /// `POST /api/v1/smartgrid?mode=blocking&schedule_resume=true`
@@ -129,8 +143,30 @@ async fn set_smartgrid(
         ApiError::BadRequest
     })?;
 
+    let resume_at = match query.resume_at.as_deref() {
+        Some(s) => {
+            let parsed = DateTime::parse_from_rfc3339(s).map_err(|e| {
+                error!("set_smartgrid: bad resume_at '{s}': {e}");
+                ApiError::BadRequest
+            })?;
+            let when = std::time::SystemTime::from(parsed.with_timezone(&Utc));
+            // Allow a 60s grace: the cheapest slot can start at the next
+            // 15-min boundary, only seconds out, so dialog dwell-time must not
+            // turn a valid pick into a 400. A just-passed pick schedules an
+            // effectively-immediate resume (the actor treats a non-future
+            // fires_at as fire-now). Reject only clearly-stale timestamps.
+            let grace = std::time::Duration::from_mins(1);
+            if when + grace <= std::time::SystemTime::now() {
+                error!("set_smartgrid: resume_at '{s}' is more than 60s in the past");
+                return Err(ApiError::BadRequest);
+            }
+            Some(when)
+        }
+        None => None,
+    };
+
     let fires_at = handle
-        .set_mode(mode, query.schedule_resume)
+        .set_mode(mode, query.schedule_resume, resume_at)
         .await
         .map_err(map_smartgrid_error)?;
 
@@ -216,6 +252,30 @@ async fn get_proposed_resume(State(state): State<SmartGridState>) -> Result<Stri
         })
 }
 
+/// Ranked, non-overlapping cheap resume runs in the configured window.
+/// Read-only; drives the dashboard resume-slot picker. Empty array (200)
+/// when no price data — an empty list is a valid "nothing to pick" state.
+///
+/// `GET /api/v1/smartgrid/resume_candidates`
+async fn get_resume_candidates(State(state): State<SmartGridState>) -> Result<String, ApiError> {
+    let window =
+        std::time::Duration::from_secs(state.config.auto_resume_window_hours.saturating_mul(3600));
+    let run_duration = std::time::Duration::from_secs(
+        u64::from(state.config.auto_resume_min_duration_minutes).saturating_mul(60),
+    );
+    let candidates = state
+        .price_state
+        .cheapest_runs_within(window, run_duration, 6);
+
+    let response = ResumeCandidatesResponse { candidates };
+    serde_json::to_string(&response)
+        .map(|s| format!("{s}\n"))
+        .map_err(|e| {
+            error!("get_resume_candidates: JSON serialization error - {e}");
+            ApiError::InternalError
+        })
+}
+
 /// Cancel any pending auto-resume without changing the current `SmartGrid` mode.
 ///
 /// Idempotent — calling this when no schedule exists returns `204 No Content`.
@@ -293,6 +353,7 @@ mod tests {
         let query = SmartGridQuery {
             mode: "blocking".to_string(),
             schedule_resume: false,
+            resume_at: None,
         };
         let result = set_smartgrid(State(state), Query(query)).await;
         assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
@@ -304,6 +365,7 @@ mod tests {
         let query = SmartGridQuery {
             mode: "invalid_mode".to_string(),
             schedule_resume: false,
+            resume_at: None,
         };
         // With no GPIO, we get ServiceUnavailable before mode validation.
         let result = set_smartgrid(State(state), Query(query)).await;
@@ -376,6 +438,113 @@ mod tests {
             0.10,
             "preview returns run-start, not isolated 0.02 slot",
         );
+    }
+
+    #[tokio::test]
+    async fn test_resume_candidates_returns_ranked_runs() {
+        let price_state = PriceState::new("SE3".to_string());
+        let mut today = crate::energy::price::test_support::make_run(60, &[0.30, 0.30]);
+        today.extend(crate::energy::price::test_support::make_run(
+            180,
+            &[0.10, 0.10],
+        ));
+        price_state.update_prices(today, vec![]);
+        let state = SmartGridState {
+            handle: None,
+            price_state,
+            config: test_config(),
+        };
+
+        let result = get_resume_candidates(State(state)).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
+        let cands = parsed["candidates"].as_array().expect("candidates array");
+        assert_eq!(cands.len(), 2);
+        assert_float_eq(
+            cands[0]["avg_spot_sek"].as_f64().unwrap(),
+            0.10,
+            "cheapest first",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resume_candidates_empty_without_prices() {
+        let state = create_state_without_handle();
+        let result = get_resume_candidates(State(state)).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
+        assert_eq!(parsed["candidates"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_smartgrid_past_resume_at_is_bad_request() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) =
+            spawn_with_test_gpio(PriceState::new("SE3".to_string()), test_config(), cancel);
+        let state = SmartGridState {
+            handle: Some(handle),
+            price_state: PriceState::new("SE3".to_string()),
+            config: test_config(),
+        };
+        let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let query = SmartGridQuery {
+            mode: "blocking".to_string(),
+            schedule_resume: true,
+            resume_at: Some(past),
+        };
+        let result = set_smartgrid(State(state), Query(query)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn test_set_smartgrid_future_resume_at_passes_validation() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) =
+            spawn_with_test_gpio(PriceState::new("SE3".to_string()), test_config(), cancel);
+        let state = SmartGridState {
+            handle: Some(handle),
+            price_state: PriceState::new("SE3".to_string()),
+            config: test_config(),
+        };
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let query = SmartGridQuery {
+            mode: "blocking".to_string(),
+            schedule_resume: true,
+            resume_at: Some(future),
+        };
+        let result = set_smartgrid(State(state), Query(query)).await;
+        // Validation passed (not BadRequest). The test GPIO can't write
+        // Blocking, so the error — if any — is InternalError, never BadRequest.
+        if let Err(e) = result {
+            assert!(
+                matches!(e, ApiError::InternalError),
+                "expected InternalError from test GPIO, not BadRequest"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_smartgrid_recent_past_resume_at_within_grace_ok() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) =
+            spawn_with_test_gpio(PriceState::new("SE3".to_string()), test_config(), cancel);
+        let state = SmartGridState {
+            handle: Some(handle),
+            price_state: PriceState::new("SE3".to_string()),
+            config: test_config(),
+        };
+        // 10s in the past — inside the 60s grace, must NOT be BadRequest.
+        let recent = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        let query = SmartGridQuery {
+            mode: "blocking".to_string(),
+            schedule_resume: true,
+            resume_at: Some(recent),
+        };
+        let result = set_smartgrid(State(state), Query(query)).await;
+        if let Err(e) = result {
+            assert!(
+                matches!(e, ApiError::InternalError),
+                "within-grace pick must pass validation, not 400"
+            );
+        }
     }
 
     #[tokio::test]

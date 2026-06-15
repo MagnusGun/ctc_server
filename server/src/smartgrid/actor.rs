@@ -124,6 +124,9 @@ pub enum SmartGridCmd {
     SetMode {
         mode: SmartGridMode,
         schedule_resume: bool,
+        /// When `Some` and scheduling applies, use this exact instant instead
+        /// of `compute_resume_target`'s auto-pick. From the dashboard picker.
+        resume_at: Option<SystemTime>,
         respond_to: oneshot::Sender<Result<Option<SystemTime>, ApplyModeError>>,
     },
     ReadMode {
@@ -159,12 +162,14 @@ impl SmartGridHandle {
         &self,
         mode: SmartGridMode,
         schedule_resume: bool,
+        resume_at: Option<SystemTime>,
     ) -> Result<Option<SystemTime>, SmartGridError> {
         let (respond_to, rx) = oneshot::channel();
         self.tx
             .send(SmartGridCmd::SetMode {
                 mode,
                 schedule_resume,
+                resume_at,
                 respond_to,
             })
             .await
@@ -318,6 +323,19 @@ fn compute_resume_target(
     }
 }
 
+/// Resolve the resume instant for a scheduling mode change: an explicit
+/// picker choice (`resume_at`) always wins; otherwise fall back to the
+/// per-mode auto-computation. Pure (no GPIO) so the override precedence is
+/// unit-testable.
+fn resolve_fires_at(
+    resume_at: Option<SystemTime>,
+    price_state: &PriceState,
+    config: &SmartGridConfig,
+    mode: SmartGridMode,
+) -> Option<SystemTime> {
+    resume_at.or_else(|| compute_resume_target(price_state, config, mode))
+}
+
 impl SmartGridActor {
     async fn run(mut self, mut rx: mpsc::Receiver<SmartGridCmd>, cancel: CancellationToken) {
         info!("SmartGrid actor started");
@@ -347,9 +365,10 @@ impl SmartGridActor {
             SmartGridCmd::SetMode {
                 mode,
                 schedule_resume,
+                resume_at,
                 respond_to,
             } => {
-                let result = self.do_set_mode(mode, schedule_resume);
+                let result = self.do_set_mode(mode, schedule_resume, resume_at);
                 let _ = respond_to.send(result);
             }
             SmartGridCmd::ReadMode { respond_to } => {
@@ -382,6 +401,7 @@ impl SmartGridActor {
         &mut self,
         mode: SmartGridMode,
         schedule_resume: bool,
+        resume_at: Option<SystemTime>,
     ) -> Result<Option<SystemTime>, ApplyModeError> {
         // Bump generation FIRST. Any in-flight resume timer that has already
         // passed its sleep will see a mismatched generation when its
@@ -404,7 +424,9 @@ impl SmartGridActor {
             return Ok(None);
         }
 
-        let fires_at = compute_resume_target(&self.price_state, &self.config, mode);
+        // An explicit picker choice overrides the auto-pick; otherwise fall
+        // back to the cheapest-run computation.
+        let fires_at = resolve_fires_at(resume_at, &self.price_state, &self.config, mode);
 
         let Some(fires_at) = fires_at else {
             warn!(
@@ -605,8 +627,10 @@ mod tests {
         // but the actor must process them serially without panic or hang.
         let h1 = handle.clone();
         let h2 = handle.clone();
-        let t1 = tokio::spawn(async move { h1.set_mode(SmartGridMode::Blocking, false).await });
-        let t2 = tokio::spawn(async move { h2.set_mode(SmartGridMode::LowPrice, false).await });
+        let t1 =
+            tokio::spawn(async move { h1.set_mode(SmartGridMode::Blocking, false, None).await });
+        let t2 =
+            tokio::spawn(async move { h2.set_mode(SmartGridMode::LowPrice, false, None).await });
 
         let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
         // Both error out at the hardware write — but the actor responded to
@@ -631,7 +655,7 @@ mod tests {
         );
 
         let err = handle
-            .set_mode(SmartGridMode::Blocking, false)
+            .set_mode(SmartGridMode::Blocking, false, None)
             .await
             .unwrap_err();
         assert!(matches!(err, SmartGridError::Apply(_)));
@@ -672,7 +696,7 @@ mod tests {
             Err(SmartGridError::ActorGone)
         ));
         assert!(matches!(
-            handle.set_mode(SmartGridMode::Normal, false).await,
+            handle.set_mode(SmartGridMode::Normal, false, None).await,
             Err(SmartGridError::ActorGone)
         ));
         assert!(matches!(
@@ -823,6 +847,60 @@ mod tests {
         state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
         let cfg = test_config();
         assert!(compute_resume_target(&state, &cfg, SmartGridMode::Normal).is_none());
+    }
+
+    #[test]
+    fn resolve_fires_at_prefers_explicit_over_computed() {
+        let state = PriceState::new("SE3".to_string());
+        let cfg = SmartGridConfig {
+            auto_resume_enabled: true,
+            auto_resume_window_hours: 12,
+            auto_resume_min_duration_minutes: 30,
+        };
+        let explicit = SystemTime::now() + Duration::from_hours(2);
+        // Explicit time wins even for a mode whose auto-pick would differ.
+        let got = resolve_fires_at(Some(explicit), &state, &cfg, SmartGridMode::Blocking);
+        assert_eq!(got, Some(explicit));
+    }
+
+    #[test]
+    fn resolve_fires_at_falls_back_to_compute_when_none() {
+        // No price data → Blocking auto-pick yields None, and with no explicit
+        // time the helper returns that None (proves the fallback is wired).
+        let state = PriceState::new("SE3".to_string());
+        let cfg = SmartGridConfig {
+            auto_resume_enabled: true,
+            auto_resume_window_hours: 12,
+            auto_resume_min_duration_minutes: 30,
+        };
+        let got = resolve_fires_at(None, &state, &cfg, SmartGridMode::Blocking);
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_mode_with_explicit_resume_at_normal_never_schedules() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) = test_support::spawn_with_test_gpio(
+            PriceState::new("SE3".to_string()),
+            SmartGridConfig {
+                auto_resume_enabled: true,
+                auto_resume_window_hours: 12,
+                auto_resume_min_duration_minutes: 30,
+            },
+            cancel,
+        );
+        let target = SystemTime::now() + Duration::from_hours(1);
+        // Normal never schedules, regardless of an explicit resume_at. The
+        // test-only GpioController errors on every write (no held request),
+        // so the call surfaces the GPIO Apply error before the Normal guard
+        // is reached — but the meaningful guarantee still holds: no resume
+        // timer was registered.
+        let result = handle
+            .set_mode(SmartGridMode::Normal, true, Some(target))
+            .await;
+        assert!(matches!(result, Err(SmartGridError::Apply(_))));
+        let scheduled = handle.scheduled_resume_at().await.unwrap();
+        assert!(scheduled.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

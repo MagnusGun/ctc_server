@@ -158,10 +158,15 @@ async function getSmartGridResume() {
     try { return await fetchJson(`${API_BASE}/smartgrid/proposed_resume`); }
     catch { return null; }
 }
+async function getResumeCandidates() {
+    try { return await fetchJson(`${API_BASE}/smartgrid/resume_candidates`); }
+    catch { return { candidates: [] }; }
+}
 
-async function setSmartGridMode(mode, scheduleResume = false) {
+async function setSmartGridMode(mode, scheduleResume = false, resumeAt = null) {
     const url = `${API_BASE}/smartgrid?mode=${mode}` +
-                (scheduleResume ? '&schedule_resume=true' : '');
+                (scheduleResume ? '&schedule_resume=true' : '') +
+                (resumeAt ? `&resume_at=${encodeURIComponent(resumeAt)}` : '');
     const r = await fetch(url, { method: 'POST' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
@@ -233,7 +238,7 @@ window.api = {
     getHeatPumpStats, getHeatPumpHistory,
     getSeries, getActivity, getStepResponse,
     getAlarms,
-    getSmartGrid, getSmartGridResume, setSmartGridMode,
+    getSmartGrid, getSmartGridResume, getResumeCandidates, setSmartGridMode,
     getGrid, getPrices, getPump,
     getDhwState, setDhwComfort, startDhwBoost, cancelDhwBoost,
     getVersion,

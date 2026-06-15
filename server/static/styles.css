@@ -1453,6 +1453,50 @@ body {
   line-height: 1.4;
 }
 
+/* Ranked resume-slot picker (powersave / Blocking enter dialog). Mobile-first:
+   single-column rows, time on the left, price on the right. Reuses the
+   spot-price band palette for the left-border tint so the picker speaks the
+   same colour vocabulary as the chart and price strip. */
+.resume-picker { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.resume-picker-label { font-weight: 600; }
+.resume-empty { font-size: 13px; opacity: 0.8; }
+.resume-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+  border-left-width: 3px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.resume-row:hover { border-color: var(--line-2); }
+.resume-row:has(input:checked) {
+  background: color-mix(in oklch, var(--accent) 8%, var(--surface));
+}
+.resume-row input[type="radio"] {
+  appearance: none;
+  width: 16px; height: 16px;
+  border: 1.5px solid var(--line-2);
+  border-radius: 50%;
+  position: relative;
+  cursor: pointer;
+  flex-shrink: 0;
+  background: transparent;
+}
+.resume-row input[type="radio"]:checked { border-color: var(--accent); }
+.resume-row input[type="radio"]:checked::after {
+  content: ""; position: absolute;
+  inset: 3px; border-radius: 50%;
+  background: var(--accent);
+}
+.resume-row .resume-time { flex: 1; font-size: 13px; color: var(--text); }
+.resume-row .resume-price { font-weight: 700; font-family: var(--font-mono); }
+.resume-row.manual { opacity: 0.85; }
+
+.resume-row.level-very_cheap     { border-left-color: var(--price-very-cheap); }
+.resume-row.level-cheap          { border-left-color: var(--price-cheap); }
+.resume-row.level-normal         { border-left-color: var(--price-normal); }
+.resume-row.level-expensive      { border-left-color: var(--price-expensive); }
+.resume-row.level-very_expensive { border-left-color: var(--price-very-expensive); }
+
 /* ============================================================
    Powersave toggle (clickable chip)
    ============================================================ */

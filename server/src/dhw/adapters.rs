@@ -70,14 +70,14 @@ impl SmartGridAdapter {
 impl SgController for SmartGridAdapter {
     async fn set_normal(&self) -> Result<(), String> {
         self.handle
-            .set_mode(SmartGridMode::Normal, false)
+            .set_mode(SmartGridMode::Normal, false, None)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
     async fn set_overcapacity(&self) -> Result<(), String> {
         self.handle
-            .set_mode(SmartGridMode::Overcapacity, false)
+            .set_mode(SmartGridMode::Overcapacity, false, None)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())

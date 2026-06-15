@@ -445,6 +445,8 @@ function App() {
   const [mode, setMode] = useState("normal");
   const [confirm, setConfirm] = useState(null);
   const [resumeMode, setResumeMode] = useState("schedule");
+  const [resumeCandidates, setResumeCandidates] = useState([]);
+  const [pickedResume, setPickedResume] = useState(0); // index into candidates
   const [trendKey, setTrendKey] = useState(null);
   const [trendData, setTrendData] = useState(null); // [{label, data, color}]
   const [trendError, setTrendError] = useState(null);
@@ -581,6 +583,21 @@ function App() {
     window.api.getSmartGridResume()
       .then(r => { if (!aborted) setProposedResume(r); })
       .catch(() => {});
+    if (confirm.target === "powersave") {
+      window.api.getResumeCandidates()
+        .then(r => {
+          if (aborted) return;
+          const cands = r?.candidates || [];
+          setResumeCandidates(cands);
+          setPickedResume(0);
+          setResumeMode(cands.length ? "schedule" : "manual");
+        })
+        .catch(() => {
+          if (aborted) return;
+          setResumeCandidates([]);
+          setResumeMode("manual");
+        });
+    }
     return () => { aborted = true; };
   }, [confirm]);
 
@@ -1525,7 +1542,7 @@ function App() {
         const tone = meta.tone;
         // Clear stale proposedResume so the next open doesn't flash the
         // previous slot before the new fetch lands.
-        const closeConfirm = () => { setConfirm(null); setProposedResume(null); };
+        const closeConfirm = () => { setConfirm(null); setProposedResume(null); setResumeCandidates([]); setPickedResume(0); };
         // Use the backend's proposed auto-resume time directly. The dashboard
         // doesn't recompute it — the backend picks the slot
         // (cheapest_run_within for Blocking, cheap_window_end for
@@ -1583,34 +1600,65 @@ function App() {
               {isEnter ? (
                 <>
                   <div className="body">{blurb}</div>
-                  <div className="resume-options">
-                    <label className="resume-opt">
-                      <input type="radio" name="resume"
-                             checked={resumeMode === "schedule"}
-                             onChange={() => setResumeMode("schedule")}/>
-                      <div>
-                        <div className="t">{optA.t}</div>
-                        <div className="d">{optA.d}</div>
-                      </div>
-                    </label>
-                    <label className="resume-opt">
-                      <input type="radio" name="resume"
-                             checked={resumeMode === "manual"}
-                             onChange={() => setResumeMode("manual")}/>
-                      <div>
-                        <div className="t">{optB.t}</div>
-                        <div className="d">{optB.d}</div>
-                      </div>
-                    </label>
-                  </div>
+                  {isPS ? (
+                    <div className="resume-picker">
+                      <div className="resume-picker-label">Resume heating at…</div>
+                      {resumeCandidates.length === 0 ? (
+                        <div className="resume-empty">No price data — block without auto-resume.</div>
+                      ) : resumeCandidates.map((c, i) => {
+                        const t0 = new Date(c.starts_at).toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", hour12: false });
+                        const t1 = new Date(c.ends_at).toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", hour12: false });
+                        const ore = Math.round(c.avg_spot_sek * 100);
+                        return (
+                          <label key={c.starts_at} className={`resume-row level-${c.level || "normal"}`}>
+                            <input type="radio" name="resume"
+                                   checked={resumeMode === "schedule" && pickedResume === i}
+                                   onChange={() => { setResumeMode("schedule"); setPickedResume(i); }}/>
+                            <span className="resume-time">{t0}–{t1}{i === 0 ? " · cheapest" : ""}</span>
+                            <span className="resume-price">{ore} öre</span>
+                          </label>
+                        );
+                      })}
+                      <label className="resume-row manual">
+                        <input type="radio" name="resume"
+                               checked={resumeMode === "manual"}
+                               onChange={() => setResumeMode("manual")}/>
+                        <span className="resume-time">Block, no auto-resume</span>
+                      </label>
+                    </div>
+                  ) : (
+                    <div className="resume-options">
+                      <label className="resume-opt">
+                        <input type="radio" name="resume"
+                               checked={resumeMode === "schedule"}
+                               onChange={() => setResumeMode("schedule")}/>
+                        <div>
+                          <div className="t">{optA.t}</div>
+                          <div className="d">{optA.d}</div>
+                        </div>
+                      </label>
+                      <label className="resume-opt">
+                        <input type="radio" name="resume"
+                               checked={resumeMode === "manual"}
+                               onChange={() => setResumeMode("manual")}/>
+                        <div>
+                          <div className="t">{optB.t}</div>
+                          <div className="d">{optB.d}</div>
+                        </div>
+                      </label>
+                    </div>
+                  )}
                   <div className="actions">
                     <button className="btn" onClick={() => closeConfirm()}>Never mind</button>
                     <button className={`btn primary ${tone}`}
                             onClick={async () => {
                               const backendMode = UI_TO_BACKEND_MODE[target] ?? target;
                               const schedule = resumeMode === "schedule";
+                              const resumeAt = (schedule && isPS && resumeCandidates[pickedResume])
+                                ? resumeCandidates[pickedResume].starts_at
+                                : null;
                               try {
-                                await window.api.setSmartGridMode(backendMode, schedule);
+                                await window.api.setSmartGridMode(backendMode, schedule, resumeAt);
                                 setMode(target);
                               } catch (e) {
                                 console.error("SmartGrid POST failed:", e);
