@@ -825,6 +825,14 @@ function App() {
               <span className="value">Charging DHW</span>
             </span>
           )}
+          {/* Warm-by heat-up active: blocked, but the heat pump is running its
+              charge cycle before the deadline; re-blocks when it finishes. */}
+          {sgResp?.warm_by_heating && (
+            <span className="chip warmby-heating" title="Warm-by heat-up running — re-blocks when the heat pump finishes">
+              <span className="dot"/>
+              <span className="value">Heating now</span>
+            </span>
+          )}
           {(() => {
             // DHW boost badge — only renders when an active boost is reported
             // by /api/v1/dhw/state. The badge auto-refreshes on the same 5s

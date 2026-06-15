@@ -168,6 +168,11 @@ pub enum SmartGridCmd {
     HeatupDoneFire {
         generation: u64,
     },
+    /// Query: is a warm-by heat-up currently running (phase B)? Drives the
+    /// dashboard "heating now" indicator.
+    WarmByHeatingNow {
+        respond_to: oneshot::Sender<bool>,
+    },
 }
 
 /// Cheap-clone handle that route handlers use to send commands.
@@ -256,6 +261,17 @@ impl SmartGridHandle {
             .map_err(|_| SmartGridError::ActorGone)?
             .map_err(SmartGridError::Apply)
     }
+
+    /// Whether a warm-by heat-up is currently running (phase B: flipped to
+    /// Normal, compressor charging).
+    pub async fn warm_by_heating_now(&self) -> Result<bool, SmartGridError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(SmartGridCmd::WarmByHeatingNow { respond_to })
+            .await
+            .map_err(|_| SmartGridError::ActorGone)?;
+        rx.await.map_err(|_| SmartGridError::ActorGone)
+    }
 }
 
 #[derive(Debug)]
@@ -292,6 +308,10 @@ struct WarmBySlot {
     heatup_start: SystemTime,
     task: AbortHandle,
     generation: u64,
+    /// `false` in phase A (waiting for `heatup_start`), `true` in phase B
+    /// (flipped to Normal, compressor charging, watcher running). Drives the
+    /// dashboard "heating now" indicator.
+    heating: bool,
 }
 
 struct SmartGridActor {
@@ -471,6 +491,10 @@ impl SmartGridActor {
             }
             SmartGridCmd::HeatupStartFire { generation } => self.on_heatup_start_fire(generation),
             SmartGridCmd::HeatupDoneFire { generation } => self.on_heatup_done_fire(generation),
+            SmartGridCmd::WarmByHeatingNow { respond_to } => {
+                let heating = self.scheduled_warmby.as_ref().is_some_and(|s| s.heating);
+                let _ = respond_to.send(heating);
+            }
         }
     }
 
@@ -618,6 +642,7 @@ impl SmartGridActor {
             heatup_start,
             task,
             generation,
+            heating: false,
         });
         info!("Warm-by heat-up scheduled to start at {heatup_start:?}");
         Ok(Some(heatup_start))
@@ -661,6 +686,7 @@ impl SmartGridActor {
         // re-blocks only when the heat pump finishes its own cycle.
         let tx = self.self_tx.clone();
         slot.task = tokio::spawn(run_heatup_watcher(generation, modbus, tx)).abort_handle();
+        slot.heating = true;
         info!("Warm-by heat-up started — Normal, watching for compressor finish");
     }
 
@@ -1615,6 +1641,8 @@ mod tests {
             handle.read_mode().await.unwrap(),
             SmartGridMode::Blocking
         ));
+        // Phase A: scheduled but not yet heating.
+        assert!(!handle.warm_by_heating_now().await.unwrap());
         cancel.cancel();
     }
 
@@ -1656,6 +1684,7 @@ mod tests {
             heatup_start: SystemTime::now(),
             task: dummy,
             generation,
+            heating: false,
         });
         actor.on_heatup_done_fire(generation);
         assert!(matches!(actor.gpio.read_mode(), SmartGridMode::Blocking));
@@ -1674,6 +1703,7 @@ mod tests {
             heatup_start: SystemTime::now(),
             task: dummy,
             generation: stale,
+            heating: false,
         });
         actor.on_heatup_done_fire(stale);
         assert!(
@@ -1692,6 +1722,7 @@ mod tests {
             heatup_start: SystemTime::now(),
             task: dummy,
             generation,
+            heating: false,
         });
         actor.on_heatup_start_fire(generation);
         assert!(
@@ -1699,8 +1730,8 @@ mod tests {
             "phase A flips to Normal"
         );
         assert!(
-            actor.scheduled_warmby.is_some(),
-            "slot retained for the phase-B watcher"
+            actor.scheduled_warmby.as_ref().is_some_and(|s| s.heating),
+            "slot retained and marked heating for the phase-B watcher"
         );
     }
 
@@ -1732,6 +1763,7 @@ mod tests {
             heatup_start: SystemTime::now(),
             task: dummy,
             generation: stale,
+            heating: false,
         });
         // Simulate DELETE /scheduled_resume landing before the queued fire.
         actor.cancel_all_schedules();

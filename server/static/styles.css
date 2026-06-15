@@ -1709,6 +1709,19 @@ body {
 }
 .chip.dhw-charging .value { color: oklch(0.78 0.16 50); font-weight: 500; }
 
+.chip.warmby-heating {
+  background: color-mix(in oklch, oklch(0.78 0.15 150) 10%, var(--surface));
+  border-color: color-mix(in oklch, oklch(0.78 0.15 150) 30%, var(--line));
+  color: oklch(0.78 0.15 150);
+}
+.chip.warmby-heating .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: oklch(0.78 0.15 150);
+  box-shadow: 0 0 0 0 oklch(0.78 0.15 150);
+  animation: pulse 2s ease-out infinite;
+}
+.chip.warmby-heating .value { color: oklch(0.78 0.15 150); font-weight: 500; }
+
 /* DHW boost — warm orange, distinct from SmartGrid green / Powersave amber. */
 .chip.dhw-boost {
   background: color-mix(in oklch, oklch(0.78 0.16 50) 18%, var(--surface));

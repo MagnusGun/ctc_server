@@ -108,6 +108,9 @@ struct SmartGridResponse {
     /// Exposed so the dashboard can render an overlay band on the price
     /// chart whose width matches the scheduled run.
     run_minutes: u16,
+    /// `true` while a warm-by heat-up is actively running (mode flipped to
+    /// Normal, compressor charging). Drives the dashboard "heating now" chip.
+    warm_by_heating: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,12 +226,17 @@ async fn get_smartgrid(State(state): State<SmartGridState>) -> Result<String, Ap
         .scheduled_resume_at()
         .await
         .map_err(map_smartgrid_error)?;
+    let warm_by_heating = handle
+        .warm_by_heating_now()
+        .await
+        .map_err(map_smartgrid_error)?;
 
     let response = SmartGridResponse {
         smartgrid_mode: mode.to_string(),
         changed_at: changed_at.map(format_system_time),
         scheduled_resume_at: scheduled_resume_at.map(format_system_time),
         run_minutes: state.config.auto_resume_min_duration_minutes,
+        warm_by_heating,
     };
 
     serde_json::to_string(&response)
