@@ -125,7 +125,7 @@ mod tests {
             modbus,
             tx,
         ));
-        tokio::time::advance(Duration::from_secs(16 * 60)).await;
+        tokio::time::advance(Duration::from_mins(16)).await;
         let cmd = rx.recv().await.expect("watcher posts a done-fire");
         match cmd {
             SmartGridCmd::HeatupDoneFire { generation, reason } => {

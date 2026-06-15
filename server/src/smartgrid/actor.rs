@@ -422,7 +422,16 @@ impl SmartGridActor {
     /// Abort and clear both the auto-resume and warm-by pending timers. Called
     /// before any mode change and on shutdown so a stale fire can never land
     /// after the user's intent has moved on.
+    ///
+    /// Bumps the mode generation FIRST: a timer task that already left its
+    /// sleep and queued its `*Fire` before `abort()` landed would otherwise
+    /// pass the generation guard and apply a mode after the schedule was
+    /// cancelled (e.g. a bare `DELETE /scheduled_resume` could still flip to
+    /// Normal, or — worse for warm-by — leave the system stuck in Normal with
+    /// the slot already cleared and no watcher spawned). Bumping invalidates
+    /// any in-flight fire.
     fn cancel_all_schedules(&mut self) {
+        self.gpio.bump_mode_generation();
         if let Some(prev) = self.scheduled_resume.take() {
             prev.timer_task.abort();
         }
@@ -489,13 +498,10 @@ impl SmartGridActor {
         schedule_resume: bool,
         resume_at: Option<SystemTime>,
     ) -> Result<Option<SystemTime>, ApplyModeError> {
-        // Bump generation FIRST. Any in-flight resume timer that has already
-        // passed its sleep will see a mismatched generation when its
-        // ResumeFire message arrives and bail out.
-        self.gpio.bump_mode_generation();
-
         // Always cancel a prior schedule before mutating: a manual change
-        // overrides any pending auto-flip or warm-by heat-up.
+        // overrides any pending auto-flip or warm-by heat-up. This also bumps
+        // the mode generation FIRST, so any in-flight timer that already left
+        // its sleep sees a mismatched generation and bails out.
         self.cancel_all_schedules();
 
         self.gpio.set_mode(mode).map_err(ApplyModeError::Gpio)?;
@@ -585,9 +591,8 @@ impl SmartGridActor {
     /// Apply Blocking now and, unless the tank is already warm, schedule the
     /// phase-A timer that will flip to Normal at `heatup_start`.
     fn do_warm_by(&mut self, cmd: WarmByCommand) -> Result<Option<SystemTime>, ApplyModeError> {
-        // Same prologue as do_set_mode: bump generation, cancel prior
-        // schedules, block, push pump.
-        self.gpio.bump_mode_generation();
+        // Same prologue as do_set_mode: cancel prior schedules (which bumps the
+        // generation, invalidating any in-flight fire), block, push pump.
         self.cancel_all_schedules();
         self.gpio
             .set_mode(SmartGridMode::Blocking)
@@ -1746,5 +1751,33 @@ mod tests {
             matches!(actor.gpio.read_mode(), SmartGridMode::Blocking),
             "stale start-fire must not flip to Normal"
         );
+    }
+
+    /// Regression: a cancel must invalidate an already-queued start-fire. The
+    /// phase-A timer can leave its sleep and queue `HeatupStartFire` before the
+    /// cancel's abort lands; without a generation bump in `cancel_all_schedules`
+    /// that stale fire would flip to Normal and, with the slot cleared, strand
+    /// the system in Normal with no watcher.
+    #[tokio::test]
+    async fn cancel_then_stale_start_fire_keeps_blocking() {
+        let (mut actor, _rx) = build_actor(Some(Arc::new(FakeReader(50.0))));
+        actor.gpio.set_mode(SmartGridMode::Blocking).unwrap();
+        let stale = actor.gpio.mode_generation();
+        let dummy = tokio::spawn(async {}).abort_handle();
+        actor.scheduled_warmby = Some(WarmBySlot {
+            heatup_start: SystemTime::now(),
+            task: dummy,
+            generation: stale,
+            target_c: 48.0,
+            max_duration: Duration::from_mins(90),
+        });
+        // Simulate DELETE /scheduled_resume landing before the queued fire.
+        actor.cancel_all_schedules();
+        actor.on_heatup_start_fire(stale);
+        assert!(
+            matches!(actor.gpio.read_mode(), SmartGridMode::Blocking),
+            "stale start-fire after cancel must not flip to Normal"
+        );
+        assert!(actor.scheduled_warmby.is_none());
     }
 }

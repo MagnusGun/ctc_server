@@ -448,7 +448,6 @@ function App() {
   const [resumeCandidates, setResumeCandidates] = useState([]);
   const [pickedResume, setPickedResume] = useState(0); // index into candidates
   const [warmByTime, setWarmByTime] = useState("06:30"); // HH:MM deadline
-  const [warmByTarget, setWarmByTarget] = useState(48);  // °C target
   const [warmByPreview, setWarmByPreview] = useState(null);
   const [trendKey, setTrendKey] = useState(null);
   const [trendData, setTrendData] = useState(null); // [{label, data, color}]
@@ -1655,14 +1654,7 @@ function App() {
                                onChange={e => { const v = e.target.value; setResumeMode("warmby"); setWarmByTime(v); loadWarmByPreview(v); }}/>
                       </label>
                       {resumeMode === "warmby" && (
-                        <div className="warmby-extra">
-                          <label className="warmby-target">Target&nbsp;
-                            <input type="number" min="45" max="50" step="1" value={warmByTarget}
-                                   onClick={e => e.stopPropagation()}
-                                   onChange={e => setWarmByTarget(Number(e.target.value))}/>°C
-                          </label>
-                          <div className="resume-empty warmby-preview">{warmByText}</div>
-                        </div>
+                        <div className="resume-empty warmby-preview">{warmByText}</div>
                       )}
                     </div>
                   ) : (
@@ -1694,7 +1686,8 @@ function App() {
                               try {
                                 if (isPS && resumeMode === "warmby") {
                                   // Block now + schedule a temp-aware heat-up by the deadline.
-                                  await window.api.warmBySmartGrid(warmByTime, warmByTarget);
+                                  // Target temp uses the server default (no UI knob).
+                                  await window.api.warmBySmartGrid(warmByTime);
                                   setMode("powersave");
                                   sgMeta?.refetch?.();
                                   closeConfirm();
