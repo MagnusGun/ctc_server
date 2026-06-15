@@ -1550,7 +1550,6 @@ function App() {
         const autoResumeAt = proposedResume?.starts_at
           ? new Date(proposedResume.starts_at).toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", hour12: false })
           : "—";
-        const runMins = sgResp?.run_minutes ?? proposedResume?.run_minutes;
         // Derive the next significant price increase from today's curve.
         // "Significant" = next upcoming 15-min slot priced ≥ 1.5× the current one.
         const priceUp = (() => {
@@ -1578,16 +1577,10 @@ function App() {
         ) : (
           <>Boost mode — heat aggressively while there is surplus capacity on the grid. Price is forecast to rise from <strong>{priceUpFrom}</strong> to <strong>{priceUpTo} kr/kWh</strong> at <strong>{priceUpAt}</strong>.</>
         );
-        const optA = isPS
-          ? { t: `Auto-resume at ${autoResumeAt}`, d: runMins
-              ? `Heat resumes at the start of the cheapest ${runMins}-minute window in the next few hours.`
-              : "Heat will turn back on automatically at the time chosen by the server." }
-          : isLP
+        const optA = isLP
           ? { t: `Auto-return to Normal at ${autoResumeAt}`, d: "Switches back when the cheap-price window ends." }
           : { t: `Auto-return to Normal at ${priceUpAt}`, d: "Switches back right before the next price increase." };
-        const optB = isPS
-          ? { t: "Block until I resume manually", d: "Heating stays off until you switch back to Normal." }
-          : isLP
+        const optB = isLP
           ? { t: "Run until I switch off manually", d: "Stays in Low-price mode until you change it." }
           : { t: "Run until I switch off manually", d: "Stays in Overcapacity until you change it." };
         return (
