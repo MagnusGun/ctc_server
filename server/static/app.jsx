@@ -613,7 +613,6 @@ function App() {
     );
   }, [t.theme, t.density, t.cards, t.accent]);
 
-  const clockStr = now.toLocaleTimeString("sv-SE", { hour12: false });
   const clockHM  = now.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", hour12: false });
   const dateStr = now.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
 
@@ -1357,7 +1356,7 @@ function App() {
       )}
 
       <footer className="footer">
-        <div>Last updated · {clockStr}</div>
+        <div>Last updated · {tempsMeta.lastUpdated ? tempsMeta.lastUpdated.toLocaleTimeString("sv-SE", { hour12: false }) : "—"}</div>
         <div className="right">
           <span className="refresh"><span className="ring"/> Auto-refresh {Math.round(window.POLL_LIVE / 1000)}s</span>
           {version?.version && (

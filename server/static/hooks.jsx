@@ -18,6 +18,10 @@ function usePolledFetch(fetcher, intervalMs) {
     const [data, setData] = React.useState(null);
     const [error, setError] = React.useState(null);
     const [loading, setLoading] = React.useState(true);
+    // Time of the last successful fetch. Updates on every poll tick (even when
+    // the payload is unchanged) so callers can show real data-freshness at the
+    // poll cadence rather than a 1Hz wall clock.
+    const [lastUpdated, setLastUpdated] = React.useState(null);
     // Bumping this state schedules an immediate tick. Used by callers that
     // want to refresh after a user-initiated mutation without waiting for
     // the next 5s poll.
@@ -31,6 +35,7 @@ function usePolledFetch(fetcher, intervalMs) {
                 if (!mounted) return;
                 setData(prev => (sameJson(prev, result) ? prev : result));
                 setError(null);
+                setLastUpdated(new Date());
             } catch (e) {
                 if (!mounted) return;
                 setError(e.message || String(e));
@@ -44,7 +49,7 @@ function usePolledFetch(fetcher, intervalMs) {
     }, [fetcher, intervalMs, refreshCounter]);
 
     const refetch = React.useCallback(() => setRefreshCounter(c => c + 1), []);
-    return [data, { error, loading, refetch }];
+    return [data, { error, loading, refetch, lastUpdated }];
 }
 
 /* Server-derived 24h activity timeline. Backend returns UTC ISO times;
