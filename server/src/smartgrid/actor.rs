@@ -29,7 +29,7 @@ use crate::homey::HomeyClient;
 use crate::homey::cache::HomeyPumpCache;
 
 use super::gpio::GpioController;
-use super::heatup::{DoneReason, WarmByCommand};
+use super::heatup::WarmByCommand;
 use super::heatup_watcher::run_heatup_watcher;
 use super::mode::SmartGridMode;
 
@@ -163,11 +163,10 @@ pub enum SmartGridCmd {
     HeatupStartFire {
         generation: u64,
     },
-    /// Internal: phase-B watcher decided the heat-up is done — re-block.
+    /// Internal: phase-B watcher saw the compressor finish — re-block.
     /// Generation-guarded.
     HeatupDoneFire {
         generation: u64,
-        reason: DoneReason,
     },
 }
 
@@ -293,8 +292,6 @@ struct WarmBySlot {
     heatup_start: SystemTime,
     task: AbortHandle,
     generation: u64,
-    target_c: f32,
-    max_duration: Duration,
 }
 
 struct SmartGridActor {
@@ -473,9 +470,7 @@ impl SmartGridActor {
                 let _ = respond_to.send(result);
             }
             SmartGridCmd::HeatupStartFire { generation } => self.on_heatup_start_fire(generation),
-            SmartGridCmd::HeatupDoneFire { generation, reason } => {
-                self.on_heatup_done_fire(generation, reason);
-            }
+            SmartGridCmd::HeatupDoneFire { generation } => self.on_heatup_done_fire(generation),
         }
     }
 
@@ -623,8 +618,6 @@ impl SmartGridActor {
             heatup_start,
             task,
             generation,
-            target_c: cmd.target_c,
-            max_duration: cmd.max_duration,
         });
         info!("Warm-by heat-up scheduled to start at {heatup_start:?}");
         Ok(Some(heatup_start))
@@ -633,6 +626,14 @@ impl SmartGridActor {
     /// Phase A fired: flip to Normal so the heat pump charges the tank, then
     /// spawn the phase-B watcher and swap the slot's handle to it.
     fn on_heatup_start_fire(&mut self, generation: u64) {
+        // Without a Modbus reader we cannot watch the compressor, so we would
+        // never know when to re-block — don't enter an unwatchable Normal.
+        // Production always has a reader (built unconditionally in main).
+        let Some(modbus) = self.modbus.clone() else {
+            error!("Warm-by: no Modbus reader — cannot run heat-up, staying blocked");
+            return;
+        };
+
         match self
             .gpio
             .set_mode_if_not_superseded(SmartGridMode::Normal, generation)
@@ -655,43 +656,16 @@ impl SmartGridActor {
             return;
         };
 
-        let Some(modbus) = self.modbus.clone() else {
-            // No reader (GPIO-only deployment): fall back to a pure max-duration
-            // timer so we still re-block instead of staying Normal forever.
-            warn!("Warm-by: no Modbus reader — re-block will be time-capped only");
-            let tx = self.self_tx.clone();
-            let max_duration = slot.max_duration;
-            slot.task = tokio::spawn(async move {
-                tokio::time::sleep(max_duration).await;
-                let _ = tx
-                    .send(SmartGridCmd::HeatupDoneFire {
-                        generation,
-                        reason: DoneReason::MaxDuration,
-                    })
-                    .await;
-            })
-            .abort_handle();
-            info!("Warm-by heat-up started — Normal (time-capped re-block)");
-            return;
-        };
-
+        // Swap the slot's handle from the (fired) phase-A timer to the phase-B
+        // watcher so a later manual override aborts the live task. The watcher
+        // re-blocks only when the heat pump finishes its own cycle.
         let tx = self.self_tx.clone();
-        let target_c = slot.target_c;
-        let max_duration = slot.max_duration;
-        slot.task = tokio::spawn(run_heatup_watcher(
-            tokio::time::Instant::now(),
-            target_c,
-            max_duration,
-            generation,
-            modbus,
-            tx,
-        ))
-        .abort_handle();
-        info!("Warm-by heat-up started — Normal, watcher running");
+        slot.task = tokio::spawn(run_heatup_watcher(generation, modbus, tx)).abort_handle();
+        info!("Warm-by heat-up started — Normal, watching for compressor finish");
     }
 
-    /// Phase B fired: the heat-up finished — re-block and stay blocked.
-    fn on_heatup_done_fire(&mut self, generation: u64, reason: DoneReason) {
+    /// Phase B fired: the compressor finished — re-block and stay blocked.
+    fn on_heatup_done_fire(&mut self, generation: u64) {
         match self
             .gpio
             .set_mode_if_not_superseded(SmartGridMode::Blocking, generation)
@@ -711,7 +685,7 @@ impl SmartGridActor {
         {
             self.scheduled_warmby = None;
         }
-        info!("Warm-by heat-up done ({reason:?}) — re-blocked");
+        info!("Warm-by heat-up done (compressor finished) — re-blocked");
     }
 }
 
@@ -1594,11 +1568,7 @@ mod tests {
     }
 
     fn warmby_cmd(heatup_start: Option<SystemTime>) -> WarmByCommand {
-        WarmByCommand {
-            heatup_start,
-            target_c: 48.0,
-            max_duration: Duration::from_mins(90),
-        }
+        WarmByCommand { heatup_start }
     }
 
     #[tokio::test]
@@ -1686,10 +1656,8 @@ mod tests {
             heatup_start: SystemTime::now(),
             task: dummy,
             generation,
-            target_c: 48.0,
-            max_duration: Duration::from_mins(90),
         });
-        actor.on_heatup_done_fire(generation, DoneReason::TargetReached);
+        actor.on_heatup_done_fire(generation);
         assert!(matches!(actor.gpio.read_mode(), SmartGridMode::Blocking));
         assert!(actor.scheduled_warmby.is_none(), "slot cleared after done");
     }
@@ -1706,10 +1674,8 @@ mod tests {
             heatup_start: SystemTime::now(),
             task: dummy,
             generation: stale,
-            target_c: 48.0,
-            max_duration: Duration::from_mins(90),
         });
-        actor.on_heatup_done_fire(stale, DoneReason::MaxDuration);
+        actor.on_heatup_done_fire(stale);
         assert!(
             matches!(actor.gpio.read_mode(), SmartGridMode::Normal),
             "stale done-fire must not re-block"
@@ -1726,8 +1692,6 @@ mod tests {
             heatup_start: SystemTime::now(),
             task: dummy,
             generation,
-            target_c: 48.0,
-            max_duration: Duration::from_mins(90),
         });
         actor.on_heatup_start_fire(generation);
         assert!(
@@ -1768,8 +1732,6 @@ mod tests {
             heatup_start: SystemTime::now(),
             task: dummy,
             generation: stale,
-            target_c: 48.0,
-            max_duration: Duration::from_mins(90),
         });
         // Simulate DELETE /scheduled_resume landing before the queued fire.
         actor.cancel_all_schedules();

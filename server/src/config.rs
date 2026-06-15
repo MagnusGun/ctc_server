@@ -313,9 +313,6 @@ pub struct SmartGridConfig {
     /// minutes. Bounds the window to `[deadline - max_lead, deadline]`.
     /// Clamped to `[30, 240]`.
     pub warm_by_max_lead_minutes: u16,
-    /// Safety cap on how long the warm-by heat-up may run before forcing a
-    /// re-block, in minutes. Clamped to `[15, 240]`.
-    pub warm_by_max_duration_minutes: u16,
 }
 
 impl Default for SmartGridConfig {
@@ -329,7 +326,6 @@ impl Default for SmartGridConfig {
             warm_by_heat_rate_c_per_min: 0.4,
             warm_by_cooldown_c_per_min: 0.05,
             warm_by_max_lead_minutes: 90,
-            warm_by_max_duration_minutes: 90,
         }
     }
 }
@@ -509,8 +505,6 @@ impl Config {
             cfg.smartgrid.warm_by_cooldown_c_per_min.clamp(0.0, 2.0);
         cfg.smartgrid.warm_by_max_lead_minutes =
             cfg.smartgrid.warm_by_max_lead_minutes.clamp(30, 240);
-        cfg.smartgrid.warm_by_max_duration_minutes =
-            cfg.smartgrid.warm_by_max_duration_minutes.clamp(15, 240);
         // Hour-of-day is 0..=23. Anything else is a config bug; clamp so a
         // typo doesn't cause the scheduler to skip days.
         if cfg.price.fetch_hour_local > 23 {

@@ -24,29 +24,13 @@ pub const REG_DHW_UPPER: u16 = 62276;
 /// Modbus register for the heat-pump compressor status (`HEATPUMP_STATUS`).
 pub const REG_HP_STATUS: u16 = 62017;
 
-/// Why the warm-by heat-up finished and the system should re-block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DoneReason {
-    /// Tank-top temperature reached the target.
-    TargetReached,
-    /// The compressor finished its cycle (left the heating state after having
-    /// been seen heating).
-    CompressorStopped,
-    /// The `max_duration` safety cap elapsed — re-block regardless.
-    MaxDuration,
-}
-
 /// A resolved warm-by request handed from the route to the actor. The route
 /// has already done the temp-aware sizing, so the actor performs no reads.
 #[derive(Debug, Clone, Copy)]
 pub struct WarmByCommand {
-    /// When to flip to Normal and start heating. `None` means the tank is
-    /// already at/above target — just block, no heat-up.
+    /// When to flip to Normal and start heating. `None` means the tank will
+    /// still be warm enough at the deadline — just block, no heat-up.
     pub heatup_start: Option<SystemTime>,
-    /// Target tank-top temperature (°C) the watcher heats toward.
-    pub target_c: f32,
-    /// Safety cap on the heat-up phase before forcing a re-block.
-    pub max_duration: Duration,
 }
 
 /// Estimate how long the tank needs to heat to reach `target_c` **at the
@@ -61,11 +45,12 @@ pub struct WarmByCommand {
 /// ```
 ///
 /// If that prediction is still ≥ target the heat-up is skipped; otherwise the
-/// heat-up is sized to close the gap from the predicted temperature up to the
-/// target (`(target - predicted) / heat_rate`, clamped to `max_duration`).
-/// Because the heat-up is placed close to the deadline, heating to target from
-/// the deadline-predicted temperature lands the tank at target around the
-/// deadline. A non-positive heat rate falls back to `max_duration`.
+/// returned duration sizes the gap from the predicted temperature up to the
+/// target (`(target - predicted) / heat_rate`). This value is **only a hint**:
+/// it sets the length of the cheap window the scheduler looks for and the
+/// "est. N min" shown in the preview. It does **not** stop the heat-up — the
+/// heat pump's own cycle does that (see [`heatup_complete`]). A non-positive
+/// heat rate falls back to a neutral 60-minute hint.
 #[must_use]
 pub fn estimate_heatup(
     current_c: f32,
@@ -73,18 +58,17 @@ pub fn estimate_heatup(
     heat_rate_c_per_min: f32,
     cooldown_c_per_min: f32,
     minutes_until_deadline: f32,
-    max_duration: Duration,
 ) -> Option<Duration> {
     let predicted_at_deadline = current_c - cooldown_c_per_min * minutes_until_deadline.max(0.0);
     if predicted_at_deadline >= target_c {
         return None;
     }
     if heat_rate_c_per_min <= 0.0 {
-        return Some(max_duration);
+        return Some(Duration::from_hours(1));
     }
     let minutes = (target_c - predicted_at_deadline) / heat_rate_c_per_min;
     let secs = (minutes * 60.0).max(0.0);
-    Some(Duration::from_secs_f32(secs).min(max_duration))
+    Some(Duration::from_secs_f32(secs))
 }
 
 /// Whether a heat-pump status reading indicates active heating.
@@ -93,43 +77,17 @@ pub fn is_heating(hp_status: Option<i64>) -> bool {
     hp_status == Some(HP_STATUS_HEATING)
 }
 
-/// Decide whether the heat-up is done this tick. Pure: the watcher passes the
-/// latest readings plus the accumulated `seen_heating` latch and elapsed time.
+/// True once the heat pump has run and then turned off — i.e. the heater's
+/// own cycle has decided the charge is complete, so the server should re-block.
 ///
-/// Checked in order:
-/// 1. `elapsed >= max_duration` → [`DoneReason::MaxDuration`] (always
-///    evaluable, so a stuck sensor still re-blocks eventually).
-/// 2. tank temp `>= target` → [`DoneReason::TargetReached`].
-/// 3. compressor was seen heating and is no longer → [`DoneReason::CompressorStopped`].
-///
-/// A failed read (`None`) simply skips its check this tick — no false trigger.
-/// `seen_heating` must already reflect this tick (caller folds in
-/// [`is_heating`] before calling), so a tick where the compressor is *still*
-/// heating never reports `CompressorStopped`.
+/// The server does **not** decide when heating is "enough"; it only watches
+/// for the compressor to finish. `seen_heating` must already fold in this
+/// tick's status (via [`is_heating`]), so a tick where the compressor is still
+/// heating never reports complete. A failed status read (`None`) is treated as
+/// "not stopped" — keep waiting rather than re-block on a transient error.
 #[must_use]
-pub fn evaluate_heatup_done(
-    temp_c: Option<f32>,
-    hp_status: Option<i64>,
-    seen_heating: bool,
-    elapsed: Duration,
-    target_c: f32,
-    max_duration: Duration,
-) -> Option<DoneReason> {
-    if elapsed >= max_duration {
-        return Some(DoneReason::MaxDuration);
-    }
-    if let Some(t) = temp_c
-        && t >= target_c
-    {
-        return Some(DoneReason::TargetReached);
-    }
-    if seen_heating
-        && let Some(s) = hp_status
-        && s != HP_STATUS_HEATING
-    {
-        return Some(DoneReason::CompressorStopped);
-    }
-    None
+pub fn heatup_complete(hp_status: Option<i64>, seen_heating: bool) -> bool {
+    seen_heating && matches!(hp_status, Some(s) if s != HP_STATUS_HEATING)
 }
 
 #[cfg(test)]
@@ -143,120 +101,55 @@ mod tests {
     #[test]
     fn estimate_skips_only_when_warm_through_the_deadline() {
         // Warm now AND a near deadline (no meaningful cooldown) → skip.
-        assert!(estimate_heatup(50.0, 48.0, 0.4, 0.05, 30.0, Duration::from_mins(90)).is_none());
+        assert!(estimate_heatup(50.0, 48.0, 0.4, 0.05, 30.0).is_none());
         // Exactly at target with zero cooldown horizon also skips.
-        assert!(estimate_heatup(48.0, 48.0, 0.4, 0.0, 0.0, Duration::from_mins(90)).is_none());
+        assert!(estimate_heatup(48.0, 48.0, 0.4, 0.0, 0.0).is_none());
     }
 
     #[test]
     fn estimate_does_not_skip_when_tank_will_cool_below_target() {
         // Warm now (50 °C) but the deadline is 8 h out: at 0.05 °C/min the tank
         // loses 24 °C → ~26 °C, well below the 48 °C target → must heat.
-        let d = estimate_heatup(50.0, 48.0, 0.4, 0.05, 480.0, Duration::from_mins(90))
+        let d = estimate_heatup(50.0, 48.0, 0.4, 0.05, 480.0)
             .expect("must schedule a heat-up, not skip");
         // gap = 48 - (50 - 24) = 22 °C at 0.4 °C/min = 55 min.
         assert_float_eq(
             d.as_secs_f32(),
             55.0 * 60.0,
-            "heat-up sized for cooldown deficit",
+            "heat-up hint sized for cooldown deficit",
         );
     }
 
     #[test]
     fn estimate_sizes_from_temp_gap_and_rate() {
         // No cooldown horizon: 48 - 24 = 24 °C at 0.4 °C/min = 60 min.
-        let d = estimate_heatup(24.0, 48.0, 0.4, 0.0, 0.0, Duration::from_mins(90)).expect("some");
-        assert_float_eq(d.as_secs_f32(), 3600.0, "60 min heat-up");
+        let d = estimate_heatup(24.0, 48.0, 0.4, 0.0, 0.0).expect("some");
+        assert_float_eq(d.as_secs_f32(), 3600.0, "60 min heat-up hint");
     }
 
     #[test]
-    fn estimate_clamps_to_max_duration() {
-        // 48 - 0 = 48 °C at 0.4 = 120 min, capped at 90.
-        let d = estimate_heatup(0.0, 48.0, 0.4, 0.0, 0.0, Duration::from_mins(90)).expect("some");
-        assert_eq!(d, Duration::from_mins(90));
+    fn estimate_non_positive_rate_falls_back_to_neutral_hint() {
+        let d = estimate_heatup(20.0, 48.0, 0.0, 0.0, 0.0).expect("some");
+        assert_eq!(d, Duration::from_hours(1));
     }
 
     #[test]
-    fn estimate_non_positive_rate_falls_back_to_cap() {
-        let d = estimate_heatup(20.0, 48.0, 0.0, 0.0, 0.0, Duration::from_mins(90)).expect("some");
-        assert_eq!(d, Duration::from_mins(90));
+    fn complete_only_after_seen_heating_then_stopped() {
+        // Not yet seen heating (compressor hasn't spun up) → not complete.
+        assert!(!heatup_complete(Some(0), false));
+        // Seen heating and now stopped → complete (the heater decided).
+        assert!(heatup_complete(Some(0), true));
     }
 
     #[test]
-    fn done_on_max_duration_even_with_no_reads() {
-        let got = evaluate_heatup_done(
-            None,
-            None,
-            false,
-            Duration::from_mins(90),
-            48.0,
-            Duration::from_mins(90),
-        );
-        assert_eq!(got, Some(DoneReason::MaxDuration));
+    fn still_heating_is_not_complete() {
+        assert!(!heatup_complete(Some(HP_STATUS_HEATING), true));
     }
 
     #[test]
-    fn done_on_target_reached() {
-        let got = evaluate_heatup_done(
-            Some(48.0),
-            Some(HP_STATUS_HEATING),
-            true,
-            Duration::from_mins(10),
-            48.0,
-            Duration::from_mins(90),
-        );
-        assert_eq!(got, Some(DoneReason::TargetReached));
-    }
-
-    #[test]
-    fn compressor_stop_only_after_seen_heating() {
-        // Not yet seen heating (compressor hasn't spun up) → no trigger.
-        let early = evaluate_heatup_done(
-            Some(30.0),
-            Some(0),
-            false,
-            Duration::from_mins(1),
-            48.0,
-            Duration::from_mins(90),
-        );
-        assert_eq!(early, None);
-        // After it was seen heating and has now stopped → CompressorStopped.
-        let later = evaluate_heatup_done(
-            Some(40.0),
-            Some(0),
-            true,
-            Duration::from_mins(20),
-            48.0,
-            Duration::from_mins(90),
-        );
-        assert_eq!(later, Some(DoneReason::CompressorStopped));
-    }
-
-    #[test]
-    fn still_heating_does_not_stop() {
-        let got = evaluate_heatup_done(
-            Some(40.0),
-            Some(HP_STATUS_HEATING),
-            true,
-            Duration::from_mins(20),
-            48.0,
-            Duration::from_mins(90),
-        );
-        assert_eq!(got, None);
-    }
-
-    #[test]
-    fn transient_read_failure_no_trigger() {
-        // Both reads failed mid-heat-up, cap not reached → keep waiting.
-        let got = evaluate_heatup_done(
-            None,
-            None,
-            true,
-            Duration::from_mins(20),
-            48.0,
-            Duration::from_mins(90),
-        );
-        assert_eq!(got, None);
+    fn transient_read_failure_is_not_complete() {
+        // Status read failed this tick → keep waiting, don't re-block.
+        assert!(!heatup_complete(None, true));
     }
 
     #[test]

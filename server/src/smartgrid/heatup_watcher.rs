@@ -1,14 +1,18 @@
 //! Phase-B watcher for the warm-by heat-up.
 //!
 //! Spawned by the actor once the heat-up has started (mode flipped to Normal).
-//! Polls the tank-top temperature and compressor status every 60s and, when
-//! [`evaluate_heatup_done`] reports a stop trigger, posts [`HeatupDoneFire`]
-//! back to the actor so it can re-block.
+//! Polls the compressor status every 60s and, once the heat pump has run and
+//! then turned off, posts [`HeatupDoneFire`] back to the actor so it re-blocks.
+//!
+//! The server does not decide when the tank is "warm enough" — the heat pump's
+//! own charge cycle does. There is intentionally **no** time cap and no
+//! target-temperature stop: the watcher only listens for the compressor to
+//! finish. If the compressor never runs, the watcher keeps waiting (the user
+//! accepted that trade-off); a manual mode change or shutdown aborts it.
 //!
 //! Mirrors the DHW Bath watcher (`dhw/watcher.rs`): 60s tick with
-//! `MissedTickBehavior::Delay`, the immediate first tick consumed so the first
-//! evaluation lands at `+60s`, and a `tokio::time::Instant` time source so
-//! `start_paused` tests can drive expiry via `tokio::time::advance`.
+//! `MissedTickBehavior::Delay` and the immediate first tick consumed so the
+//! first evaluation lands at `+60s` (the compressor needs time to spin up).
 //!
 //! [`HeatupDoneFire`]: super::actor::SmartGridCmd::HeatupDoneFire
 
@@ -20,14 +24,11 @@ use tokio::sync::mpsc;
 use crate::dhw::actor::ModbusWriter;
 
 use super::actor::SmartGridCmd;
-use super::heatup::{REG_DHW_UPPER, REG_HP_STATUS, evaluate_heatup_done, is_heating};
+use super::heatup::{REG_HP_STATUS, heatup_complete, is_heating};
 
-/// Run the phase-B heat-up watcher until a stop trigger fires (or the actor
-/// shuts down and the channel closes).
+/// Run the phase-B heat-up watcher until the compressor finishes its cycle (or
+/// the actor shuts down / aborts it and the channel closes).
 pub async fn run_heatup_watcher(
-    started_at: tokio::time::Instant,
-    target_c: f32,
-    max_duration: Duration,
     generation: u64,
     modbus: Arc<dyn ModbusWriter>,
     self_tx: mpsc::Sender<SmartGridCmd>,
@@ -42,9 +43,8 @@ pub async fn run_heatup_watcher(
     loop {
         tick.tick().await;
 
-        // Failed reads return None and simply skip their check this tick; the
-        // Instant-based max_duration cap still guarantees an eventual re-block.
-        let temp_c = modbus.read_scaled(REG_DHW_UPPER).await.ok();
+        // A failed read returns None and is treated as "not stopped" — keep
+        // waiting rather than re-block on a transient Modbus error.
         // Status is a small enumerated integer (0..=3); the rounded scaled
         // read always fits an i64, so the truncation lint is a non-issue here.
         #[allow(clippy::cast_possible_truncation)]
@@ -55,16 +55,9 @@ pub async fn run_heatup_watcher(
             .map(|f| f.round() as i64);
         seen_heating = seen_heating || is_heating(hp_status);
 
-        if let Some(reason) = evaluate_heatup_done(
-            temp_c,
-            hp_status,
-            seen_heating,
-            started_at.elapsed(),
-            target_c,
-            max_duration,
-        ) {
+        if heatup_complete(hp_status, seen_heating) {
             let _ = self_tx
-                .send(SmartGridCmd::HeatupDoneFire { generation, reason })
+                .send(SmartGridCmd::HeatupDoneFire { generation })
                 .await;
             return;
         }
@@ -74,65 +67,59 @@ pub async fn run_heatup_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smartgrid::heatup::DoneReason;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Modbus fake returning a fixed temperature for any read.
-    struct FakeReader(f32);
+    /// Modbus fake that returns a scripted sequence of status values, holding
+    /// the last value once the script is exhausted.
+    struct ScriptedReader {
+        vals: Vec<f32>,
+        idx: AtomicUsize,
+    }
+    impl ScriptedReader {
+        fn new(vals: Vec<f32>) -> Self {
+            Self {
+                vals,
+                idx: AtomicUsize::new(0),
+            }
+        }
+    }
     #[async_trait::async_trait]
-    impl ModbusWriter for FakeReader {
+    impl ModbusWriter for ScriptedReader {
         async fn write_scaled(&self, _addr: u16, _v: f32) -> Result<(), String> {
             Ok(())
         }
         async fn read_scaled(&self, _addr: u16) -> Result<f32, String> {
-            Ok(self.0)
+            let i = self.idx.fetch_add(1, Ordering::SeqCst);
+            Ok(self.vals[i.min(self.vals.len() - 1)])
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn watcher_posts_done_when_target_reached() {
+    async fn watcher_reblocks_when_compressor_stops() {
         let (tx, mut rx) = mpsc::channel(8);
-        let modbus: Arc<dyn ModbusWriter> = Arc::new(FakeReader(50.0)); // ≥ target
-        tokio::spawn(run_heatup_watcher(
-            tokio::time::Instant::now(),
-            48.0,
-            Duration::from_mins(90),
-            7,
-            modbus,
-            tx,
-        ));
-        // Past the consumed first tick into the first evaluation tick.
-        tokio::time::advance(Duration::from_secs(61)).await;
+        // Tick 1: status 3 (heating, seen_heating=true). Tick 2: status 0
+        // (stopped) → complete.
+        let modbus: Arc<dyn ModbusWriter> = Arc::new(ScriptedReader::new(vec![3.0, 0.0]));
+        tokio::spawn(run_heatup_watcher(7, modbus, tx));
+        tokio::time::advance(Duration::from_secs(61)).await; // first eval tick
+        tokio::time::advance(Duration::from_mins(1)).await; // second eval tick
         let cmd = rx.recv().await.expect("watcher posts a done-fire");
         match cmd {
-            SmartGridCmd::HeatupDoneFire { generation, reason } => {
-                assert_eq!(generation, 7);
-                assert_eq!(reason, DoneReason::TargetReached);
-            }
+            SmartGridCmd::HeatupDoneFire { generation } => assert_eq!(generation, 7),
             _ => panic!("unexpected command"),
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn watcher_caps_at_max_duration_when_cold() {
+    async fn watcher_waits_while_compressor_runs() {
         let (tx, mut rx) = mpsc::channel(8);
-        // Cold tank, compressor never seen heating → only the cap can fire.
-        let modbus: Arc<dyn ModbusWriter> = Arc::new(FakeReader(20.0));
-        tokio::spawn(run_heatup_watcher(
-            tokio::time::Instant::now(),
-            48.0,
-            Duration::from_mins(15),
-            9,
-            modbus,
-            tx,
-        ));
-        tokio::time::advance(Duration::from_mins(16)).await;
-        let cmd = rx.recv().await.expect("watcher posts a done-fire");
-        match cmd {
-            SmartGridCmd::HeatupDoneFire { generation, reason } => {
-                assert_eq!(generation, 9);
-                assert_eq!(reason, DoneReason::MaxDuration);
-            }
-            _ => panic!("unexpected command"),
-        }
+        // Always heating → never completes.
+        let modbus: Arc<dyn ModbusWriter> = Arc::new(ScriptedReader::new(vec![3.0]));
+        tokio::spawn(run_heatup_watcher(7, modbus, tx));
+        tokio::time::advance(Duration::from_mins(30)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must not re-block while the compressor is still heating"
+        );
     }
 }

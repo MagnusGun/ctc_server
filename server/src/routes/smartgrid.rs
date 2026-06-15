@@ -407,7 +407,6 @@ async fn plan_warm_by(
     })?;
 
     let max_lead = Duration::from_mins(u64::from(state.config.warm_by_max_lead_minutes));
-    let max_duration = Duration::from_mins(u64::from(state.config.warm_by_max_duration_minutes));
     let rate = state.config.warm_by_heat_rate_c_per_min;
     let cooldown = state.config.warm_by_cooldown_c_per_min;
     // How long until the deadline — drives the cooldown prediction so a tank
@@ -416,14 +415,7 @@ async fn plan_warm_by(
         .duration_since(SystemTime::now())
         .map_or(0.0, |d| d.as_secs_f32() / 60.0);
 
-    match estimate_heatup(
-        current_c,
-        target_c,
-        rate,
-        cooldown,
-        minutes_until_deadline,
-        max_duration,
-    ) {
+    match estimate_heatup(current_c, target_c, rate, cooldown, minutes_until_deadline) {
         // Stays warm through the deadline — block only, no heat-up.
         None => Ok(WarmByPlan {
             heatup_start: None,
@@ -469,8 +461,6 @@ async fn set_warm_by(
     let plan = plan_warm_by(&state, deadline, target_c).await?;
     let cmd = WarmByCommand {
         heatup_start: plan.heatup_start,
-        target_c,
-        max_duration: Duration::from_mins(u64::from(state.config.warm_by_max_duration_minutes)),
     };
     let scheduled = handle
         .schedule_warm_by(cmd)
