@@ -26,6 +26,10 @@ pub struct MockState {
     pub last_set_authorization: Option<String>,
     pub last_set_body: Option<serde_json::Value>,
     pub get_returns_error: bool,
+    /// When true, the PUT (set) endpoint returns a 500 so callers exercise
+    /// their push-failure handling. The attempted value is still recorded in
+    /// `set_calls` before the error so tests can assert the push was tried.
+    pub set_returns_error: bool,
 }
 
 pub type SharedMock = Arc<Mutex<MockState>>;
@@ -35,7 +39,7 @@ async fn put_onoff(
     headers: HeaderMap,
     Path((_id, _cap)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let mut s = state.lock().unwrap();
     s.last_set_authorization = headers
         .get("authorization")
@@ -46,7 +50,10 @@ async fn put_onoff(
         s.pump_on = v;
         s.set_calls.push(v);
     }
-    Json(json!({}))
+    if s.set_returns_error {
+        return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    Ok(Json(json!({})))
 }
 
 async fn get_device(

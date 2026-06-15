@@ -573,6 +573,198 @@ mod tests {
         assert!(matches!(result.unwrap_err(), ApiError::InternalError));
     }
 
+    // --- Unexpected-response arms: actor returns a response shape the read
+    //     helpers don't expect, which must surface as InternalError. ---
+
+    #[tokio::test]
+    async fn test_read_parameter_value_unexpected_raw_registers() {
+        let (tx, mut rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+
+        let handle = tokio::spawn(async move {
+            read_parameter_value(&tx, CTC_ROOM_TEMP, "test_context", timeout).await
+        });
+
+        if let Some((ParameterOperation::Read(_), response_tx)) = rx.recv().await {
+            response_tx
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: 0,
+                    values: vec![1, 2, 3],
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_read_parameter_unexpected_raw_registers() {
+        let (tx, mut rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+
+        let handle = tokio::spawn(async move {
+            read_parameter(&tx, CTC_ROOM_TEMP, "temperature", "test_context", timeout).await
+        });
+
+        if let Some((ParameterOperation::Read(_), response_tx)) = rx.recv().await {
+            response_tx
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: 10,
+                    values: vec![42],
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    // --- write_parameter_value (the JSON-free twin of write_parameter) ---
+
+    #[tokio::test]
+    async fn test_write_parameter_value_success() {
+        let (tx, mut rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+
+        let handle = tokio::spawn(async move {
+            write_parameter_value(&tx, CTC_ROOM_TEMP, 21.0, "test_context", timeout).await
+        });
+
+        if let Some((ParameterOperation::Write(_, value), response_tx)) = rx.recv().await {
+            assert!((value - 21.0).abs() < f32::EPSILON);
+            response_tx.send(Ok(ModbusResponse::Value(value))).unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_write_parameter_value_modbus_error() {
+        let (tx, mut rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+
+        let handle = tokio::spawn(async move {
+            write_parameter_value(&tx, CTC_ROOM_TEMP, 21.0, "test_context", timeout).await
+        });
+
+        if let Some((ParameterOperation::Write(_, _), response_tx)) = rx.recv().await {
+            response_tx
+                .send(Err(ModbusError::ReadOnly { register: 1000 }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn test_write_parameter_value_timeout() {
+        let (tx, _rx) = create_mock_channel();
+        let timeout = Duration::from_millis(1);
+
+        let result = write_parameter_value(&tx, CTC_ROOM_TEMP, 21.0, "test_context", timeout).await;
+
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn test_write_parameter_value_channel_closed() {
+        let (tx, rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+        drop(rx);
+
+        let result = write_parameter_value(&tx, CTC_ROOM_TEMP, 21.0, "test_context", timeout).await;
+
+        assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
+    }
+
+    // --- request_stats: cover the error / wrong-variant arms. The success
+    //     arm needs a fully-populated ModbusStats which is only produced by a
+    //     live actor's snapshot_stats(), so it's exercised end-to-end through
+    //     the actor's own tests, not reconstructable cheaply here. ---
+
+    #[tokio::test]
+    async fn test_request_stats_unexpected_value() {
+        let (tx, mut rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+
+        let handle = tokio::spawn(async move { request_stats(&tx, timeout).await });
+
+        if let Some((ParameterOperation::GetStats, response_tx)) = rx.recv().await {
+            response_tx.send(Ok(ModbusResponse::Value(1.0))).unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_request_stats_unexpected_raw_registers() {
+        let (tx, mut rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+
+        let handle = tokio::spawn(async move { request_stats(&tx, timeout).await });
+
+        if let Some((ParameterOperation::GetStats, response_tx)) = rx.recv().await {
+            response_tx
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: 0,
+                    values: vec![],
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_request_stats_modbus_error() {
+        let (tx, mut rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+
+        let handle = tokio::spawn(async move { request_stats(&tx, timeout).await });
+
+        if let Some((ParameterOperation::GetStats, response_tx)) = rx.recv().await {
+            response_tx
+                .send(Err(ModbusError::Timeout {
+                    register: 0,
+                    operation: "stats".to_string(),
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn test_request_stats_timeout() {
+        let (tx, _rx) = create_mock_channel();
+        let timeout = Duration::from_millis(1);
+
+        let result = request_stats(&tx, timeout).await;
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn test_request_stats_channel_closed() {
+        let (tx, rx) = create_mock_channel();
+        let timeout = Duration::from_secs(5);
+        drop(rx);
+
+        let result = request_stats(&tx, timeout).await;
+        assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
+    }
+
+    #[test]
+    fn test_format_value_json_emits_number() {
+        let out = format_value_json("temperature", 22.5).unwrap();
+        assert_eq!(out, "{\"temperature\":22.5}\n");
+    }
+
     #[tokio::test]
     async fn test_read_parameter_value_out_of_range_error() {
         let (tx, mut rx) = create_mock_channel();

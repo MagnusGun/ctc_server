@@ -190,3 +190,180 @@ impl DhwError {
         (code, axum::Json(serde_json::to_value(&body).unwrap()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn assert_float_eq(a: f32, b: f32, msg: &str) {
+        assert!((a - b).abs() < f32::EPSILON, "{msg}: expected {b}, got {a}");
+    }
+
+    #[test]
+    fn comfort_from_query_accepts_writable() {
+        assert_eq!(
+            ComfortLevel::from_query("economy"),
+            Some(ComfortLevel::Economy)
+        );
+        assert_eq!(
+            ComfortLevel::from_query("normal"),
+            Some(ComfortLevel::Normal)
+        );
+        assert_eq!(
+            ComfortLevel::from_query("komfort"),
+            Some(ComfortLevel::Komfort)
+        );
+        assert_eq!(
+            ComfortLevel::from_query("comfort"),
+            Some(ComfortLevel::Komfort)
+        );
+        // Case-insensitive.
+        assert_eq!(
+            ComfortLevel::from_query("ECONOMY"),
+            Some(ComfortLevel::Economy)
+        );
+    }
+
+    #[test]
+    fn comfort_from_query_rejects_manuell_and_unknown() {
+        assert_eq!(ComfortLevel::from_query("manuell"), None);
+        assert_eq!(ComfortLevel::from_query("garbage"), None);
+        assert_eq!(ComfortLevel::from_query(""), None);
+    }
+
+    #[test]
+    fn comfort_as_scaled() {
+        assert_float_eq(ComfortLevel::Economy.as_scaled().unwrap(), 0.0, "economy");
+        assert_float_eq(ComfortLevel::Normal.as_scaled().unwrap(), 1.0, "normal");
+        assert_float_eq(ComfortLevel::Komfort.as_scaled().unwrap(), 2.0, "komfort");
+        assert_eq!(ComfortLevel::Manuell.as_scaled(), None);
+    }
+
+    #[test]
+    fn comfort_from_raw() {
+        assert_eq!(ComfortLevel::from_raw(0), ComfortLevel::Economy);
+        assert_eq!(ComfortLevel::from_raw(1), ComfortLevel::Normal);
+        assert_eq!(ComfortLevel::from_raw(2), ComfortLevel::Komfort);
+        // Anything else (including 3 and negatives) falls back to Manuell.
+        assert_eq!(ComfortLevel::from_raw(3), ComfortLevel::Manuell);
+        assert_eq!(ComfortLevel::from_raw(-1), ComfortLevel::Manuell);
+        assert_eq!(ComfortLevel::from_raw(99), ComfortLevel::Manuell);
+    }
+
+    #[test]
+    fn comfort_serde_roundtrip_lowercase() {
+        // serde rename_all = "lowercase"
+        let json = serde_json::to_string(&ComfortLevel::Komfort).unwrap();
+        assert_eq!(json, "\"komfort\"");
+        let back: ComfortLevel = serde_json::from_str("\"economy\"").unwrap();
+        assert_eq!(back, ComfortLevel::Economy);
+    }
+
+    #[test]
+    fn start_report_serializes_outcome_tag() {
+        let end = chrono::Utc.with_ymd_and_hms(2026, 1, 4, 12, 0, 0).unwrap();
+        let started = StartReport::Started { scheduled_end: end };
+        let v = serde_json::to_value(&started).unwrap();
+        assert_eq!(v["outcome"], "started");
+        assert!(v["scheduled_end"].is_string());
+
+        let at_target = StartReport::AlreadyAtTarget {
+            dhw_c: 52.5,
+            target_c: 50.0,
+        };
+        let v = serde_json::to_value(&at_target).unwrap();
+        assert_eq!(v["outcome"], "already_at_target");
+        assert!((v["dhw_c"].as_f64().unwrap() - 52.5).abs() < 1e-6);
+        assert!((v["target_c"].as_f64().unwrap() - 50.0).abs() < 1e-6);
+    }
+
+    fn body_of(err: DhwError) -> (StatusCode, serde_json::Value) {
+        let (code, json) = err.into_response();
+        (code, json.0)
+    }
+
+    #[test]
+    fn into_response_boost_already_active() {
+        let (code, body) = body_of(DhwError::BoostAlreadyActive);
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "boost_already_active");
+        // Optional fields are skipped.
+        assert!(body.get("field").is_none());
+    }
+
+    #[test]
+    fn into_response_price_not_cheap_carries_level() {
+        let (code, body) = body_of(DhwError::PriceNotCheap {
+            current_level: "Expensive".to_string(),
+        });
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "price_not_cheap");
+        assert_eq!(body["current_level"], "Expensive");
+    }
+
+    #[test]
+    fn into_response_hours_out_of_range_carries_field_and_range() {
+        let (code, body) = body_of(DhwError::HoursOutOfRange { min: 0.5, max: 6.0 });
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "out_of_range");
+        assert_eq!(body["field"], "hours");
+        assert!((body["min"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert!((body["max"].as_f64().unwrap() - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn into_response_shower_cannot_be_cancelled() {
+        let (code, body) = body_of(DhwError::ShowerCannotBeCancelled);
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "shower_runs_to_completion");
+    }
+
+    #[test]
+    fn into_response_modbus_carries_detail() {
+        let (code, body) = body_of(DhwError::Modbus("bus timeout".to_string()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "modbus");
+        assert_eq!(body["detail"], "bus timeout");
+    }
+
+    #[test]
+    fn into_response_homey_override_failed() {
+        let (code, body) = body_of(DhwError::HomeyOverrideSendFailed);
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "homey_override_unavailable");
+    }
+
+    #[test]
+    fn into_response_smartgrid_carries_detail() {
+        let (code, body) = body_of(DhwError::SmartGrid("gpio busy".to_string()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "smartgrid");
+        assert_eq!(body["detail"], "gpio busy");
+    }
+
+    #[test]
+    fn into_response_sensor_carries_field() {
+        let (code, body) = body_of(DhwError::Sensor("dhw_temp"));
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "sensor_unavailable");
+        assert_eq!(body["field"], "dhw_temp");
+    }
+
+    #[test]
+    fn into_response_persistence_carries_detail() {
+        let (code, body) = body_of(DhwError::Persistence("disk full".to_string()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "persistence");
+        assert_eq!(body["detail"], "disk full");
+    }
+
+    #[test]
+    fn cancel_reason_is_constructible_and_comparable() {
+        // CancelReason is a plain marker enum used at boundaries; assert the
+        // derived PartialEq distinguishes variants.
+        assert_eq!(CancelReason::TimerExpired, CancelReason::TimerExpired);
+        assert_ne!(CancelReason::TimerExpired, CancelReason::Manual);
+        assert_ne!(CancelReason::RoomTooCold, CancelReason::PriceLeftCheap);
+    }
+}

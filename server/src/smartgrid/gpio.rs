@@ -43,6 +43,12 @@ pub struct GpioController {
     /// manual override that races a waking timer is detected.
     /// Belt-and-suspenders given the actor already serialises commands.
     mode_generation: u64,
+    /// Test-only seam: when true, `set_mode` updates in-memory bookkeeping
+    /// without issuing the hardware ioctl, letting tests drive the actor's
+    /// post-set scheduling paths. Always false in production
+    /// (`request` is `Some`, so this flag is never consulted there).
+    #[cfg(test)]
+    test_accept_writes: bool,
 }
 
 impl GpioController {
@@ -94,6 +100,8 @@ impl GpioController {
             current_mode: SmartGridMode::Normal,
             mode_changed_at: None,
             mode_generation: 0,
+            #[cfg(test)]
+            test_accept_writes: false,
         })
     }
 
@@ -110,6 +118,24 @@ impl GpioController {
             current_mode: SmartGridMode::Normal,
             mode_changed_at: None,
             mode_generation: 0,
+            test_accept_writes: false,
+        }
+    }
+
+    /// Test-only constructor whose `set_mode` succeeds in memory without any
+    /// hardware ioctl. Lets tests drive the actor's post-set scheduling,
+    /// resume-timer, and cancellation paths. Production never uses this.
+    #[cfg(test)]
+    pub fn new_for_test_accepting(gpio_k24: u32, gpio_k25: u32, active_low: bool) -> Self {
+        Self {
+            gpio_k24,
+            gpio_k25,
+            active_low,
+            request: None,
+            current_mode: SmartGridMode::Normal,
+            mode_changed_at: None,
+            mode_generation: 0,
+            test_accept_writes: true,
         }
     }
 
@@ -191,26 +217,36 @@ impl GpioController {
             if k25_closed { "closed" } else { "open" }
         );
 
-        let request = self
-            .request
-            .as_ref()
-            .ok_or_else(|| "GPIO request not initialised (test-only controller)".to_string())?;
+        // Test seam: a test controller built via `new_for_test_accepting`
+        // skips the ioctl and just updates bookkeeping below. Production
+        // always holds a `request`, so this branch is dead there.
+        #[cfg(test)]
+        let skip_hardware = self.test_accept_writes;
+        #[cfg(not(test))]
+        let skip_hardware = false;
 
-        let mut values = Values::default();
-        values
-            .set(self.gpio_k24, self.gpio_level(k24_closed))
-            .set(self.gpio_k25, self.gpio_level(k25_closed));
+        if !skip_hardware {
+            let request = self
+                .request
+                .as_ref()
+                .ok_or_else(|| "GPIO request not initialised (test-only controller)".to_string())?;
 
-        request.set_values(&values).map_err(|e| {
-            error!(
-                "Failed to write GPIO K24={}/K25={}: {e}",
-                self.gpio_k24, self.gpio_k25
-            );
-            format!(
-                "Failed to write GPIO K24={}/K25={}: {e}",
-                self.gpio_k24, self.gpio_k25
-            )
-        })?;
+            let mut values = Values::default();
+            values
+                .set(self.gpio_k24, self.gpio_level(k24_closed))
+                .set(self.gpio_k25, self.gpio_level(k25_closed));
+
+            request.set_values(&values).map_err(|e| {
+                error!(
+                    "Failed to write GPIO K24={}/K25={}: {e}",
+                    self.gpio_k24, self.gpio_k25
+                );
+                format!(
+                    "Failed to write GPIO K24={}/K25={}: {e}",
+                    self.gpio_k24, self.gpio_k25
+                )
+            })?;
+        }
 
         if self.current_mode != mode {
             self.mode_changed_at = Some(SystemTime::now());
@@ -257,5 +293,29 @@ mod tests {
         let mut controller = GpioController::new_for_test(20, 21, false);
         let err = controller.set_mode(SmartGridMode::Blocking).unwrap_err();
         assert!(err.contains("not initialised"));
+    }
+
+    #[test]
+    fn test_accepting_controller_set_mode_updates_bookkeeping() {
+        // The accepting seam must behave like a successful hardware write:
+        // mode is recorded and the changed-at timestamp is stamped.
+        let mut controller = GpioController::new_for_test_accepting(20, 21, false);
+        assert!(matches!(controller.read_mode(), SmartGridMode::Normal));
+        assert!(controller.mode_changed_at().is_none());
+
+        controller.set_mode(SmartGridMode::Blocking).unwrap();
+        assert!(matches!(controller.read_mode(), SmartGridMode::Blocking));
+        assert!(controller.mode_changed_at().is_some());
+    }
+
+    #[test]
+    fn test_accepting_controller_same_mode_keeps_timestamp() {
+        // Re-applying the current mode must not refresh mode_changed_at
+        // (mirrors the production guard `if self.current_mode != mode`).
+        let mut controller = GpioController::new_for_test_accepting(20, 21, false);
+        controller.set_mode(SmartGridMode::Blocking).unwrap();
+        let first = controller.mode_changed_at().unwrap();
+        controller.set_mode(SmartGridMode::Blocking).unwrap();
+        assert_eq!(controller.mode_changed_at().unwrap(), first);
     }
 }

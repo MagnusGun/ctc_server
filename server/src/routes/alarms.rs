@@ -706,6 +706,45 @@ mod tests {
         (state, rx)
     }
 
+    /// State with a zero-second request timeout so a handler awaiting a reply
+    /// that never arrives hits the `Err(Elapsed)` arm immediately.
+    fn create_mock_state_timeout() -> (AlarmState, MockReceiver) {
+        let (tx, rx) = mpsc::channel(10);
+        let state = AlarmState {
+            sender: tx,
+            request_timeout_secs: 0,
+        };
+        (state, rx)
+    }
+
+    /// Encode a string into a low-byte-first text-buffer register vector, the
+    /// same layout `decode_text_buffer` expects (two chars per register, low
+    /// byte first). Pads to `TEXT_BUFFER_COUNT` registers with zeros.
+    fn encode_text_buffer(s: &str) -> Vec<u16> {
+        let bytes = s.as_bytes();
+        let mut regs = vec![0u16; usize::from(TEXT_BUFFER_COUNT)];
+        for (i, chunk) in bytes.chunks(2).enumerate() {
+            if i >= regs.len() {
+                break;
+            }
+            let lo = u16::from(chunk[0]);
+            let hi = chunk.get(1).map_or(0, |&b| u16::from(b));
+            regs[i] = (hi << 8) | lo;
+        }
+        regs
+    }
+
+    /// Remove specific references from the global alarm-text cache so a test
+    /// can deterministically force a cache miss (device fetch) for them.
+    fn evict_cache(refs: &[u16]) {
+        let mut cache = ALARM_TEXT_CACHE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for r in refs {
+            cache.remove(r);
+        }
+    }
+
     #[test]
     fn test_decode_text_buffer() {
         // Test with "[E040] Low" encoded as low-byte first, high-byte second
@@ -1104,5 +1143,438 @@ mod tests {
             !first.contains_key(&stale_key),
             "stale entry should have been evicted by cleanup_inactive_codes"
         );
+    }
+
+    // --- get_alarm_status: remaining response arms ---
+
+    #[tokio::test]
+    async fn test_get_alarm_status_unexpected_raw_registers() {
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_alarm_status(State(state)).await });
+
+        // A scalar count read must reply with Value; RawRegisters is wrong.
+        if let Some((ParameterOperation::Read(_), response_tx)) = rx.recv().await {
+            response_tx
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: 65001,
+                    values: vec![1],
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_get_alarm_status_timeout() {
+        let (state, mut rx) = create_mock_state_timeout();
+
+        let handle = tokio::spawn(async move { get_alarm_status(State(state)).await });
+
+        // Receive but never respond; the zero-second timeout elapses.
+        let _held = rx.recv().await.map(|(_, tx)| tx);
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    // --- get_alarms: full text-fetch path via the shared fake actor ---
+
+    /// One active alarm (E040). Drives the full handler: count -> alarm
+    /// bitmask scan -> transfer-register write -> text-buffer read -> decode
+    /// -> translation/description lookup. Asserts the decoded code, the raw
+    /// message, and that the English/Swedish lookups resolve from the catalog.
+    #[tokio::test]
+    async fn test_get_alarms_one_alarm_full_fetch() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
+        // Force a device fetch for ref 40 so the transfer/read/decode path runs.
+        evict_cache(&[40]);
+
+        // Alarm ref 40 => bitmask register index 40/16 = 2 (addr 65012), bit 8.
+        let mut reads = std::collections::HashMap::new();
+        reads.insert(CTC_ALARM_INFO_COUNT.id, 1u16); // 1 alarm, 0 infos
+        reads.insert(ALARM_BITMASK_START + 2, 1u16 << 8); // bit 8 of reg 2 => ref 40
+        // Seed the text buffer with the device text for E040.
+        for (i, &v) in encode_text_buffer("[E040] Low brine flow")
+            .iter()
+            .enumerate()
+        {
+            reads.insert(TEXT_BUFFER_START_REG + u16::try_from(i).unwrap(), v);
+        }
+
+        let sender = crate::modbus::test_support::spawn_fake_actor(reads);
+        let state = AlarmState {
+            sender,
+            request_timeout_secs: 5,
+        };
+
+        let json = get_alarms(State(state)).await.expect("get_alarms");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(v["alarm_count"].as_u64(), Some(1));
+        assert_eq!(v["info_count"].as_u64(), Some(0));
+        // partial is omitted (false) when all reads succeed.
+        assert!(v.get("partial").is_none());
+
+        let alarms = v["alarms"].as_array().expect("alarms array");
+        assert_eq!(alarms.len(), 1);
+        let a = &alarms[0];
+        assert_eq!(a["reference"].as_u64(), Some(40));
+        assert_eq!(a["code"].as_str(), Some("E040"));
+        assert_eq!(a["message"].as_str(), Some("Low brine flow"));
+        // Catalog lookups resolve for E040.
+        assert_eq!(a["message_en"].as_str(), Some("Low brine flow"));
+        assert_eq!(
+            a["description"].as_str(),
+            Some("Insufficient brine flow - check circulation pump and pipes for blockage")
+        );
+        assert_eq!(
+            a["description_sv"].as_str(),
+            Some("Otillräckligt köldbärarflöde - kontrollera pump och rör")
+        );
+        assert!(a["first_seen"].is_string());
+    }
+
+    /// Cache-hit path: prime the global cache for the active reference, then
+    /// drive `get_alarms` with a fake actor whose text-buffer registers are
+    /// EMPTY. If the handler re-read the device it would decode an empty
+    /// message; instead it serves the primed cache entry, proving the
+    /// transfer-write / text-read round trip was skipped.
+    #[tokio::test]
+    async fn test_get_alarms_cache_hit_skips_device_read() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
+
+        let alarm_ref: u16 = 40;
+        // Prime the cache with a sentinel message distinct from anything the
+        // empty text buffer could decode to.
+        {
+            let mut cache = ALARM_TEXT_CACHE
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.insert(
+                alarm_ref,
+                CachedAlarmText {
+                    code: Some("E040".to_string()),
+                    message: "CACHED-SENTINEL".to_string(),
+                    raw_text: "[E040] CACHED-SENTINEL".to_string(),
+                },
+            );
+        }
+
+        let mut reads = std::collections::HashMap::new();
+        reads.insert(CTC_ALARM_INFO_COUNT.id, 1u16); // 1 alarm
+        reads.insert(ALARM_BITMASK_START + 2, 1u16 << 8); // ref 40
+        // Deliberately DO NOT seed text-buffer registers (all read as 0).
+
+        let sender = crate::modbus::test_support::spawn_fake_actor(reads);
+        let state = AlarmState {
+            sender,
+            request_timeout_secs: 5,
+        };
+
+        let json = get_alarms(State(state)).await.expect("get_alarms");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let a = &v["alarms"].as_array().expect("alarms array")[0];
+        // The cached message wins; an empty-buffer re-read would NOT yield this.
+        assert_eq!(a["message"].as_str(), Some("CACHED-SENTINEL"));
+        assert_eq!(a["code"].as_str(), Some("E040"));
+    }
+
+    /// Active alarm AND active info, both served from primed cache. Confirms
+    /// both vectors populate and the info reference is reported as the bare
+    /// index (not the `INFO_REF_OFFSET`-adjusted value).
+    #[tokio::test]
+    async fn test_get_alarms_alarm_and_info() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
+
+        let alarm_ref: u16 = 40;
+        let info_idx: u16 = 19;
+        let info_reference = info_ref(info_idx);
+        {
+            let mut cache = ALARM_TEXT_CACHE
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.insert(
+                alarm_ref,
+                CachedAlarmText {
+                    code: Some("E040".to_string()),
+                    message: "Low brine flow".to_string(),
+                    raw_text: "[E040] Low brine flow".to_string(),
+                },
+            );
+            cache.insert(
+                info_reference,
+                CachedAlarmText {
+                    code: Some("I019".to_string()),
+                    message: "Smart: Low price".to_string(),
+                    raw_text: "[I019] Smart: Low price".to_string(),
+                },
+            );
+        }
+
+        let mut reads = std::collections::HashMap::new();
+        reads.insert(CTC_ALARM_INFO_COUNT.id, (1u16 << 8) | 1); // 1 alarm, 1 info
+        reads.insert(ALARM_BITMASK_START + 2, 1u16 << 8); // alarm ref 40
+        // Info idx 19 => reg index 19/16 = 1 (addr INFO_BITMASK_START+1), bit 3.
+        reads.insert(INFO_BITMASK_START + 1, 1u16 << 3);
+
+        let sender = crate::modbus::test_support::spawn_fake_actor(reads);
+        let state = AlarmState {
+            sender,
+            request_timeout_secs: 5,
+        };
+
+        let json = get_alarms(State(state)).await.expect("get_alarms");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(v["alarm_count"].as_u64(), Some(1));
+        assert_eq!(v["info_count"].as_u64(), Some(1));
+
+        let info = &v["infos"].as_array().expect("infos array")[0];
+        // Reported reference is the bare index, not info_ref(19).
+        assert_eq!(info["reference"].as_u64(), Some(u64::from(info_idx)));
+        assert_eq!(info["code"].as_str(), Some("I019"));
+        assert_eq!(info["message_en"].as_str(), Some("Smart: Low price"));
+    }
+
+    /// Count reports an alarm, but the bitmask read fails. The handler must
+    /// not error: it returns an empty alarm list with `partial = true`.
+    #[tokio::test]
+    async fn test_get_alarms_bitmask_read_failure_is_partial() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_alarms(State(state)).await });
+
+        // 1. Count read: 1 alarm, 0 infos.
+        let (op, tx) = rx.recv().await.expect("count read");
+        assert!(matches!(op, ParameterOperation::Read(_)));
+        tx.send(Ok(ModbusResponse::Value(1.0))).unwrap();
+
+        // 2. Alarm bitmask read: reply with an error.
+        let (op, tx) = rx.recv().await.expect("bitmask read");
+        assert!(matches!(op, ParameterOperation::ReadRawRegisters { .. }));
+        tx.send(Err(ModbusError::Timeout {
+            register: ALARM_BITMASK_START,
+            operation: "bitmask".to_string(),
+        }))
+        .unwrap();
+
+        let json = handle.await.unwrap().expect("get_alarms");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["alarm_count"].as_u64(), Some(0));
+        assert_eq!(v["alarms"].as_array().expect("alarms").len(), 0);
+        assert_eq!(v["partial"].as_bool(), Some(true));
+    }
+
+    /// Bitmask scan finds an active alarm but its text fetch fails. The alarm
+    /// is dropped from the list and `partial` is set.
+    #[tokio::test]
+    async fn test_get_alarms_text_fetch_failure_is_partial() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
+        evict_cache(&[40]);
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_alarms(State(state)).await });
+
+        // 1. Count: 1 alarm.
+        let (_, tx) = rx.recv().await.expect("count read");
+        tx.send(Ok(ModbusResponse::Value(1.0))).unwrap();
+
+        // 2. Alarm bitmask: set bit for ref 40.
+        let (_, tx) = rx.recv().await.expect("bitmask read");
+        let mut bitmask = vec![0u16; usize::from(ALARM_BITMASK_COUNT)];
+        bitmask[2] = 1u16 << 8;
+        tx.send(Ok(ModbusResponse::RawRegisters {
+            start: ALARM_BITMASK_START,
+            values: bitmask,
+        }))
+        .unwrap();
+
+        // 3. Transfer-register write succeeds.
+        let (op, tx) = rx.recv().await.expect("transfer write");
+        assert!(matches!(op, ParameterOperation::WriteRawRegister { .. }));
+        tx.send(Ok(ModbusResponse::Value(40.0))).unwrap();
+
+        // 4. Text-buffer read fails.
+        let (op, tx) = rx.recv().await.expect("text read");
+        assert!(matches!(op, ParameterOperation::ReadRawRegisters { .. }));
+        tx.send(Err(ModbusError::Timeout {
+            register: TEXT_BUFFER_START_REG,
+            operation: "text".to_string(),
+        }))
+        .unwrap();
+
+        let json = handle.await.unwrap().expect("get_alarms");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["alarm_count"].as_u64(), Some(0));
+        assert_eq!(v["partial"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_get_alarms_count_unexpected_response() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_alarms(State(state)).await });
+
+        if let Some((ParameterOperation::Read(_), response_tx)) = rx.recv().await {
+            response_tx
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: 65001,
+                    values: vec![1],
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_get_alarms_count_timeout() {
+        let _guard = crate::messages::types::clear_alarm_first_seen_guard();
+        let (state, mut rx) = create_mock_state_timeout();
+
+        let handle = tokio::spawn(async move { get_alarms(State(state)).await });
+        let _held = rx.recv().await.map(|(_, tx)| tx);
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    // --- get_or_fetch_alarm_text: error/unexpected arms ---
+
+    #[tokio::test]
+    async fn test_get_or_fetch_alarm_text_write_error() {
+        evict_cache(&[5000]);
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_or_fetch_alarm_text(&state, 5000).await });
+
+        // Transfer-register write fails.
+        let (op, tx) = rx.recv().await.expect("transfer write");
+        assert!(matches!(op, ParameterOperation::WriteRawRegister { .. }));
+        tx.send(Err(ModbusError::Timeout {
+            register: TEXT_BUFFER_TRANSFER_REG,
+            operation: "transfer".to_string(),
+        }))
+        .unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn test_get_or_fetch_alarm_text_unexpected_value_on_read() {
+        evict_cache(&[5001]);
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_or_fetch_alarm_text(&state, 5001).await });
+
+        // Transfer write OK.
+        let (_, tx) = rx.recv().await.expect("transfer write");
+        tx.send(Ok(ModbusResponse::Value(5001.0))).unwrap();
+
+        // Text-buffer read returns a scalar Value instead of RawRegisters.
+        let (op, tx) = rx.recv().await.expect("text read");
+        assert!(matches!(op, ParameterOperation::ReadRawRegisters { .. }));
+        tx.send(Ok(ModbusResponse::Value(0.0))).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_get_or_fetch_alarm_text_decodes_and_caches() {
+        evict_cache(&[5002]);
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_or_fetch_alarm_text(&state, 5002).await });
+
+        let (_, tx) = rx.recv().await.expect("transfer write");
+        tx.send(Ok(ModbusResponse::Value(5002.0))).unwrap();
+
+        let (_, tx) = rx.recv().await.expect("text read");
+        tx.send(Ok(ModbusResponse::RawRegisters {
+            start: TEXT_BUFFER_START_REG,
+            values: encode_text_buffer("[E040] Low brine flow"),
+        }))
+        .unwrap();
+
+        let cached = handle.await.unwrap().expect("cached text");
+        assert_eq!(cached.code.as_deref(), Some("E040"));
+        assert_eq!(cached.message, "Low brine flow");
+
+        // The entry must now be in the global cache.
+        let cache = ALARM_TEXT_CACHE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            cache.get(&5002).map(|c| c.message.as_str()),
+            Some("Low brine flow")
+        );
+    }
+
+    // --- read_raw_registers: error/unexpected arms ---
+
+    #[tokio::test]
+    async fn test_read_raw_registers_unexpected_value() {
+        let (state, mut rx) = create_mock_state();
+
+        let handle =
+            tokio::spawn(async move { read_raw_registers(&state, ALARM_BITMASK_START, 1).await });
+
+        let (op, tx) = rx.recv().await.expect("raw read");
+        assert!(matches!(op, ParameterOperation::ReadRawRegisters { .. }));
+        tx.send(Ok(ModbusResponse::Value(1.0))).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_read_raw_registers_timeout() {
+        let (state, mut rx) = create_mock_state_timeout();
+
+        let handle =
+            tokio::spawn(async move { read_raw_registers(&state, ALARM_BITMASK_START, 1).await });
+        let _held = rx.recv().await.map(|(_, tx)| tx);
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    // --- lookup helpers: None and not-found branches ---
+
+    #[test]
+    fn test_lookup_none_code() {
+        assert!(lookup_translation(None).is_none());
+        assert!(lookup_description(None).is_none());
+        assert!(lookup_description_sv(None).is_none());
+    }
+
+    #[test]
+    fn test_lookup_unknown_code() {
+        assert!(lookup_translation(Some("ZZZZ")).is_none());
+        assert!(lookup_description(Some("ZZZZ")).is_none());
+        assert!(lookup_description_sv(Some("ZZZZ")).is_none());
+    }
+
+    #[test]
+    fn test_lookup_known_code() {
+        assert_eq!(
+            lookup_translation(Some("E040")).as_deref(),
+            Some("Low brine flow")
+        );
+    }
+
+    #[test]
+    fn test_decode_info_ref_roundtrip() {
+        assert_eq!(decode_info_ref(info_ref(19)), Some(19));
+        // A reference below the info offset is not an info ref.
+        assert_eq!(decode_info_ref(40), None);
     }
 }

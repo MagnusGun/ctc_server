@@ -500,6 +500,78 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_price_trend_negative_first_falling() {
+        // First quarter averages -0.05, last quarter averages -0.20 — the
+        // absolute-change branch (diff < -0.05) classifies this as falling.
+        let mut prices: Vec<PricePoint> = (0..6)
+            .map(|_| PricePoint::from_spot(String::new(), String::new(), -0.05, 0.0, 0.0))
+            .collect();
+        prices.extend(
+            (0..18).map(|_| PricePoint::from_spot(String::new(), String::new(), -0.20, 0.0, 0.0)),
+        );
+        assert_eq!(calculate_price_trend(&prices), "falling");
+    }
+
+    #[test]
+    fn test_calculate_price_trend_negative_first_stable() {
+        // First and last quarters both average -0.05 — diff is 0, so the
+        // absolute-change branch yields stable (neither >0.05 nor <-0.05).
+        let prices: Vec<PricePoint> = (0..24)
+            .map(|_| PricePoint::from_spot(String::new(), String::new(), -0.05, 0.0, 0.0))
+            .collect();
+        assert_eq!(calculate_price_trend(&prices), "stable");
+    }
+
+    #[tokio::test]
+    async fn test_get_grid_status_reflects_current_quarter() {
+        // A set current quarter must surface verbatim in the response,
+        // exercising the populated current_quarter_kwh read path rather than
+        // the zero default. update_current_quarter is deterministic (no
+        // tariff/month gating, unlike peak tracking).
+        let state = create_test_state();
+        state.grid_state.update_current_quarter(0.8);
+
+        let json = get_grid_status(State(state))
+            .await
+            .expect("get_grid_status");
+        let v = parse(&json);
+        let q = v["current_quarter_kwh"].as_f64().unwrap();
+        assert!(
+            (q - 0.8).abs() < 1e-9,
+            "current quarter must reflect the set value, got {q}"
+        );
+        assert!(v["consumption_15min"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_prices_with_tomorrow_populated() {
+        // Today + tomorrow both populated so the tomorrow `available=true`
+        // branch and its statistics path are exercised.
+        let state = create_test_state();
+        let now = chrono::Utc::now();
+        let today = vec![PricePoint::from_spot(
+            (now - chrono::Duration::minutes(30)).to_rfc3339(),
+            (now + chrono::Duration::minutes(30)).to_rfc3339(),
+            0.42,
+            0.0,
+            0.0,
+        )];
+        let tomorrow = vec![PricePoint::from_spot(
+            (now + chrono::Duration::hours(24)).to_rfc3339(),
+            (now + chrono::Duration::hours(25)).to_rfc3339(),
+            0.30,
+            0.0,
+            0.0,
+        )];
+        state.price_state.update_prices(today, tomorrow);
+
+        let json = get_prices(State(state)).await.expect("get_prices");
+        let v = parse(&json);
+        assert_eq!(v["tomorrow"]["available"].as_bool(), Some(true));
+        assert_eq!(v["tomorrow"]["prices"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
     fn test_calculate_price_trend_zero_first_stable() {
         // First quarter averages 0.0, last quarter also 0.0 — stable, not NaN.
         let prices: Vec<PricePoint> = (0..24)

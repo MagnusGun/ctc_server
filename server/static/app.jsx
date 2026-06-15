@@ -945,17 +945,23 @@ function App() {
                   {pumpResp && !pumpMeta?.error && (() => {
                     // Circulation pump state from the Homey integration. Hidden
                     // when /pump returns 503 (Homey integration disabled).
-                    const on = pumpResp.on;
+                    // When the heating system is off (status 0), the heater
+                    // relay cuts power to the pump, so it cannot run regardless
+                    // of the last (now stale) plug reading — show Off.
+                    const heatingOff = heating?.status === 0;
+                    const on = heatingOff ? false : pumpResp.on;
                     const stale = !!pumpResp.stale;
                     const valueLabel = on == null ? "?" : (on ? "On" : "Off");
                     const stamp = pumpResp.last_observed_unix_secs;
                     const ageText = stamp == null
                       ? "not yet observed"
                       : `updated ${Math.max(0, Math.floor(Date.now() / 1000 - stamp))} s ago`;
-                    const tip = stale
-                      ? `Circulation Pump · Homey unreachable (${ageText})`
-                      : `Circulation Pump · ${ageText}`;
-                    const cls = stale ? "warn" : on ? "on" : "off";
+                    const tip = heatingOff
+                      ? "Circulation Pump · Off — heating is off, heater cut pump power"
+                      : stale
+                        ? `Circulation Pump · Homey unreachable (${ageText})`
+                        : `Circulation Pump · ${ageText}`;
+                    const cls = heatingOff ? "off" : stale ? "warn" : on ? "on" : "off";
                     return (
                       <div className={`status ${cls}`} title={tip}>
                         <span className="lbl">Circ. Pump</span>
@@ -1657,6 +1663,7 @@ function App() {
                               try {
                                 await window.api.setSmartGridMode(backendMode, schedule, resumeAt);
                                 setMode(target);
+                                sgMeta?.refetch?.();   // pull new scheduled_resume_at now, not on next 5s poll
                               } catch (e) {
                                 console.error("SmartGrid POST failed:", e);
                               }
@@ -1678,6 +1685,7 @@ function App() {
                               try {
                                 await window.api.setSmartGridMode("normal", false);
                                 setMode("normal");
+                                sgMeta?.refetch?.();   // clear the band immediately
                               } catch (e) {
                                 console.error("SmartGrid POST failed:", e);
                               }

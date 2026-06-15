@@ -914,4 +914,187 @@ mod tests {
         let state = GridState::new();
         assert!((state.get_current_quarter_kwh() - 0.0).abs() < f64::EPSILON);
     }
+
+    // ==================== maybe_update_peak real-path tests ====================
+    //
+    // These drive the public method (not test_insert_peak) so the tariff
+    // filter, month-change clear, and case-1/case-2 branches are exercised.
+
+    /// A known winter weekday at 10:00 Swedish-local (high tariff) Unix start.
+    /// 2026-01-07 is a Wednesday; CET (UTC+1) so 10:00 local = 09:00 UTC.
+    const HIGH_TARIFF_HOUR: u64 = 1_767_776_400;
+    /// Same Wednesday at 03:00 Swedish-local — outside 07:00-19:59 → low tariff.
+    const LOW_TARIFF_HOUR: u64 = 1_767_751_200;
+
+    #[test]
+    fn maybe_update_peak_skips_nan() {
+        let state = GridState::new();
+        state.maybe_update_peak(HIGH_TARIFF_HOUR, f64::NAN);
+        assert_eq!(state.get_recorded_days_count(), 0);
+    }
+
+    #[test]
+    fn maybe_update_peak_skips_low_tariff_hour() {
+        let state = GridState::new();
+        state.maybe_update_peak(LOW_TARIFF_HOUR, 9.9);
+        assert_eq!(
+            state.get_recorded_days_count(),
+            0,
+            "low-tariff hours must not be recorded as peaks"
+        );
+    }
+
+    #[test]
+    fn maybe_update_peak_records_high_tariff_hour() {
+        let state = GridState::new();
+        state.maybe_update_peak(HIGH_TARIFF_HOUR, 4.2);
+        assert_eq!(state.get_recorded_days_count(), 1);
+        assert!((state.get_top3_average() - 4.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn maybe_update_peak_same_day_keeps_higher_and_ignores_lower() {
+        let state = GridState::new();
+        // Two high-tariff hours on the same day (09:00 and 10:00 local).
+        let h09 = HIGH_TARIFF_HOUR - 3600;
+        state.maybe_update_peak(h09, 3.0);
+        // Higher → replaces (Case 1 update branch).
+        state.maybe_update_peak(HIGH_TARIFF_HOUR, 5.0);
+        // Lower → ignored (Case 1 no-op branch).
+        state.maybe_update_peak(h09, 1.0);
+        assert_eq!(state.get_recorded_days_count(), 1, "still one day");
+        assert!(
+            (state.get_top3_average() - 5.0).abs() < f64::EPSILON,
+            "highest same-day value wins"
+        );
+    }
+
+    #[test]
+    fn maybe_update_peak_fourth_day_replaces_lowest_via_public_path() {
+        let state = GridState::new();
+        // Three distinct winter weekdays, each high-tariff at 10:00 local.
+        let day1 = HIGH_TARIFF_HOUR; // 2026-01-07 Wed
+        let day2 = HIGH_TARIFF_HOUR + 86_400; // 2026-01-08 Thu
+        let day3 = HIGH_TARIFF_HOUR + 2 * 86_400; // 2026-01-09 Fri
+        state.maybe_update_peak(day1, 5.0);
+        state.maybe_update_peak(day2, 4.0);
+        state.maybe_update_peak(day3, 3.0); // lowest of the three
+        assert_eq!(state.get_recorded_days_count(), 3);
+
+        // A 4th weekday (2026-01-12 Mon) higher than the lowest must replace it.
+        let day4 = HIGH_TARIFF_HOUR + 5 * 86_400;
+        state.maybe_update_peak(day4, 6.0);
+        assert_eq!(state.get_recorded_days_count(), 3, "still capped at 3 days");
+        // Top3 now {6,5,4} → avg 5.0; the 3.0 day was evicted.
+        assert!((state.get_top3_average() - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn maybe_update_peak_fourth_day_lower_than_all_is_ignored() {
+        let state = GridState::new();
+        let day1 = HIGH_TARIFF_HOUR;
+        let day2 = HIGH_TARIFF_HOUR + 86_400;
+        let day3 = HIGH_TARIFF_HOUR + 2 * 86_400;
+        state.maybe_update_peak(day1, 5.0);
+        state.maybe_update_peak(day2, 6.0);
+        state.maybe_update_peak(day3, 7.0);
+
+        // 4th day below every stored peak → skipped (Case 2 else branch).
+        let day4 = HIGH_TARIFF_HOUR + 5 * 86_400;
+        state.maybe_update_peak(day4, 1.0);
+        assert_eq!(state.get_recorded_days_count(), 3);
+        assert!((state.get_top3_average() - 6.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn maybe_update_peak_new_month_clears_old_data() {
+        let state = GridState::new();
+        // Seed January.
+        state.maybe_update_peak(HIGH_TARIFF_HOUR, 5.0);
+        assert_eq!(state.get_recorded_days_count(), 1);
+
+        // A high-tariff hour roughly a month later (2026-02-04 Wed 10:00 local
+        // = 31 days after 2026-01-07, still a Wednesday, winter, high tariff).
+        let february = HIGH_TARIFF_HOUR + 28 * 86_400;
+        state.maybe_update_peak(february, 2.0);
+        assert_eq!(
+            state.get_recorded_days_count(),
+            1,
+            "month change clears the January peak, leaving only February"
+        );
+        assert!((state.get_top3_average() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_hour_rounds_and_records_high_tariff() {
+        let state = GridState::new();
+        // 37 minutes into the high-tariff hour → rounds down to the hour start.
+        let mid_hour = SystemTime::UNIX_EPOCH + Duration::from_secs(HIGH_TARIFF_HOUR + 37 * 60);
+        state.record_hour(mid_hour, 3.3);
+        assert_eq!(state.get_recorded_days_count(), 1);
+        let peaks = state.get_top3_hours();
+        assert_eq!(peaks.len(), 1);
+        assert!((peaks[0].kwh - 3.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_hour_skips_low_tariff() {
+        let state = GridState::new();
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(LOW_TARIFF_HOUR);
+        state.record_hour(t, 8.0);
+        assert_eq!(state.get_recorded_days_count(), 0);
+    }
+
+    // ==================== update_current_quarter tests ====================
+
+    #[test]
+    fn update_current_quarter_sets_current_value() {
+        let state = GridState::new();
+        state.update_current_quarter(0.42);
+        assert!((state.get_current_quarter_kwh() - 0.42).abs() < f64::EPSILON);
+        // No quarter boundary crossed → nothing pushed to the history yet.
+        assert!(state.get_consumption_15min().is_empty());
+    }
+
+    #[test]
+    fn update_current_quarter_rollover_records_previous() {
+        let state = GridState::new();
+        // Force the in-memory current quarter into the past so the next call
+        // observes a quarter change and flushes the previous quarter to history.
+        {
+            let mut inner = state.inner.lock().unwrap();
+            inner.current_quarter_start -= 900; // one quarter earlier
+            inner.current_quarter_kwh = 0.7;
+        }
+        state.update_current_quarter(0.1);
+        let entries = state.get_consumption_15min();
+        assert_eq!(entries.len(), 1, "previous quarter recorded on rollover");
+        assert!((entries[0].kwh - 0.7).abs() < f64::EPSILON);
+        // Current value reset to the new sample.
+        assert!((state.get_current_quarter_kwh() - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn update_current_quarter_rollover_drops_nan_previous() {
+        let state = GridState::new();
+        {
+            let mut inner = state.inner.lock().unwrap();
+            inner.current_quarter_start -= 900;
+            inner.current_quarter_kwh = f64::NAN; // poison value must not persist
+        }
+        state.update_current_quarter(0.2);
+        assert!(
+            state.get_consumption_15min().is_empty(),
+            "NaN previous quarter must be dropped, not recorded"
+        );
+    }
+
+    #[test]
+    fn record_quarter_skips_current_quarter() {
+        let state = GridState::new();
+        // Recording the *current* quarter is a no-op (use update_current_quarter).
+        let current = state.inner.lock().unwrap().current_quarter_start;
+        state.record_quarter(current, 0.9);
+        assert!(state.get_consumption_15min().is_empty());
+    }
 }

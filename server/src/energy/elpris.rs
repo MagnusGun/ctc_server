@@ -216,6 +216,71 @@ mod tests {
             "Prices not available"
         );
         assert_eq!(ElprisError::Http(404).to_string(), "HTTP error: 404");
+        assert_eq!(
+            ElprisError::Network("connection refused".to_string()).to_string(),
+            "Network error: connection refused"
+        );
+        assert_eq!(
+            ElprisError::Parse("expected value".to_string()).to_string(),
+            "Parse error: expected value"
+        );
+    }
+
+    #[test]
+    fn test_parse_multi_slot_payload() {
+        // Realistic two-slot payload as the API returns it (15-min slots).
+        let json = r#"[
+            {
+                "SEK_per_kWh": 0.50,
+                "EUR_per_kWh": 0.043,
+                "EXR": 11.54,
+                "time_start": "2026-01-04T00:00:00+01:00",
+                "time_end": "2026-01-04T00:15:00+01:00"
+            },
+            {
+                "SEK_per_kWh": 1.25,
+                "EUR_per_kWh": 0.108,
+                "EXR": 11.54,
+                "time_start": "2026-01-04T00:15:00+01:00",
+                "time_end": "2026-01-04T00:30:00+01:00"
+            }
+        ]"#;
+
+        let entries: Vec<ElprisEntry> = serde_json::from_str(json).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!((entries[0].sek_per_kwh - 0.50).abs() < f64::EPSILON);
+        assert!((entries[1].sek_per_kwh - 1.25).abs() < f64::EPSILON);
+        assert_eq!(entries[0].time_start, "2026-01-04T00:00:00+01:00");
+        assert_eq!(entries[1].time_end, "2026-01-04T00:30:00+01:00");
+        // Slots are wall-clock adjacent: slot0 end == slot1 start.
+        assert_eq!(entries[0].time_end, entries[1].time_start);
+    }
+
+    #[test]
+    fn test_parse_empty_array() {
+        let entries: Vec<ElprisEntry> = serde_json::from_str("[]").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_missing_field_fails() {
+        // Missing the required "EXR" field — deserialization must error,
+        // mirroring the ElprisError::Parse branch in get_prices.
+        let json = r#"[{
+            "SEK_per_kWh": 0.50,
+            "EUR_per_kWh": 0.043,
+            "time_start": "2026-01-04T00:00:00+01:00",
+            "time_end": "2026-01-04T00:15:00+01:00"
+        }]"#;
+
+        let result: Result<Vec<ElprisEntry>, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_malformed_json_fails() {
+        let result: Result<Vec<ElprisEntry>, _> = serde_json::from_str("{not json");
+        assert!(result.is_err());
     }
 
     #[test]

@@ -250,7 +250,11 @@ fn format_system_time(t: SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::modbus::actor::ModbusRequest;
+    use crate::modbus::bms_parameters::{CTC_ROOM_TEMP, HEATSYSTEM_ROOM_SETTEMP};
+    use crate::modbus::test_support::spawn_fake_actor;
     use crate::smartgrid::actor::test_support::spawn_with_test_gpio;
+    use std::collections::HashMap;
+    use std::time::SystemTime;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -264,6 +268,26 @@ mod tests {
         // set_power_save never touches the sender — a closed channel is fine.
         let (tx, _rx) = mpsc::channel::<ModbusRequest>(1);
         tx
+    }
+
+    /// A `ModbusSender` whose receiver is dropped, so sends fail with
+    /// `ServiceUnavailable`.
+    fn closed_modbus_sender() -> ModbusSender {
+        let (tx, rx) = mpsc::channel::<ModbusRequest>(1);
+        drop(rx);
+        tx
+    }
+
+    /// Build a `CtcState` with the given Modbus sender and store. No GPIO.
+    fn ctc_state(store: Store, sender: ModbusSender) -> CtcState {
+        CtcState {
+            store,
+            sender,
+            request_timeout_secs: 5,
+            smartgrid: None,
+            price_state: PriceState::new("SE3".into()),
+            smartgrid_config: test_smartgrid_config(),
+        }
     }
 
     fn test_smartgrid_config() -> SmartGridConfig {
@@ -370,6 +394,234 @@ mod tests {
         )
         .await
         .expect_err("actor gone should fail");
+        assert!(matches!(err, ApiError::ServiceUnavailable));
+    }
+
+    // --- get_ctc_data: read paths ---
+
+    #[tokio::test]
+    async fn get_ctc_data_reads_from_modbus_for_non_polled_addr() {
+        // HEATSYSTEM_ROOM_SETTEMP (61509) is not a polled sensor, so it skips
+        // the cache and goes straight to the fake actor. factor 0.1: 221->22.1.
+        let (_dir, store) = temp_store();
+        let mut reads = HashMap::new();
+        reads.insert(HEATSYSTEM_ROOM_SETTEMP.id, 221_u16);
+        let state = ctc_state(store, spawn_fake_actor(reads));
+        let result = get_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr: HEATSYSTEM_ROOM_SETTEMP.id,
+                value: None,
+                factor: None,
+                custom: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("\"ctc_data\":"), "got: {result}");
+        assert!(result.contains("22.1"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_ctc_data_serves_polled_addr_from_cache() {
+        // CTC_ROOM_TEMP (62203) is a polled sensor. With a cached sample the
+        // handler returns the cached value and never touches Modbus.
+        let (_dir, store) = temp_store();
+        store
+            .record_sample(crate::storage::Sensor::Room, SystemTime::now(), 19.5)
+            .unwrap();
+        // closed sender proves the cache path is taken (no Modbus send).
+        let state = ctc_state(store, closed_modbus_sender());
+        let result = get_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr: CTC_ROOM_TEMP.id,
+                value: None,
+                factor: None,
+                custom: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("\"ctc_data\":"), "got: {result}");
+        // 19.5 is exactly representable as f32, so it serializes cleanly.
+        assert!(result.contains("19.5"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_ctc_data_reads_custom_param() {
+        // custom=true builds a parameter from addr+factor without a lookup.
+        // Use a non-polled addr so it hits the actor. factor 0.1: 150->15.0.
+        let (_dir, store) = temp_store();
+        let addr = HEATSYSTEM_ROOM_SETTEMP.id;
+        let mut reads = HashMap::new();
+        reads.insert(addr, 150_u16);
+        let state = ctc_state(store, spawn_fake_actor(reads));
+        let result = get_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr,
+                value: None,
+                factor: Some(0.1),
+                custom: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("\"ctc_data\":"), "got: {result}");
+        assert!(result.contains("15"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_ctc_data_unknown_addr_is_bad_request() {
+        // Non-custom lookup of an unknown addr fails. 12345 is not a defined
+        // parameter and not a polled sensor.
+        let (_dir, store) = temp_store();
+        let state = ctc_state(store, spawn_fake_actor(HashMap::new()));
+        let err = get_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr: 12345,
+                value: None,
+                factor: None,
+                custom: None,
+            }),
+        )
+        .await
+        .expect_err("unknown addr should be rejected");
+        assert!(matches!(err, ApiError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn get_ctc_data_service_unavailable_on_closed_channel() {
+        // Non-polled addr + empty store -> Modbus path -> send fails.
+        let (_dir, store) = temp_store();
+        let state = ctc_state(store, closed_modbus_sender());
+        let err = get_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr: HEATSYSTEM_ROOM_SETTEMP.id,
+                value: None,
+                factor: None,
+                custom: None,
+            }),
+        )
+        .await
+        .expect_err("closed channel should fail");
+        assert!(matches!(err, ApiError::ServiceUnavailable));
+    }
+
+    // --- post_ctc_data: write paths ---
+
+    #[tokio::test]
+    async fn post_ctc_data_writes_value() {
+        // Write echoes the value back; HEATSYSTEM_ROOM_SETTEMP is RW.
+        let (_dir, store) = temp_store();
+        let state = ctc_state(store, spawn_fake_actor(HashMap::new()));
+        let result = post_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr: HEATSYSTEM_ROOM_SETTEMP.id,
+                value: Some(21.0),
+                factor: None,
+                custom: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("\"ctc_data\":"), "got: {result}");
+        assert!(result.contains("21"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn post_ctc_data_unknown_addr_is_bad_request() {
+        let (_dir, store) = temp_store();
+        let state = ctc_state(store, spawn_fake_actor(HashMap::new()));
+        let err = post_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr: 12345,
+                value: Some(1.0),
+                factor: None,
+                custom: None,
+            }),
+        )
+        .await
+        .expect_err("unknown addr should be rejected");
+        assert!(matches!(err, ApiError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn post_ctc_data_missing_value_is_bad_request() {
+        // Valid addr but no value -> BadRequest.
+        let (_dir, store) = temp_store();
+        let state = ctc_state(store, spawn_fake_actor(HashMap::new()));
+        let err = post_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr: HEATSYSTEM_ROOM_SETTEMP.id,
+                value: None,
+                factor: None,
+                custom: None,
+            }),
+        )
+        .await
+        .expect_err("missing value should be rejected");
+        assert!(matches!(err, ApiError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn post_ctc_data_service_unavailable_on_closed_channel() {
+        let (_dir, store) = temp_store();
+        let state = ctc_state(store, closed_modbus_sender());
+        let err = post_ctc_data(
+            State(state),
+            Query(CtcParams {
+                addr: HEATSYSTEM_ROOM_SETTEMP.id,
+                value: Some(21.0),
+                factor: None,
+                custom: None,
+            }),
+        )
+        .await
+        .expect_err("closed channel should fail");
+        assert!(matches!(err, ApiError::ServiceUnavailable));
+    }
+
+    // --- power-save read path ---
+
+    #[tokio::test]
+    async fn get_power_save_returns_normal_mode() {
+        // A freshly spawned test GPIO defaults to Normal; powersave=false.
+        let (_dir, store) = temp_store();
+        let cancel = CancellationToken::new();
+        let price_state = PriceState::new("SE3".into());
+        let (handle, _join) =
+            spawn_with_test_gpio(price_state.clone(), test_smartgrid_config(), cancel.clone());
+
+        let state = CtcState {
+            store,
+            sender: dummy_modbus_sender(),
+            request_timeout_secs: 5,
+            smartgrid: Some(handle),
+            price_state,
+            smartgrid_config: test_smartgrid_config(),
+        };
+
+        let result = get_power_save(State(state)).await.unwrap();
+        assert!(result.contains("\"powersave\":false"), "got: {result}");
+        assert!(result.contains("\"mode\":"), "got: {result}");
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn get_power_save_service_unavailable_without_gpio() {
+        let (_dir, store) = temp_store();
+        let state = ctc_state(store, dummy_modbus_sender());
+        let err = get_power_save(State(state))
+            .await
+            .expect_err("no GPIO should fail");
         assert!(matches!(err, ApiError::ServiceUnavailable));
     }
 }

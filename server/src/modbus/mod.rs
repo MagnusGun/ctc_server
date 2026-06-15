@@ -2,6 +2,8 @@
 pub mod actor;
 pub mod bms_parameters;
 pub mod operations;
+#[cfg(test)]
+pub mod test_support;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

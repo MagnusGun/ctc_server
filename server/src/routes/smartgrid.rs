@@ -547,6 +547,88 @@ mod tests {
         }
     }
 
+    fn state_with_handle() -> (SmartGridState, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let (handle, _join) = spawn_with_test_gpio(
+            PriceState::new("SE3".to_string()),
+            test_config(),
+            cancel.clone(),
+        );
+        let state = SmartGridState {
+            handle: Some(handle),
+            price_state: PriceState::new("SE3".to_string()),
+            config: test_config(),
+        };
+        (state, cancel)
+    }
+
+    /// With a handle present, an unparseable mode string reaches the
+    /// `SmartGridMode::from_str` step and maps to `BadRequest` — the
+    /// no-handle test short-circuits at `ServiceUnavailable` before this.
+    #[tokio::test]
+    async fn test_set_smartgrid_invalid_mode_with_handle_is_bad_request() {
+        let (state, _cancel) = state_with_handle();
+        let query = SmartGridQuery {
+            mode: "not_a_mode".to_string(),
+            schedule_resume: false,
+            resume_at: None,
+        };
+        let result = set_smartgrid(State(state), Query(query)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest));
+    }
+
+    /// A `resume_at` that isn't valid RFC 3339 fails the
+    /// `DateTime::parse_from_rfc3339` step with `BadRequest`.
+    #[tokio::test]
+    async fn test_set_smartgrid_unparseable_resume_at_is_bad_request() {
+        let (state, _cancel) = state_with_handle();
+        let query = SmartGridQuery {
+            mode: "blocking".to_string(),
+            schedule_resume: true,
+            resume_at: Some("definitely-not-a-timestamp".to_string()),
+        };
+        let result = set_smartgrid(State(state), Query(query)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest));
+    }
+
+    /// Happy path for `get_smartgrid` with a live handle: the test GPIO's
+    /// in-memory mode is Normal, no change timestamp, no scheduled resume.
+    /// Covers the success serialization branch and the `Option::None`
+    /// `skip_serializing_if` arms.
+    #[tokio::test]
+    async fn test_get_smartgrid_with_handle_returns_normal() {
+        let (state, _cancel) = state_with_handle();
+        let result = get_smartgrid(State(state)).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
+        assert_eq!(parsed["smartgrid_mode"], "normal");
+        assert_eq!(parsed["run_minutes"], 30);
+        // No mode change yet and nothing scheduled → both fields omitted.
+        assert!(parsed.get("changed_at").is_none());
+        assert!(parsed.get("scheduled_resume_at").is_none());
+    }
+
+    /// When the actor has shut down, the handle returns `ActorGone`, which
+    /// `map_smartgrid_error` maps to `ServiceUnavailable` (not `InternalError`).
+    #[tokio::test]
+    async fn test_get_smartgrid_actor_gone_maps_to_service_unavailable() {
+        let cancel = CancellationToken::new();
+        let (handle, join) = spawn_with_test_gpio(
+            PriceState::new("SE3".to_string()),
+            test_config(),
+            cancel.clone(),
+        );
+        let state = SmartGridState {
+            handle: Some(handle),
+            price_state: PriceState::new("SE3".to_string()),
+            config: test_config(),
+        };
+        // Tear the actor down so the next handle call sees a closed channel.
+        cancel.cancel();
+        let _ = join.await;
+        let result = get_smartgrid(State(state)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
+    }
+
     #[tokio::test]
     async fn test_delete_scheduled_resume_no_gpio() {
         let state = create_state_without_handle();

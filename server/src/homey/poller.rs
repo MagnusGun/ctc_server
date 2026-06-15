@@ -210,6 +210,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_reconciles_then_exits_on_cancel() {
+        // Drive the full `run` loop: a short period so the first ticker tick
+        // fires quickly, a desired/actual mismatch so a reconcile push lands,
+        // then cancel and assert the loop returns (cancel branch).
+        let state: SharedMock = Arc::new(Mutex::new(MockState {
+            pump_on: true,
+            ..MockState::default()
+        }));
+        let addr = spawn_mock(state.clone()).await;
+        let client = make_client(addr);
+        let cache = Arc::new(HomeyPumpCache::new());
+        let (_tx, rx) = watch::channel(false); // desired=false vs actual=true
+        let (_boost_tx, boost_rx) = watch::channel(None::<bool>);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(run(
+            client,
+            cache.clone(),
+            rx,
+            boost_rx,
+            Duration::from_millis(30),
+            cancel.clone(),
+        ));
+
+        // Wait until at least one reconcile push has happened.
+        let mut pushed = false;
+        for _ in 0..100 {
+            if !state.lock().unwrap().set_calls.is_empty() {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(pushed, "run loop must reconcile the mismatch at least once");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("run must exit promptly after cancel")
+            .expect("run task must not panic");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_logs_but_does_not_mark_stale_when_reconcile_push_fails() {
+        // GET succeeds (actual=true) but the corrective SET fails. The
+        // reconcile push-error branch must NOT write_fresh(desired) — the
+        // cache keeps the freshly-read actual, not the failed desired.
+        let state: SharedMock = Arc::new(Mutex::new(MockState {
+            pump_on: true,
+            set_returns_error: true,
+            ..MockState::default()
+        }));
+        let addr = spawn_mock(state.clone()).await;
+        let client = make_client(addr);
+        let cache = Arc::new(HomeyPumpCache::new());
+        let (_tx, rx) = watch::channel(false); // desired=false, actual=true → push
+        let (_boost_tx, boost_rx) = watch::channel(None::<bool>);
+
+        tick(&client, &cache, &rx, &boost_rx).await;
+
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.set_calls, vec![false], "push was attempted once");
+        }
+        // GET wrote_fresh(actual=true); the failed SET must not overwrite it
+        // with desired=false.
+        let snap = cache.read().await;
+        assert_eq!(
+            snap.actual,
+            Some(true),
+            "cache keeps read actual after failed reconcile push"
+        );
+        assert!(!snap.stale, "GET succeeded so cache is not stale");
+    }
+
+    #[tokio::test]
     #[ignore = "needs HomeyClient mock; manual ctc.lan test covers this for now"]
     async fn poller_respects_boost_override() {
         // Documented in spec §4.7. Real integration with a fake HomeyClient

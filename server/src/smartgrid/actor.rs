@@ -529,6 +529,29 @@ pub(crate) mod test_support {
         let join = tokio::spawn(actor.run(rx, cancel));
         (SmartGridHandle { tx }, join)
     }
+
+    /// Like [`spawn_with_test_gpio`] but the controller accepts `set_mode`
+    /// writes in memory (no hardware ioctl). This unlocks the actor's
+    /// post-set scheduling, resume-timer, and cancellation paths that the
+    /// erroring controller can never reach.
+    pub fn spawn_accepting_test_gpio(
+        price_state: PriceState,
+        config: SmartGridConfig,
+        cancel: CancellationToken,
+    ) -> (SmartGridHandle, JoinHandle<()>) {
+        let gpio = GpioController::new_for_test_accepting(20, 21, false);
+        let (tx, rx) = mpsc::channel(32);
+        let actor = SmartGridActor {
+            gpio,
+            scheduled_resume: None,
+            price_state,
+            config,
+            self_tx: tx.clone(),
+            homey: None,
+        };
+        let join = tokio::spawn(actor.run(rx, cancel));
+        (SmartGridHandle { tx }, join)
+    }
 }
 
 #[cfg(test)]
@@ -849,6 +872,83 @@ mod tests {
         assert!(compute_resume_target(&state, &cfg, SmartGridMode::Normal).is_none());
     }
 
+    use crate::energy::price::{PriceLevel, PricePoint};
+
+    /// Build a 15-min leveled slot starting `offset_mins` from now. The
+    /// `LowPrice`/`Overcapacity` dispatch in `compute_resume_target` routes to
+    /// `cheap_window_end`, which only reasons about slots that carry a
+    /// `PriceLevel`; the `make_run`/`slot` helpers leave `level: None`.
+    fn leveled_slot(offset_mins: i64, spot_sek: f64, level: PriceLevel) -> PricePoint {
+        let start = chrono::Utc::now() + chrono::Duration::minutes(offset_mins);
+        let end = start + chrono::Duration::minutes(15);
+        let mut p = PricePoint::from_spot(start.to_rfc3339(), end.to_rfc3339(), spot_sek, 0.0, 0.0);
+        p.level = Some(level);
+        p
+    }
+
+    /// `LowPrice` dispatches to `cheap_window_end`: resume at the start of the
+    /// first non-cheap slot inside the window. Exercises the
+    /// `LowPrice | Overcapacity` arm of `compute_resume_target`, which the
+    /// Blocking-focused tests never reach.
+    #[test]
+    fn compute_resume_target_lowprice_resumes_at_first_non_cheap_slot() {
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(
+            vec![
+                leveled_slot(15, 0.10, PriceLevel::VeryCheap),
+                leveled_slot(30, 0.12, PriceLevel::Cheap),
+                leveled_slot(45, 0.50, PriceLevel::Normal), // first non-cheap
+            ],
+            vec![],
+        );
+        let cfg = test_config();
+        let target = compute_resume_target(&state, &cfg, SmartGridMode::LowPrice)
+            .expect("a non-cheap slot inside the window yields a resume target");
+        let expected = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(45));
+        let diff = target
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            diff < Duration::from_secs(5),
+            "LowPrice resume must land at the first non-cheap slot, diff {diff:?}"
+        );
+    }
+
+    /// `Overcapacity` shares the `cheap_window_end` dispatch with `LowPrice`.
+    /// When every slot in the window is cheap, the helper caps the resume at
+    /// the window end so the heater never stays buffering indefinitely.
+    #[test]
+    fn compute_resume_target_overcapacity_all_cheap_caps_at_window_end() {
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(
+            vec![
+                leveled_slot(15, 0.10, PriceLevel::VeryCheap),
+                leveled_slot(30, 0.11, PriceLevel::Cheap),
+            ],
+            vec![],
+        );
+        let cfg = test_config(); // 12h window
+        let target = compute_resume_target(&state, &cfg, SmartGridMode::Overcapacity)
+            .expect("all-cheap window still produces a capped resume target");
+        let expected = SystemTime::from(chrono::Utc::now() + chrono::Duration::hours(12));
+        let diff = target
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            diff < Duration::from_secs(5),
+            "all-cheap Overcapacity must cap at window end, diff {diff:?}"
+        );
+    }
+
+    /// `cheap_window_end` returns `None` when there is no leveled price data
+    /// in the window, so the buffer-mode dispatch yields no schedule.
+    #[test]
+    fn compute_resume_target_lowprice_no_prices_returns_none() {
+        let state = PriceState::new("SE3".to_string());
+        let cfg = test_config();
+        assert!(compute_resume_target(&state, &cfg, SmartGridMode::LowPrice).is_none());
+    }
+
     #[test]
     fn resolve_fires_at_prefers_explicit_over_computed() {
         let state = PriceState::new("SE3".to_string());
@@ -877,6 +977,23 @@ mod tests {
         assert!(got.is_none());
     }
 
+    /// With no explicit `resume_at`, `resolve_fires_at` must surface the
+    /// per-mode auto-computation when it yields `Some`. Pairs with
+    /// `resolve_fires_at_falls_back_to_compute_when_none` (the `None` arm).
+    #[test]
+    fn resolve_fires_at_falls_back_to_computed_some() {
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let cfg = test_config();
+        let got = resolve_fires_at(None, &state, &cfg, SmartGridMode::Blocking);
+        let expected = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(60));
+        let target = got.expect("computed Blocking target must flow through resolve_fires_at");
+        let diff = target
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(diff < Duration::from_secs(5), "diff {diff:?}");
+    }
+
     #[tokio::test]
     async fn set_mode_with_explicit_resume_at_normal_never_schedules() {
         let cancel = CancellationToken::new();
@@ -901,6 +1018,272 @@ mod tests {
         assert!(matches!(result, Err(SmartGridError::Apply(_))));
         let scheduled = handle.scheduled_resume_at().await.unwrap();
         assert!(scheduled.is_none());
+    }
+
+    // ── Scheduling paths through the accepting test GPIO ─────────────
+    //
+    // These drive the real do_set_mode → resolve_fires_at → schedule path,
+    // plus on_resume_fire and CancelScheduledResume-with-pending, which the
+    // erroring controller can never reach (every set_mode short-circuits).
+
+    #[tokio::test]
+    async fn blocking_with_prices_schedules_resume_at_run_start() {
+        let cancel = CancellationToken::new();
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let (handle, _join) =
+            test_support::spawn_accepting_test_gpio(state, test_config(), cancel.clone());
+
+        let scheduled = handle
+            .set_mode(SmartGridMode::Blocking, true, None)
+            .await
+            .expect("Blocking set_mode succeeds with accepting GPIO")
+            .expect("a resume must be scheduled");
+
+        // Echoed schedule must match what scheduled_resume_at reports.
+        let queried = handle.scheduled_resume_at().await.unwrap();
+        assert_eq!(queried, Some(scheduled));
+
+        // Target is the start of the contiguous run: now + 60 min.
+        let expected = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(60));
+        let diff = scheduled
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(diff < Duration::from_secs(5), "diff {diff:?}");
+
+        // Mode actually flipped to Blocking in memory.
+        assert!(matches!(
+            handle.read_mode().await.unwrap(),
+            SmartGridMode::Blocking
+        ));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn lowprice_schedules_cheap_window_end_target() {
+        let cancel = CancellationToken::new();
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(
+            vec![
+                leveled_slot(15, 0.10, PriceLevel::VeryCheap),
+                leveled_slot(30, 0.12, PriceLevel::Cheap),
+                leveled_slot(45, 0.50, PriceLevel::Normal), // first non-cheap
+            ],
+            vec![],
+        );
+        let (handle, _join) =
+            test_support::spawn_accepting_test_gpio(state, test_config(), cancel.clone());
+
+        let scheduled = handle
+            .set_mode(SmartGridMode::LowPrice, true, None)
+            .await
+            .expect("LowPrice set_mode succeeds")
+            .expect("buffer mode schedules a resume at cheap-window end");
+
+        // Resume lands at the first non-cheap slot: now + 45 min.
+        let expected = SystemTime::from(chrono::Utc::now() + chrono::Duration::minutes(45));
+        let diff = scheduled
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(diff < Duration::from_secs(5), "diff {diff:?}");
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_at_overrides_auto_pick() {
+        let cancel = CancellationToken::new();
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let (handle, _join) =
+            test_support::spawn_accepting_test_gpio(state, test_config(), cancel.clone());
+
+        let explicit = SystemTime::now() + Duration::from_hours(3);
+        let scheduled = handle
+            .set_mode(SmartGridMode::Blocking, true, Some(explicit))
+            .await
+            .expect("set_mode succeeds")
+            .expect("explicit resume is scheduled");
+        assert_eq!(scheduled, explicit);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn schedule_resume_false_does_not_schedule() {
+        let cancel = CancellationToken::new();
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let (handle, _join) =
+            test_support::spawn_accepting_test_gpio(state, test_config(), cancel.clone());
+
+        let scheduled = handle
+            .set_mode(SmartGridMode::Blocking, false, None)
+            .await
+            .expect("set_mode succeeds");
+        assert!(scheduled.is_none());
+        assert!(handle.scheduled_resume_at().await.unwrap().is_none());
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn auto_resume_disabled_config_never_schedules() {
+        let cancel = CancellationToken::new();
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let cfg = SmartGridConfig {
+            auto_resume_enabled: false,
+            auto_resume_window_hours: 12,
+            auto_resume_min_duration_minutes: 30,
+        };
+        let (handle, _join) = test_support::spawn_accepting_test_gpio(state, cfg, cancel.clone());
+
+        let scheduled = handle
+            .set_mode(SmartGridMode::Blocking, true, None)
+            .await
+            .expect("set_mode succeeds");
+        assert!(scheduled.is_none(), "disabled config must not schedule");
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn blocking_no_prices_logs_and_skips_schedule() {
+        // schedule_resume=true but no price data → compute yields None → the
+        // warn-and-return-None arm in do_set_mode.
+        let cancel = CancellationToken::new();
+        let (handle, _join) = test_support::spawn_accepting_test_gpio(
+            PriceState::new("SE3".to_string()),
+            test_config(),
+            cancel.clone(),
+        );
+
+        let scheduled = handle
+            .set_mode(SmartGridMode::Blocking, true, None)
+            .await
+            .expect("set_mode succeeds");
+        assert!(scheduled.is_none());
+        assert!(handle.scheduled_resume_at().await.unwrap().is_none());
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn later_mode_change_cancels_pending_schedule() {
+        let cancel = CancellationToken::new();
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let (handle, _join) =
+            test_support::spawn_accepting_test_gpio(state, test_config(), cancel.clone());
+
+        // Schedule a resume far in the future.
+        let explicit = SystemTime::now() + Duration::from_hours(5);
+        handle
+            .set_mode(SmartGridMode::Blocking, true, Some(explicit))
+            .await
+            .unwrap()
+            .expect("scheduled");
+        assert!(handle.scheduled_resume_at().await.unwrap().is_some());
+
+        // A subsequent manual change to Normal cancels the pending schedule.
+        handle
+            .set_mode(SmartGridMode::Normal, false, None)
+            .await
+            .unwrap();
+        assert!(
+            handle.scheduled_resume_at().await.unwrap().is_none(),
+            "manual mode change must clear the pending auto-resume"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn cancel_scheduled_resume_clears_pending_without_changing_mode() {
+        let cancel = CancellationToken::new();
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let (handle, _join) =
+            test_support::spawn_accepting_test_gpio(state, test_config(), cancel.clone());
+
+        let explicit = SystemTime::now() + Duration::from_hours(5);
+        handle
+            .set_mode(SmartGridMode::Blocking, true, Some(explicit))
+            .await
+            .unwrap()
+            .expect("scheduled");
+
+        // Cancel hits the take()+abort() branch (pending was Some).
+        handle.cancel_scheduled_resume().await.unwrap();
+        assert!(handle.scheduled_resume_at().await.unwrap().is_none());
+        // Mode is untouched by a bare cancel.
+        assert!(matches!(
+            handle.read_mode().await.unwrap(),
+            SmartGridMode::Blocking
+        ));
+
+        // Idempotent: cancelling again with nothing pending is a no-op.
+        handle.cancel_scheduled_resume().await.unwrap();
+        assert!(handle.scheduled_resume_at().await.unwrap().is_none());
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn auto_resume_timer_fires_and_flips_back_to_normal() {
+        // Schedule a resume in the immediate past so the timer task's
+        // duration_since check fails (already elapsed) and it posts
+        // ResumeFire right away, exercising on_resume_fire end-to-end.
+        let cancel = CancellationToken::new();
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
+        let (handle, _join) =
+            test_support::spawn_accepting_test_gpio(state, test_config(), cancel.clone());
+
+        // resume_at = now (already due). The timer task sees remaining==zero /
+        // an elapsed instant and posts ResumeFire immediately.
+        let due = SystemTime::now();
+        handle
+            .set_mode(SmartGridMode::Blocking, true, Some(due))
+            .await
+            .unwrap()
+            .expect("scheduled at a due instant");
+
+        // Wait for the timer task to post ResumeFire and the actor to flip.
+        let mut flipped = false;
+        for _ in 0..100 {
+            if matches!(handle.read_mode().await.unwrap(), SmartGridMode::Normal) {
+                flipped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(flipped, "auto-resume timer must flip mode back to Normal");
+        // The fired slot cleared itself.
+        assert!(handle.scheduled_resume_at().await.unwrap().is_none());
+        cancel.cancel();
+    }
+
+    #[test]
+    fn set_mode_if_not_superseded_rejects_stale_generation() {
+        // The generation guard on the controller (called by on_resume_fire)
+        // must reject a fire whose snapshot generation no longer matches the
+        // current one — the in-memory mode stays put.
+        let mut gpio = GpioController::new_for_test_accepting(20, 21, false);
+        gpio.set_mode(SmartGridMode::Blocking).unwrap();
+        let snapshot = gpio.mode_generation();
+
+        // A manual override bumps the generation past the snapshot.
+        gpio.bump_mode_generation();
+
+        // Now the would-be resume fire is superseded → Ok(false), no flip.
+        let applied = gpio
+            .set_mode_if_not_superseded(SmartGridMode::Normal, snapshot)
+            .unwrap();
+        assert!(!applied, "stale fire must be rejected");
+        assert!(matches!(gpio.read_mode(), SmartGridMode::Blocking));
+
+        // A matching generation applies the flip.
+        let current = gpio.mode_generation();
+        let applied = gpio
+            .set_mode_if_not_superseded(SmartGridMode::Normal, current)
+            .unwrap();
+        assert!(applied, "matching generation must apply");
+        assert!(matches!(gpio.read_mode(), SmartGridMode::Normal));
     }
 
     #[tokio::test(flavor = "current_thread")]

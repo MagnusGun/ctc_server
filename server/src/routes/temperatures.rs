@@ -154,6 +154,8 @@ async fn get_return_temp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modbus::test_support::spawn_fake_actor;
+    use std::collections::HashMap;
     use std::time::SystemTime;
     use tokio::sync::mpsc;
 
@@ -169,6 +171,37 @@ mod tests {
         // fail and surface as ServiceUnavailable, which makes the test fail
         // loudly rather than hang.
         let (tx, _rx) = mpsc::channel(1);
+        (
+            store,
+            tx,
+            TemperatureValidationConfig {
+                min: 10.0,
+                max: 30.0,
+            },
+            1,
+        )
+    }
+
+    /// State whose Modbus sender is a fake actor seeded with `reads`
+    /// (register id -> raw u16). The store is empty so handlers miss the
+    /// cache and exercise the real Modbus read path.
+    fn fake_state(store: Store, reads: HashMap<u16, u16>) -> TempState {
+        (
+            store,
+            spawn_fake_actor(reads),
+            TemperatureValidationConfig {
+                min: 10.0,
+                max: 30.0,
+            },
+            1,
+        )
+    }
+
+    /// State whose Modbus sender's receiver is dropped, so any actual send
+    /// fails and surfaces as `ServiceUnavailable`.
+    fn closed_state(store: Store) -> TempState {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
         (
             store,
             tx,
@@ -200,5 +233,155 @@ mod tests {
         let result = get_outdoor_temp(State(dummy_state(store))).await.unwrap();
         assert!(result.contains("\"outdoor_temperature\":"), "got: {result}");
         assert!(result.contains("-3.2"), "got: {result}");
+    }
+
+    // --- Modbus read success paths (cache miss -> fake actor) ---
+
+    #[tokio::test]
+    async fn get_room_temp_reads_from_modbus_on_cache_miss() {
+        let (_dir, store) = tmp_store();
+        let mut reads = HashMap::new();
+        // factor 0.1: raw 215 -> 21.5
+        reads.insert(CTC_ROOM_TEMP.id, 215_u16);
+        let result = get_room_temp(State(fake_state(store, reads)))
+            .await
+            .unwrap();
+        assert!(result.contains("\"room_temperature\":"), "got: {result}");
+        assert!(result.contains("21.5"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_room_set_temp_reads_from_modbus() {
+        let (_dir, store) = tmp_store();
+        let mut reads = HashMap::new();
+        // factor 0.1: raw 221 -> 22.1
+        reads.insert(HEATSYSTEM_ROOM_SETTEMP.id, 221_u16);
+        let result = get_room_set_temp(State(fake_state(store, reads)))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("\"room_temperature_setpoint\":"),
+            "got: {result}"
+        );
+        assert!(result.contains("22.1"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_outdoor_temp_reads_from_modbus_on_cache_miss() {
+        let (_dir, store) = tmp_store();
+        let mut reads = HashMap::new();
+        // factor 0.1, signed: raw 0xFFE0 (65504) -> -3.2
+        reads.insert(CTC_OUTDOOR_TEMP.id, (-32_i16).cast_unsigned());
+        let result = get_outdoor_temp(State(fake_state(store, reads)))
+            .await
+            .unwrap();
+        assert!(result.contains("\"outdoor_temperature\":"), "got: {result}");
+        assert!(result.contains("-3.2"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_flow_temp_reads_from_modbus_on_cache_miss() {
+        let (_dir, store) = tmp_store();
+        let mut reads = HashMap::new();
+        reads.insert(HEATSYSTEM_FLOW_TEMP.id, 350_u16); // 35.0
+        let result = get_flow_temp(State(fake_state(store, reads)))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("\"flow_outlet_temperature\":"),
+            "got: {result}"
+        );
+        assert!(result.contains("35"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn get_return_temp_reads_from_modbus_on_cache_miss() {
+        let (_dir, store) = tmp_store();
+        let mut reads = HashMap::new();
+        reads.insert(CTC_RETURN_TEMP.id, 305_u16); // 30.5
+        let result = get_return_temp(State(fake_state(store, reads)))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("\"flow_return_temperature\":"),
+            "got: {result}"
+        );
+        assert!(result.contains("30.5"), "got: {result}");
+    }
+
+    // --- Set setpoint: validation + write success ---
+
+    #[tokio::test]
+    async fn set_room_set_temp_writes_valid_value() {
+        let (_dir, store) = tmp_store();
+        // Write ops echo the value; 22.0 is within [10, 30].
+        let result = set_room_set_temp(
+            State(fake_state(store, HashMap::new())),
+            Query(RoomSetPoint { value: 22.0 }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.contains("\"room_temperature_setpoint\":"),
+            "got: {result}"
+        );
+        assert!(result.contains("22"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn set_room_set_temp_rejects_below_min() {
+        let (_dir, store) = tmp_store();
+        let err = set_room_set_temp(
+            State(fake_state(store, HashMap::new())),
+            Query(RoomSetPoint { value: 5.0 }),
+        )
+        .await
+        .expect_err("below min should be rejected");
+        assert!(matches!(err, ApiError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn set_room_set_temp_rejects_above_max() {
+        let (_dir, store) = tmp_store();
+        let err = set_room_set_temp(
+            State(fake_state(store, HashMap::new())),
+            Query(RoomSetPoint { value: 99.0 }),
+        )
+        .await
+        .expect_err("above max should be rejected");
+        assert!(matches!(err, ApiError::BadRequest));
+    }
+
+    // --- Error paths: closed channel -> ServiceUnavailable ---
+
+    #[tokio::test]
+    async fn get_room_set_temp_service_unavailable_on_closed_channel() {
+        let (_dir, store) = tmp_store();
+        let err = get_room_set_temp(State(closed_state(store)))
+            .await
+            .expect_err("closed channel should fail");
+        assert!(matches!(err, ApiError::ServiceUnavailable));
+    }
+
+    #[tokio::test]
+    async fn get_room_temp_service_unavailable_on_closed_channel() {
+        let (_dir, store) = tmp_store();
+        // Empty store -> cache miss -> tries Modbus -> send fails.
+        let err = get_room_temp(State(closed_state(store)))
+            .await
+            .expect_err("closed channel should fail");
+        assert!(matches!(err, ApiError::ServiceUnavailable));
+    }
+
+    #[tokio::test]
+    async fn set_room_set_temp_service_unavailable_on_closed_channel() {
+        let (_dir, store) = tmp_store();
+        let err = set_room_set_temp(
+            State(closed_state(store)),
+            Query(RoomSetPoint { value: 22.0 }),
+        )
+        .await
+        .expect_err("closed channel should fail");
+        assert!(matches!(err, ApiError::ServiceUnavailable));
     }
 }

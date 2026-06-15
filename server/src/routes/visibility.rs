@@ -386,6 +386,18 @@ mod tests {
         (state, rx)
     }
 
+    /// State with a zero-second request timeout. A handler awaiting a response
+    /// that never arrives hits the `Err(Elapsed)` arm immediately, so the
+    /// timeout branch is exercised without a real wall-clock delay.
+    fn create_mock_state_timeout() -> (VisibilityState, MockReceiver) {
+        let (tx, rx) = mpsc::channel(10);
+        let state = VisibilityState {
+            sender: tx,
+            request_timeout_secs: 0,
+        };
+        (state, rx)
+    }
+
     #[tokio::test]
     async fn test_get_visibility_success() {
         let (state, mut rx) = create_mock_state();
@@ -637,5 +649,127 @@ mod tests {
         let result = get_parameter_visibility(State(state), Path(61509)).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
+    }
+
+    // --- get_visibility: unexpected-response and timeout arms ---
+
+    #[tokio::test]
+    async fn test_get_visibility_unexpected_raw_registers() {
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_visibility(State(state), Path(62500)).await });
+
+        // A single-register read must reply with Value; RawRegisters is wrong.
+        if let Some((ParameterOperation::ReadVisibility(_), response_tx)) = rx.recv().await {
+            response_tx
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: 62500,
+                    values: vec![1, 2, 3],
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_get_visibility_timeout() {
+        let (state, mut rx) = create_mock_state_timeout();
+
+        let handle = tokio::spawn(async move { get_visibility(State(state), Path(62500)).await });
+
+        // Receive the request but never respond; hold response_tx open so the
+        // handler waits and the zero-second timeout elapses.
+        let _held = rx.recv().await.map(|(_, tx)| tx);
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    // --- get_all_visibility: unexpected-response and timeout arms ---
+
+    #[tokio::test]
+    async fn test_get_all_visibility_unexpected_value() {
+        let (state, mut rx) = create_mock_state();
+
+        let handle = tokio::spawn(async move { get_all_visibility(State(state)).await });
+
+        // ReadAllVisibility must reply with RawRegisters; Value is wrong.
+        if let Some((ParameterOperation::ReadAllVisibility, response_tx)) = rx.recv().await {
+            response_tx.send(Ok(ModbusResponse::Value(1.0))).unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_get_all_visibility_timeout() {
+        let (state, mut rx) = create_mock_state_timeout();
+
+        let handle = tokio::spawn(async move { get_all_visibility(State(state)).await });
+
+        let _held = rx.recv().await.map(|(_, tx)| tx);
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    // --- get_parameter_visibility: error, unexpected-response, timeout arms ---
+
+    #[tokio::test]
+    async fn test_get_parameter_visibility_modbus_error() {
+        let (state, mut rx) = create_mock_state();
+
+        // 61509 requires a real visibility-register read.
+        let handle =
+            tokio::spawn(async move { get_parameter_visibility(State(state), Path(61509)).await });
+
+        if let Some((ParameterOperation::ReadVisibility(_), response_tx)) = rx.recv().await {
+            response_tx
+                .send(Err(ModbusError::Timeout {
+                    register: 62500,
+                    operation: "test".to_string(),
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn test_get_parameter_visibility_unexpected_raw_registers() {
+        let (state, mut rx) = create_mock_state();
+
+        let handle =
+            tokio::spawn(async move { get_parameter_visibility(State(state), Path(61509)).await });
+
+        // The visibility read expects a Value; RawRegisters is the wrong shape.
+        if let Some((ParameterOperation::ReadVisibility(_), response_tx)) = rx.recv().await {
+            response_tx
+                .send(Ok(ModbusResponse::RawRegisters {
+                    start: 62500,
+                    values: vec![0],
+                }))
+                .unwrap();
+        }
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::InternalError));
+    }
+
+    #[tokio::test]
+    async fn test_get_parameter_visibility_timeout() {
+        let (state, mut rx) = create_mock_state_timeout();
+
+        let handle =
+            tokio::spawn(async move { get_parameter_visibility(State(state), Path(61509)).await });
+
+        let _held = rx.recv().await.map(|(_, tx)| tx);
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result.unwrap_err(), ApiError::Timeout));
     }
 }

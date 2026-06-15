@@ -361,6 +361,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_boost_bath_with_hours_returns_started() {
+        // The "bath" arm with valid hours reaches start_bath and maps the
+        // success report to JSON — a path the shower/missing-hours tests skip.
+        let scheduled_end = chrono::Utc::now() + chrono::Duration::hours(2);
+        let handle = spawn_fake(
+            sample_snapshot(),
+            Ok(()),
+            Err(DhwError::Modbus("unused".into())),
+            Ok(StartReport::Started { scheduled_end }),
+            Ok(false),
+        );
+        let state = DhwRouterState { handle };
+        let result = start_boost(
+            State(state),
+            Query(BoostQ {
+                preset: "bath".into(),
+                hours: Some(2.0),
+            }),
+        )
+        .await;
+        match result {
+            Ok(Json(report)) => {
+                let v = serde_json::to_value(&report).unwrap();
+                assert_eq!(v["outcome"], "started");
+            }
+            Err(resp) => panic!("expected 200, got {}", resp.status()),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_comfort_actor_error_maps_to_response() {
+        // set_comfort with a valid level but a failing actor must propagate
+        // the DhwError through into_resp rather than returning 204.
+        let handle = spawn_fake(
+            sample_snapshot(),
+            Err(DhwError::Modbus("write failed".into())),
+            Ok(StartReport::AlreadyAtTarget {
+                dhw_c: 0.0,
+                target_c: 0.0,
+            }),
+            Err(DhwError::Modbus("unused".into())),
+            Ok(false),
+        );
+        let state = DhwRouterState { handle };
+        let result = set_comfort(
+            State(state),
+            Query(ComfortQ {
+                level: "komfort".into(),
+            }),
+        )
+        .await;
+        match result {
+            Err(resp) => assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR),
+            Ok(code) => panic!("expected error response, got {code}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_boost_shower_actor_error_maps_to_response() {
+        // A failing shower start must flow through into_resp (the err arm of
+        // result.map(Json).map_err(into_resp)).
+        let handle = spawn_fake(
+            sample_snapshot(),
+            Ok(()),
+            Err(DhwError::Modbus("read failed".into())),
+            Err(DhwError::Modbus("unused".into())),
+            Ok(false),
+        );
+        let state = DhwRouterState { handle };
+        let result = start_boost(
+            State(state),
+            Query(BoostQ {
+                preset: "shower".into(),
+                hours: None,
+            }),
+        )
+        .await;
+        match result {
+            Err(resp) => assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR),
+            Ok(_) => panic!("expected error response from failing shower start"),
+        }
+    }
+
+    #[tokio::test]
     async fn delete_boost_returns_409_for_active_shower() {
         let handle = spawn_fake(
             sample_snapshot(),

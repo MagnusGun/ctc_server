@@ -333,6 +333,278 @@ fn migrate_skips_when_store_already_populated() {
 }
 
 #[test]
+fn sensor_from_slug_round_trips_known_and_rejects_unknown() {
+    // A representative spread including the dash/underscore aliases.
+    assert_eq!(Sensor::from_slug("room"), Some(Sensor::Room));
+    assert_eq!(Sensor::from_slug("flow_sp"), Some(Sensor::FlowSp));
+    assert_eq!(Sensor::from_slug("flow-sp"), Some(Sensor::FlowSp));
+    assert_eq!(Sensor::from_slug("hp-status"), Some(Sensor::HpStatus));
+    assert_eq!(Sensor::from_slug("brine_out"), Some(Sensor::BrineOut));
+    assert_eq!(Sensor::from_slug("nope"), None);
+    // Stable numeric ids are exposed via as_u16.
+    assert_eq!(Sensor::Room.as_u16(), 1);
+    assert_eq!(Sensor::HpStatus.as_u16(), 19);
+}
+
+#[test]
+fn bucket_minutes_empty_sensor_returns_empty() {
+    let (_dir, store) = tmp_db();
+    // Sensor with no ring entries → early-return Vec::new().
+    assert!(
+        store
+            .bucket_minutes(Sensor::Outdoor, 0, i64::MAX)
+            .is_empty()
+    );
+}
+
+#[test]
+fn series_range_filters_outside_window() {
+    let (_dir, store) = tmp_db();
+    let t = SystemTime::now();
+    let s = unix_secs(t).unwrap();
+    store.record_sample(Sensor::Room, t, 21.0).unwrap();
+    // Window entirely before the sample → filtered out (data present, range miss).
+    assert!(store.series_range(Sensor::Room, s - 100, s - 50).is_empty());
+    // Window entirely after → also empty.
+    assert!(store.series_range(Sensor::Room, s + 50, s + 100).is_empty());
+}
+
+#[test]
+fn step_events_record_serve_and_survive_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ctc.redb");
+    {
+        let store = Store::open(&path).unwrap();
+        store.record_step_event(StepEventBlob {
+            started_at: 1_700_000_000,
+            flow_before: 30.0,
+            flow_after: 40.0,
+            return_before: 28.0,
+            samples: vec![(0, 30.0, 28.0), (5, 35.0, 29.0)],
+        });
+        store.record_step_event(StepEventBlob {
+            started_at: 1_700_000_100,
+            flow_before: 31.0,
+            flow_after: 41.0,
+            return_before: 29.0,
+            samples: vec![],
+        });
+        // In-memory cache serves newest-first immediately.
+        let recent = store.recent_step_events(10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].started_at, 1_700_000_100);
+        // limit is honored.
+        assert_eq!(store.recent_step_events(1).len(), 1);
+        store.flush().unwrap();
+    }
+    // Reopen hydrates step_events_cache from disk (newest first).
+    let store = Store::open(&path).unwrap();
+    let recent = store.recent_step_events(10);
+    assert_eq!(recent.len(), 2, "step events must survive flush + reopen");
+    assert_eq!(recent[0].started_at, 1_700_000_100);
+}
+
+#[test]
+fn step_events_pruned_to_max_on_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ctc.redb");
+    {
+        let store = Store::open(&path).unwrap();
+        // Record more than MAX_STEP_EVENTS distinct events.
+        for i in 0..(MAX_STEP_EVENTS as u64 + 10) {
+            store.record_step_event(StepEventBlob {
+                started_at: 1_700_000_000 + i,
+                flow_before: 30.0,
+                flow_after: 40.0,
+                return_before: 28.0,
+                samples: vec![],
+            });
+        }
+        store.flush().unwrap();
+    }
+    // After reopen, the on-disk table was pruned to MAX_STEP_EVENTS, so the
+    // hydrated cache holds exactly that many (newest retained).
+    let store = Store::open(&path).unwrap();
+    let recent = store.recent_step_events(usize::MAX);
+    assert_eq!(recent.len(), MAX_STEP_EVENTS);
+    // Newest event must be present; oldest beyond the cap dropped.
+    assert_eq!(
+        recent[0].started_at,
+        1_700_000_000 + MAX_STEP_EVENTS as u64 + 9
+    );
+}
+
+#[test]
+fn step_event_timestamp_overflowing_i64_is_clamped_not_dropped() {
+    // started_at beyond i64::MAX (only representable as u64) must be kept,
+    // clamped to i64::MAX, and survive a flush+reopen rather than being
+    // silently discarded. Exercises the i64::try_from-fails clamp branch.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ctc.redb");
+    {
+        let store = Store::open(&path).unwrap();
+        store.record_step_event(StepEventBlob {
+            started_at: u64::MAX, // > i64::MAX → clamp path
+            flow_before: 30.0,
+            flow_after: 40.0,
+            return_before: 28.0,
+            samples: vec![],
+        });
+        // Immediately served from the in-memory cache (value preserved).
+        let recent = store.recent_step_events(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].started_at, u64::MAX);
+        store.flush().unwrap();
+    }
+    // The disk key was clamped to i64::MAX; reopen rehydrates the event.
+    let store = Store::open(&path).unwrap();
+    let recent = store.recent_step_events(10);
+    assert_eq!(recent.len(), 1, "clamped event must survive reopen");
+    assert_eq!(recent[0].started_at, u64::MAX);
+}
+
+#[test]
+fn recent_cycles_caps_at_limit_from_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ctc.redb");
+    let base = SystemTime::now();
+    {
+        let store = Store::open(&path).unwrap();
+        for i in 0..5u64 {
+            store
+                .record_cycle(
+                    base + std::time::Duration::from_secs(i),
+                    CycleBlob {
+                        timestamp: format!("2026-05-10T15:00:0{i}Z"),
+                        duration_secs: 100 + i,
+                        outdoor_temp_c: None,
+                    },
+                )
+                .unwrap();
+        }
+        store.flush().unwrap();
+    }
+    // Reopen so pending is empty and all reads come from disk.
+    let store = Store::open(&path).unwrap();
+    let since = unix_secs(base).unwrap() - 10;
+    let recent = store.recent_cycles(since, 2).unwrap();
+    assert_eq!(recent.len(), 2, "disk read must respect the limit cap");
+}
+
+#[test]
+fn recent_cycles_skips_entries_before_since() {
+    let (_dir, store) = tmp_db();
+    let base = SystemTime::now();
+    // One old cycle and one recent cycle, both pending in RAM.
+    store
+        .record_cycle(
+            base - std::time::Duration::from_secs(10_000),
+            CycleBlob {
+                timestamp: "old".to_string(),
+                duration_secs: 1,
+                outdoor_temp_c: None,
+            },
+        )
+        .unwrap();
+    store
+        .record_cycle(
+            base,
+            CycleBlob {
+                timestamp: "new".to_string(),
+                duration_secs: 2,
+                outdoor_temp_c: None,
+            },
+        )
+        .unwrap();
+    let since = unix_secs(base).unwrap() - 5;
+    let recent = store.recent_cycles(since, 10).unwrap();
+    assert_eq!(recent.len(), 1, "the pre-since cycle must be skipped");
+    assert_eq!(recent[0].timestamp, "new");
+}
+
+#[test]
+fn recent_cycles_pending_limit_returns_early() {
+    let (_dir, store) = tmp_db();
+    let base = SystemTime::now();
+    for i in 0..4u64 {
+        store
+            .record_cycle(
+                base + std::time::Duration::from_secs(i),
+                CycleBlob {
+                    timestamp: format!("c{i}"),
+                    duration_secs: i,
+                    outdoor_temp_c: None,
+                },
+            )
+            .unwrap();
+    }
+    let since = unix_secs(base).unwrap() - 5;
+    // Limit smaller than pending count → early return out of the RAM loop.
+    let recent = store.recent_cycles(since, 2).unwrap();
+    assert_eq!(recent.len(), 2);
+}
+
+#[test]
+fn migrate_from_legacy_json_corrupt_file_is_left_in_place() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let json_path = dir.path().join("heatpump_stats.json");
+    // Valid JSON but not the expected shape → parse_legacy_json returns None.
+    std::fs::write(&json_path, br#"{"unexpected":"shape"}"#).unwrap();
+
+    let store = Store::open(dir.path().join("ctc.redb")).unwrap();
+    let migrated = store.migrate_from_legacy_json(&json_path).unwrap();
+    assert!(!migrated, "unparseable legacy file must not migrate");
+    assert!(json_path.exists(), "corrupt file is left untouched");
+    assert_eq!(store.accumulators(), Accumulators::default());
+}
+
+#[test]
+fn migrate_from_legacy_json_missing_file_is_noop() {
+    let (dir, store) = tmp_db();
+    let absent = dir.path().join("does_not_exist.json");
+    let migrated = store.migrate_from_legacy_json(&absent).unwrap();
+    assert!(!migrated, "a missing legacy file is a no-op, not an error");
+}
+
+#[test]
+fn v1_to_v2_migration_copies_cycle_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ctc.redb");
+    // Hand-build a v1-schema database: META schema_version = 1 and a CYCLES_V1
+    // row keyed by i64 seconds. open() must migrate it into the v2 table.
+    {
+        let db = Database::create(&path).unwrap();
+        let w = db.begin_write().unwrap();
+        {
+            let mut m = w.open_table(META).unwrap();
+            m.insert(SCHEMA_KEY, 1u32).unwrap();
+            let blob = CycleBlob {
+                timestamp: "2026-05-10T15:00:00Z".to_string(),
+                duration_secs: 321,
+                outdoor_temp_c: Some(-4.0),
+            };
+            let buf = serde_json::to_vec(&blob).unwrap();
+            let mut c = w.open_table(CYCLES_V1).unwrap();
+            c.insert(1_700_000_000i64, buf.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+        drop(db); // release the file lock before Store::open reopens it
+    }
+    // open() runs migrate_cycles_v1_to_v2 because stored_version == Some(1).
+    {
+        let store = Store::open(&path).unwrap();
+        let recent = store.recent_cycles(0, 10).unwrap();
+        assert_eq!(recent.len(), 1, "v1 cycle row must migrate into v2");
+        assert_eq!(recent[0].duration_secs, 321);
+    }
+
+    // Reopen: schema is now v3 and the v1 table is gone, so no re-migration
+    // and the row is still served.
+    let store2 = Store::open(&path).unwrap();
+    assert_eq!(store2.recent_cycles(0, 10).unwrap().len(), 1);
+}
+
+#[test]
 fn parse_date_yyyymmdd_rejects_calendar_invalid() {
     // Valid dates round-trip into the YYYYMMDD packed form.
     assert_eq!(parse_date_yyyymmdd("2025-02-28"), Some(20_250_228));
