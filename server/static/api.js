@@ -172,6 +172,22 @@ async function setSmartGridMode(mode, scheduleResume = false, resumeAt = null) {
     return r.json();
 }
 
+// Block now and schedule a temp-aware heat-up so the tank is warm by `warmBy`
+// (HH:MM local), then re-block. `targetC` is optional (server default applies).
+async function warmBySmartGrid(warmBy, targetC = null) {
+    let url = `${API_BASE}/smartgrid/warm_by?warm_by=${encodeURIComponent(warmBy)}`;
+    if (targetC != null) url += `&target_c=${targetC}`;
+    const r = await fetch(url, { method: 'POST' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+}
+
+// Read-only preview of what a warm-by request would do (no side effect).
+async function getWarmByPreview(warmBy) {
+    try { return await fetchJson(`${API_BASE}/smartgrid/warm_by_preview?warm_by=${encodeURIComponent(warmBy)}`); }
+    catch { return null; }
+}
+
 async function getGrid()   { return fetchJson(`${API_BASE}/grid`); }
 async function getPrices() { return fetchJson(`${API_BASE}/prices`); }
 
@@ -239,6 +255,7 @@ window.api = {
     getSeries, getActivity, getStepResponse,
     getAlarms,
     getSmartGrid, getSmartGridResume, getResumeCandidates, setSmartGridMode,
+    warmBySmartGrid, getWarmByPreview,
     getGrid, getPrices, getPump,
     getDhwState, setDhwComfort, startDhwBoost, cancelDhwBoost,
     getVersion,

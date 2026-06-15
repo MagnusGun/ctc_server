@@ -10,6 +10,7 @@
 //! the bump → cancel → set → schedule sequence.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use axum::{
     Router,
@@ -20,11 +21,16 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
+
+use std::time::{Duration, SystemTime};
 
 use crate::config::SmartGridConfig;
+use crate::dhw::actor::ModbusWriter;
 use crate::energy::price::PriceState;
+use crate::energy::tibber::parse_iso8601;
 use crate::error::ApiError;
+use crate::smartgrid::heatup::{REG_DHW_UPPER, WarmByCommand, estimate_heatup};
 use crate::smartgrid::{SmartGridError, SmartGridHandle, SmartGridMode};
 
 /// State for `SmartGrid` routes.
@@ -33,6 +39,11 @@ pub struct SmartGridState {
     handle: Option<SmartGridHandle>,
     price_state: PriceState,
     config: SmartGridConfig,
+    /// Local timezone for parsing `HH:MM` warm-by deadlines.
+    tz: chrono_tz::Tz,
+    /// Scaled Modbus reader for the warm-by schedule-time temp read + preview.
+    /// `None` only in tests that don't exercise warm-by.
+    modbus: Option<Arc<dyn ModbusWriter>>,
 }
 
 pub fn routes(
@@ -40,11 +51,15 @@ pub fn routes(
     price_state: PriceState,
     config: SmartGridConfig,
     _request_timeout_secs: u64,
+    tz: chrono_tz::Tz,
+    modbus: Arc<dyn ModbusWriter>,
 ) -> Router {
     let state = SmartGridState {
         handle,
         price_state,
         config,
+        tz,
+        modbus: Some(modbus),
     };
 
     Router::new()
@@ -61,6 +76,11 @@ pub fn routes(
         .route(
             "/api/v1/smartgrid/scheduled_resume",
             delete(delete_scheduled_resume),
+        )
+        .route("/api/v1/smartgrid/warm_by", post(set_warm_by))
+        .route(
+            "/api/v1/smartgrid/warm_by_preview",
+            get(get_warm_by_preview),
         )
         .with_state(state)
 }
@@ -297,6 +317,196 @@ async fn delete_scheduled_resume(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize)]
+struct WarmByQuery {
+    /// Deadline in `HH:MM` local wall-clock (e.g. `06:30`).
+    warm_by: String,
+    /// Optional target tank-top temperature; defaults to the configured value.
+    #[serde(default)]
+    target_c: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct SetWarmByResponse {
+    smartgrid_mode: String,
+    applied_blocking: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heatup_start_at: Option<String>,
+    skipped: bool,
+    target_c: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct WarmByPreviewResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heatup_start_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    est_minutes: Option<u64>,
+    would_skip: bool,
+}
+
+/// The temp-aware sizing result shared by the POST and preview handlers.
+struct WarmByPlan {
+    heatup_start: Option<SystemTime>,
+    skipped: bool,
+    est_minutes: Option<u64>,
+}
+
+/// Parse `target_c` from the query (or fall back to the configured default),
+/// rejecting anything outside the accepted shower range.
+fn resolve_target_c(query: Option<f32>, config: &SmartGridConfig) -> Result<f32, ApiError> {
+    let target = query.unwrap_or(config.warm_by_target_temp_c);
+    if (45.0..=50.0).contains(&target) {
+        Ok(target)
+    } else {
+        error!("warm_by: target_c {target} outside accepted range [45, 50]");
+        Err(ApiError::BadRequest)
+    }
+}
+
+/// Resolve an `HH:MM` local-time string to the next future instant at that
+/// wall-clock time. If the time has already passed today, it rolls to
+/// tomorrow. DST-safe via `from_local_datetime().earliest()`. `now_utc` is a
+/// parameter so the rollover logic is unit-testable.
+fn next_deadline_from_hh_mm(
+    s: &str,
+    tz: chrono_tz::Tz,
+    now_utc: DateTime<Utc>,
+) -> Option<SystemTime> {
+    let (h_str, m_str) = s.split_once(':')?;
+    let hour: u32 = h_str.parse().ok()?;
+    let minute: u32 = m_str.parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    let now_local = now_utc.with_timezone(&tz);
+    let today = now_local.date_naive();
+    let at = |date: chrono::NaiveDate| -> Option<DateTime<chrono_tz::Tz>> {
+        tz.from_local_datetime(&date.and_hms_opt(hour, minute, 0)?)
+            .earliest()
+    };
+    let candidate = match at(today) {
+        Some(dt) if dt > now_local => dt,
+        _ => at(today.succ_opt()?)?,
+    };
+    Some(SystemTime::from(candidate.with_timezone(&Utc)))
+}
+
+/// Read the current tank temperature and size (or skip) the heat-up window,
+/// picking the cheapest run that finishes by `deadline`. Shared by the POST
+/// handler and the read-only preview.
+async fn plan_warm_by(
+    state: &SmartGridState,
+    deadline: SystemTime,
+    target_c: f32,
+) -> Result<WarmByPlan, ApiError> {
+    let modbus = state.modbus.as_ref().ok_or(ApiError::ServiceUnavailable)?;
+    let current_c = modbus.read_scaled(REG_DHW_UPPER).await.map_err(|e| {
+        error!("warm_by: failed to read tank temp: {e}");
+        ApiError::InternalError
+    })?;
+
+    let max_lead = Duration::from_mins(u64::from(state.config.warm_by_max_lead_minutes));
+    let max_duration = Duration::from_mins(u64::from(state.config.warm_by_max_duration_minutes));
+    let rate = state.config.warm_by_heat_rate_c_per_min;
+
+    match estimate_heatup(current_c, target_c, rate, max_duration) {
+        // Already warm — block only, no heat-up.
+        None => Ok(WarmByPlan {
+            heatup_start: None,
+            skipped: true,
+            est_minutes: None,
+        }),
+        Some(dur) => {
+            // Cheapest run finishing by the deadline within the lead window;
+            // if none fits, start immediately so the tank still warms.
+            let start = state
+                .price_state
+                .cheapest_run_ending_by(deadline, max_lead, dur)
+                .and_then(|p| parse_iso8601(&p.starts_at).ok())
+                .unwrap_or_else(SystemTime::now);
+            Ok(WarmByPlan {
+                heatup_start: Some(start),
+                skipped: false,
+                est_minutes: Some(dur.as_secs() / 60),
+            })
+        }
+    }
+}
+
+/// Apply Blocking and schedule a warm-by heat-up.
+///
+/// `POST /api/v1/smartgrid/warm_by?warm_by=06:30&target_c=48`
+async fn set_warm_by(
+    State(state): State<SmartGridState>,
+    Query(query): Query<WarmByQuery>,
+) -> Result<String, ApiError> {
+    let handle = state.handle.as_ref().ok_or(ApiError::ServiceUnavailable)?;
+    if !state.config.warm_by_enabled {
+        error!("warm_by: feature disabled in config");
+        return Err(ApiError::ServiceUnavailable);
+    }
+    let target_c = resolve_target_c(query.target_c, &state.config)?;
+    let deadline =
+        next_deadline_from_hh_mm(&query.warm_by, state.tz, Utc::now()).ok_or_else(|| {
+            error!("warm_by: bad HH:MM deadline '{}'", query.warm_by);
+            ApiError::BadRequest
+        })?;
+
+    let plan = plan_warm_by(&state, deadline, target_c).await?;
+    let cmd = WarmByCommand {
+        heatup_start: plan.heatup_start,
+        target_c,
+        max_duration: Duration::from_mins(u64::from(state.config.warm_by_max_duration_minutes)),
+    };
+    let scheduled = handle
+        .schedule_warm_by(cmd)
+        .await
+        .map_err(map_smartgrid_error)?;
+
+    let response = SetWarmByResponse {
+        smartgrid_mode: SmartGridMode::Blocking.to_string(),
+        applied_blocking: true,
+        heatup_start_at: scheduled.map(format_system_time),
+        skipped: plan.skipped,
+        target_c,
+    };
+    serde_json::to_string(&response)
+        .map(|s| format!("{s}\n"))
+        .map_err(|e| {
+            error!("set_warm_by: JSON serialization error - {e}");
+            ApiError::InternalError
+        })
+}
+
+/// Preview what a warm-by request would do without any side effect.
+///
+/// `GET /api/v1/smartgrid/warm_by_preview?warm_by=06:30`
+async fn get_warm_by_preview(
+    State(state): State<SmartGridState>,
+    Query(query): Query<WarmByQuery>,
+) -> Result<String, ApiError> {
+    let target_c = resolve_target_c(query.target_c, &state.config)?;
+    let deadline =
+        next_deadline_from_hh_mm(&query.warm_by, state.tz, Utc::now()).ok_or_else(|| {
+            error!("warm_by_preview: bad HH:MM deadline '{}'", query.warm_by);
+            ApiError::BadRequest
+        })?;
+
+    let plan = plan_warm_by(&state, deadline, target_c).await?;
+    let response = WarmByPreviewResponse {
+        heatup_start_at: plan.heatup_start.map(format_system_time),
+        est_minutes: plan.est_minutes,
+        would_skip: plan.skipped,
+    };
+    serde_json::to_string(&response)
+        .map(|s| format!("{s}\n"))
+        .map_err(|e| {
+            error!("get_warm_by_preview: JSON serialization error - {e}");
+            ApiError::InternalError
+        })
+}
+
 fn map_smartgrid_error(err: SmartGridError) -> ApiError {
     match err {
         SmartGridError::ActorGone => {
@@ -325,19 +535,21 @@ mod tests {
     }
 
     fn test_config() -> SmartGridConfig {
-        SmartGridConfig {
-            auto_resume_enabled: true,
-            auto_resume_window_hours: 12,
-            auto_resume_min_duration_minutes: 30,
+        SmartGridConfig::default()
+    }
+
+    fn test_state(handle: Option<SmartGridHandle>, price_state: PriceState) -> SmartGridState {
+        SmartGridState {
+            handle,
+            price_state,
+            config: test_config(),
+            tz: chrono_tz::Europe::Stockholm,
+            modbus: None,
         }
     }
 
     fn create_state_without_handle() -> SmartGridState {
-        SmartGridState {
-            handle: None,
-            price_state: PriceState::new("SE3".to_string()),
-            config: test_config(),
-        }
+        test_state(None, PriceState::new("SE3".to_string()))
     }
 
     #[tokio::test]
@@ -424,11 +636,7 @@ mod tests {
         today.push(isolated);
         price_state.update_prices(today, vec![]);
 
-        let state = SmartGridState {
-            handle: None,
-            price_state,
-            config: test_config(),
-        };
+        let state = test_state(None, price_state);
         let result = get_proposed_resume(State(state)).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
         assert_eq!(parsed["run_minutes"], 30);
@@ -449,11 +657,7 @@ mod tests {
             &[0.10, 0.10],
         ));
         price_state.update_prices(today, vec![]);
-        let state = SmartGridState {
-            handle: None,
-            price_state,
-            config: test_config(),
-        };
+        let state = test_state(None, price_state);
 
         let result = get_resume_candidates(State(state)).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(result.trim()).unwrap();
@@ -479,11 +683,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, _join) =
             spawn_with_test_gpio(PriceState::new("SE3".to_string()), test_config(), cancel);
-        let state = SmartGridState {
-            handle: Some(handle),
-            price_state: PriceState::new("SE3".to_string()),
-            config: test_config(),
-        };
+        let state = test_state(Some(handle), PriceState::new("SE3".to_string()));
         let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let query = SmartGridQuery {
             mode: "blocking".to_string(),
@@ -499,11 +699,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, _join) =
             spawn_with_test_gpio(PriceState::new("SE3".to_string()), test_config(), cancel);
-        let state = SmartGridState {
-            handle: Some(handle),
-            price_state: PriceState::new("SE3".to_string()),
-            config: test_config(),
-        };
+        let state = test_state(Some(handle), PriceState::new("SE3".to_string()));
         let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         let query = SmartGridQuery {
             mode: "blocking".to_string(),
@@ -526,11 +722,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, _join) =
             spawn_with_test_gpio(PriceState::new("SE3".to_string()), test_config(), cancel);
-        let state = SmartGridState {
-            handle: Some(handle),
-            price_state: PriceState::new("SE3".to_string()),
-            config: test_config(),
-        };
+        let state = test_state(Some(handle), PriceState::new("SE3".to_string()));
         // 10s in the past — inside the 60s grace, must NOT be BadRequest.
         let recent = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
         let query = SmartGridQuery {
@@ -554,11 +746,7 @@ mod tests {
             test_config(),
             cancel.clone(),
         );
-        let state = SmartGridState {
-            handle: Some(handle),
-            price_state: PriceState::new("SE3".to_string()),
-            config: test_config(),
-        };
+        let state = test_state(Some(handle), PriceState::new("SE3".to_string()));
         (state, cancel)
     }
 
@@ -617,11 +805,7 @@ mod tests {
             test_config(),
             cancel.clone(),
         );
-        let state = SmartGridState {
-            handle: Some(handle),
-            price_state: PriceState::new("SE3".to_string()),
-            config: test_config(),
-        };
+        let state = test_state(Some(handle), PriceState::new("SE3".to_string()));
         // Tear the actor down so the next handle call sees a closed channel.
         cancel.cancel();
         let _ = join.await;
@@ -641,15 +825,180 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, _join) =
             spawn_with_test_gpio(PriceState::new("SE3".to_string()), test_config(), cancel);
-        let state = SmartGridState {
-            handle: Some(handle),
-            price_state: PriceState::new("SE3".to_string()),
-            config: test_config(),
-        };
+        let state = test_state(Some(handle), PriceState::new("SE3".to_string()));
         let status = delete_scheduled_resume(State(state.clone())).await.unwrap();
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         let again = delete_scheduled_resume(State(state)).await.unwrap();
         assert_eq!(again, StatusCode::NO_CONTENT);
+    }
+
+    // ---- warm-by ----
+
+    use crate::smartgrid::actor::test_support::spawn_accepting_test_gpio_with_modbus;
+    use chrono::TimeZone;
+
+    /// Modbus fake that returns a fixed tank temperature for any read.
+    struct FakeTemp(f32);
+    #[async_trait::async_trait]
+    impl ModbusWriter for FakeTemp {
+        async fn write_scaled(&self, _addr: u16, _v: f32) -> Result<(), String> {
+            Ok(())
+        }
+        async fn read_scaled(&self, _addr: u16) -> Result<f32, String> {
+            Ok(self.0)
+        }
+    }
+
+    fn test_state_with_modbus(
+        handle: Option<SmartGridHandle>,
+        price_state: PriceState,
+        modbus: Arc<dyn ModbusWriter>,
+    ) -> SmartGridState {
+        SmartGridState {
+            handle,
+            price_state,
+            config: test_config(),
+            tz: chrono_tz::Europe::Stockholm,
+            modbus: Some(modbus),
+        }
+    }
+
+    #[test]
+    fn hh_mm_today_when_still_ahead() {
+        // 04:00Z = 05:00 local (winter, UTC+1); 06:30 is later today.
+        let now = Utc.with_ymd_and_hms(2026, 1, 15, 4, 0, 0).unwrap();
+        let got = next_deadline_from_hh_mm("06:30", chrono_tz::Europe::Stockholm, now).unwrap();
+        let expected = SystemTime::from(Utc.with_ymd_and_hms(2026, 1, 15, 5, 30, 0).unwrap());
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hh_mm_rolls_to_tomorrow_when_past() {
+        // 10:00Z = 11:00 local; 06:30 already passed → tomorrow.
+        let now = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let got = next_deadline_from_hh_mm("06:30", chrono_tz::Europe::Stockholm, now).unwrap();
+        let expected = SystemTime::from(Utc.with_ymd_and_hms(2026, 1, 16, 5, 30, 0).unwrap());
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hh_mm_rejects_bad_input() {
+        let tz = chrono_tz::Europe::Stockholm;
+        let now = Utc.with_ymd_and_hms(2026, 1, 15, 4, 0, 0).unwrap();
+        assert!(next_deadline_from_hh_mm("0630", tz, now).is_none());
+        assert!(next_deadline_from_hh_mm("25:00", tz, now).is_none());
+        assert!(next_deadline_from_hh_mm("06:99", tz, now).is_none());
+        assert!(next_deadline_from_hh_mm("ab:cd", tz, now).is_none());
+    }
+
+    #[test]
+    fn resolve_target_defaults_and_validates() {
+        let cfg = test_config();
+        assert!((resolve_target_c(None, &cfg).unwrap() - 48.0).abs() < f32::EPSILON);
+        assert!((resolve_target_c(Some(46.0), &cfg).unwrap() - 46.0).abs() < f32::EPSILON);
+        assert!(matches!(
+            resolve_target_c(Some(60.0), &cfg),
+            Err(ApiError::BadRequest)
+        ));
+        assert!(matches!(
+            resolve_target_c(Some(40.0), &cfg),
+            Err(ApiError::BadRequest)
+        ));
+    }
+
+    #[tokio::test]
+    async fn warm_by_no_gpio_is_service_unavailable() {
+        let state = create_state_without_handle();
+        let query = WarmByQuery {
+            warm_by: "06:30".to_string(),
+            target_c: None,
+        };
+        let result = set_warm_by(State(state), Query(query)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
+    }
+
+    #[tokio::test]
+    async fn warm_by_bad_deadline_is_bad_request() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) = spawn_accepting_test_gpio_with_modbus(
+            PriceState::new("SE3".to_string()),
+            test_config(),
+            None,
+            cancel,
+        );
+        let state = test_state(Some(handle), PriceState::new("SE3".to_string()));
+        let query = WarmByQuery {
+            warm_by: "not-a-time".to_string(),
+            target_c: None,
+        };
+        let result = set_warm_by(State(state), Query(query)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn warm_by_preview_skips_when_tank_already_warm() {
+        let modbus: Arc<dyn ModbusWriter> = Arc::new(FakeTemp(50.0));
+        let state = test_state_with_modbus(None, PriceState::new("SE3".to_string()), modbus);
+        let query = WarmByQuery {
+            warm_by: "23:59".to_string(),
+            target_c: None,
+        };
+        let body = get_warm_by_preview(State(state), Query(query))
+            .await
+            .unwrap();
+        assert!(body.contains("\"would_skip\":true"), "body: {body}");
+        assert!(!body.contains("heatup_start_at"), "skip → no start: {body}");
+    }
+
+    #[tokio::test]
+    async fn warm_by_preview_plans_heatup_when_cold() {
+        let modbus: Arc<dyn ModbusWriter> = Arc::new(FakeTemp(20.0));
+        // No price data → immediate-start fallback, so a start is still produced.
+        let state = test_state_with_modbus(None, PriceState::new("SE3".to_string()), modbus);
+        let query = WarmByQuery {
+            warm_by: "23:59".to_string(),
+            target_c: None,
+        };
+        let body = get_warm_by_preview(State(state), Query(query))
+            .await
+            .unwrap();
+        assert!(body.contains("\"would_skip\":false"), "body: {body}");
+        assert!(body.contains("heatup_start_at"), "cold → has start: {body}");
+        assert!(body.contains("est_minutes"), "cold → has estimate: {body}");
+    }
+
+    #[tokio::test]
+    async fn warm_by_post_skip_path_blocks_without_heatup() {
+        let cancel = CancellationToken::new();
+        let modbus: Arc<dyn ModbusWriter> = Arc::new(FakeTemp(50.0));
+        let (handle, _join) = spawn_accepting_test_gpio_with_modbus(
+            PriceState::new("SE3".to_string()),
+            test_config(),
+            Some(modbus.clone()),
+            cancel,
+        );
+        let state =
+            test_state_with_modbus(Some(handle), PriceState::new("SE3".to_string()), modbus);
+        let query = WarmByQuery {
+            warm_by: "23:59".to_string(),
+            target_c: None,
+        };
+        let body = set_warm_by(State(state), Query(query)).await.unwrap();
+        assert!(body.contains("\"applied_blocking\":true"), "body: {body}");
+        assert!(body.contains("\"skipped\":true"), "body: {body}");
+        assert!(!body.contains("heatup_start_at"), "skip → no start: {body}");
+    }
+
+    #[tokio::test]
+    async fn warm_by_preview_no_modbus_is_service_unavailable() {
+        // create_state_without_handle has modbus None → temp read impossible.
+        let state = create_state_without_handle();
+        let query = WarmByQuery {
+            warm_by: "23:59".to_string(),
+            target_c: None,
+        };
+        let result = get_warm_by_preview(State(state), Query(query)).await;
+        assert!(matches!(result.unwrap_err(), ApiError::ServiceUnavailable));
     }
 }

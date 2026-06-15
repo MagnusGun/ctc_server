@@ -1491,6 +1491,24 @@ body {
 .resume-row .resume-price { font-weight: 700; font-family: var(--font-mono); }
 .resume-row.manual { opacity: 0.85; }
 
+/* Warm-by: "Warm water ready by [time]" row + target/preview block. */
+.resume-row.warmby .warmby-time {
+  font-family: var(--font-mono); font-size: 13px;
+  padding: 4px 8px; border-radius: 6px;
+  border: 1px solid var(--line-2); background: var(--surface); color: var(--text);
+}
+.warmby-extra {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 12px; margin-top: -2px;
+}
+.warmby-target { font-size: 13px; color: var(--text); }
+.warmby-target input[type="number"] {
+  width: 56px; font-family: var(--font-mono); font-size: 13px;
+  padding: 3px 6px; border-radius: 6px;
+  border: 1px solid var(--line-2); background: var(--surface); color: var(--text);
+}
+.warmby-preview { font-style: italic; }
+
 .resume-row.level-very_cheap     { border-left-color: var(--price-very-cheap); }
 .resume-row.level-cheap          { border-left-color: var(--price-cheap); }
 .resume-row.level-normal         { border-left-color: var(--price-normal); }

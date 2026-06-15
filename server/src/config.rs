@@ -297,6 +297,25 @@ pub struct SmartGridConfig {
     /// 30 min (default) selects the start of the cheapest 30-min contiguous
     /// stretch instead. Clamped to `[15, 240]`.
     pub auto_resume_min_duration_minutes: u16,
+    /// Enable the "Block + warm-by deadline" one-shot heat-up scheduler.
+    pub warm_by_enabled: bool,
+    /// Target hot-water tank-top temperature (`dhw_upper`, °C) the warm-by
+    /// heat-up aims for by the deadline. Clamped to `[45, 50]`.
+    pub warm_by_target_temp_c: f32,
+    /// Estimated tank heat-up rate (°C/min) used to size the heat-up window
+    /// from the current temperature. Clamped to `[0.05, 5.0]`.
+    pub warm_by_heat_rate_c_per_min: f32,
+    /// Assumed standby cooldown rate (°C/min) used to place the heat-up window
+    /// so the tank is still at target at the deadline. A learned value will
+    /// replace this constant in a later phase. Clamped to `[0.0, 2.0]`.
+    pub warm_by_cooldown_c_per_min: f32,
+    /// How far before the deadline the cheapest-window scan may start, in
+    /// minutes. Bounds the window to `[deadline - max_lead, deadline]`.
+    /// Clamped to `[30, 240]`.
+    pub warm_by_max_lead_minutes: u16,
+    /// Safety cap on how long the warm-by heat-up may run before forcing a
+    /// re-block, in minutes. Clamped to `[15, 240]`.
+    pub warm_by_max_duration_minutes: u16,
 }
 
 impl Default for SmartGridConfig {
@@ -305,6 +324,12 @@ impl Default for SmartGridConfig {
             auto_resume_enabled: true,
             auto_resume_window_hours: 12,
             auto_resume_min_duration_minutes: 30,
+            warm_by_enabled: true,
+            warm_by_target_temp_c: 48.0,
+            warm_by_heat_rate_c_per_min: 0.4,
+            warm_by_cooldown_c_per_min: 0.05,
+            warm_by_max_lead_minutes: 90,
+            warm_by_max_duration_minutes: 90,
         }
     }
 }
@@ -474,6 +499,18 @@ impl Config {
             .smartgrid
             .auto_resume_min_duration_minutes
             .clamp(15, 240);
+        // Warm-by knobs: clamp to sane ranges so a config typo cannot produce
+        // a div-by-zero (heat rate), an unreachable target, or an unbounded
+        // heat-up. Mirrors the auto_resume clamps above.
+        cfg.smartgrid.warm_by_target_temp_c = cfg.smartgrid.warm_by_target_temp_c.clamp(45.0, 50.0);
+        cfg.smartgrid.warm_by_heat_rate_c_per_min =
+            cfg.smartgrid.warm_by_heat_rate_c_per_min.clamp(0.05, 5.0);
+        cfg.smartgrid.warm_by_cooldown_c_per_min =
+            cfg.smartgrid.warm_by_cooldown_c_per_min.clamp(0.0, 2.0);
+        cfg.smartgrid.warm_by_max_lead_minutes =
+            cfg.smartgrid.warm_by_max_lead_minutes.clamp(30, 240);
+        cfg.smartgrid.warm_by_max_duration_minutes =
+            cfg.smartgrid.warm_by_max_duration_minutes.clamp(15, 240);
         // Hour-of-day is 0..=23. Anything else is a config bug; clamp so a
         // typo doesn't cause the scheduler to skip days.
         if cfg.price.fetch_hour_local > 23 {

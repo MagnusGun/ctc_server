@@ -447,6 +447,9 @@ function App() {
   const [resumeMode, setResumeMode] = useState("schedule");
   const [resumeCandidates, setResumeCandidates] = useState([]);
   const [pickedResume, setPickedResume] = useState(0); // index into candidates
+  const [warmByTime, setWarmByTime] = useState("06:30"); // HH:MM deadline
+  const [warmByTarget, setWarmByTarget] = useState(48);  // °C target
+  const [warmByPreview, setWarmByPreview] = useState(null);
   const [trendKey, setTrendKey] = useState(null);
   const [trendData, setTrendData] = useState(null); // [{label, data, color}]
   const [trendError, setTrendError] = useState(null);
@@ -1552,7 +1555,21 @@ function App() {
         const tone = meta.tone;
         // Clear stale proposedResume so the next open doesn't flash the
         // previous slot before the new fetch lands.
-        const closeConfirm = () => { setConfirm(null); setProposedResume(null); setResumeCandidates([]); setPickedResume(0); };
+        const closeConfirm = () => { setConfirm(null); setProposedResume(null); setResumeCandidates([]); setPickedResume(0); setWarmByPreview(null); };
+        // Fetch a read-only preview of the warm-by plan for the chosen time.
+        const loadWarmByPreview = (t) => {
+          window.api.getWarmByPreview(t).then(setWarmByPreview).catch(() => setWarmByPreview(null));
+        };
+        const warmByText = (() => {
+          if (!warmByPreview) return "Pick a time to see the plan.";
+          if (warmByPreview.would_skip) return "Tank already warm — will just block.";
+          if (warmByPreview.heatup_start_at) {
+            const s = new Date(warmByPreview.heatup_start_at).toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", hour12: false });
+            const est = warmByPreview.est_minutes != null ? `, est. ${warmByPreview.est_minutes} min` : "";
+            return `Cheapest heat-up from ${s}${est}.`;
+          }
+          return "—";
+        })();
         // Use the backend's proposed auto-resume time directly. The dashboard
         // doesn't recompute it — the backend picks the slot
         // (cheapest_run_within for Blocking, cheap_window_end for
@@ -1628,6 +1645,25 @@ function App() {
                                onChange={() => setResumeMode("manual")}/>
                         <span className="resume-time">Block, no auto-resume</span>
                       </label>
+                      <label className="resume-row warmby">
+                        <input type="radio" name="resume"
+                               checked={resumeMode === "warmby"}
+                               onChange={() => { setResumeMode("warmby"); loadWarmByPreview(warmByTime); }}/>
+                        <span className="resume-time">Warm water ready by</span>
+                        <input type="time" className="warmby-time" value={warmByTime}
+                               onClick={e => e.stopPropagation()}
+                               onChange={e => { const v = e.target.value; setResumeMode("warmby"); setWarmByTime(v); loadWarmByPreview(v); }}/>
+                      </label>
+                      {resumeMode === "warmby" && (
+                        <div className="warmby-extra">
+                          <label className="warmby-target">Target&nbsp;
+                            <input type="number" min="45" max="50" step="1" value={warmByTarget}
+                                   onClick={e => e.stopPropagation()}
+                                   onChange={e => setWarmByTarget(Number(e.target.value))}/>°C
+                          </label>
+                          <div className="resume-empty warmby-preview">{warmByText}</div>
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <div className="resume-options">
@@ -1655,12 +1691,20 @@ function App() {
                     <button className="btn" onClick={() => closeConfirm()}>Never mind</button>
                     <button className={`btn primary ${tone}`}
                             onClick={async () => {
-                              const backendMode = UI_TO_BACKEND_MODE[target] ?? target;
-                              const schedule = resumeMode === "schedule";
-                              const resumeAt = (schedule && isPS && resumeCandidates[pickedResume])
-                                ? resumeCandidates[pickedResume].starts_at
-                                : null;
                               try {
+                                if (isPS && resumeMode === "warmby") {
+                                  // Block now + schedule a temp-aware heat-up by the deadline.
+                                  await window.api.warmBySmartGrid(warmByTime, warmByTarget);
+                                  setMode("powersave");
+                                  sgMeta?.refetch?.();
+                                  closeConfirm();
+                                  return;
+                                }
+                                const backendMode = UI_TO_BACKEND_MODE[target] ?? target;
+                                const schedule = resumeMode === "schedule";
+                                const resumeAt = (schedule && isPS && resumeCandidates[pickedResume])
+                                  ? resumeCandidates[pickedResume].starts_at
+                                  : null;
                                 await window.api.setSmartGridMode(backendMode, schedule, resumeAt);
                                 setMode(target);
                                 sgMeta?.refetch?.();   // pull new scheduled_resume_at now, not on next 5s poll

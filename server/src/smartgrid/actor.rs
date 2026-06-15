@@ -19,15 +19,18 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::SmartGridConfig;
+use crate::dhw::actor::ModbusWriter;
 use crate::energy::price::PriceState;
 use crate::energy::tibber::parse_iso8601;
 use crate::homey::HomeyClient;
 use crate::homey::cache::HomeyPumpCache;
 
 use super::gpio::GpioController;
+use super::heatup::{DoneReason, WarmByCommand};
+use super::heatup_watcher::run_heatup_watcher;
 use super::mode::SmartGridMode;
 
 /// Side-channel for slaving the Cirkulationspump to `SmartGrid` mode via Homey.
@@ -148,6 +151,24 @@ pub enum SmartGridCmd {
         fires_at: SystemTime,
         generation: u64,
     },
+    /// Schedule a "Block + warm-by deadline" one-shot heat-up. Blocks
+    /// immediately; the route has already resolved the temp-aware
+    /// `heatup_start` (or `None` to skip the heat-up and just block).
+    ScheduleWarmBy {
+        cmd: WarmByCommand,
+        respond_to: oneshot::Sender<Result<Option<SystemTime>, ApplyModeError>>,
+    },
+    /// Internal: phase-A timer reached `heatup_start` — flip to Normal and
+    /// start the phase-B watcher. Generation-guarded like `ResumeFire`.
+    HeatupStartFire {
+        generation: u64,
+    },
+    /// Internal: phase-B watcher decided the heat-up is done — re-block.
+    /// Generation-guarded.
+    HeatupDoneFire {
+        generation: u64,
+        reason: DoneReason,
+    },
 }
 
 /// Cheap-clone handle that route handlers use to send commands.
@@ -218,6 +239,24 @@ impl SmartGridHandle {
             .map_err(|_| SmartGridError::ActorGone)?;
         rx.await.map_err(|_| SmartGridError::ActorGone)
     }
+
+    /// Apply Blocking now and schedule a warm-by heat-up. Returns the
+    /// scheduled `heatup_start` instant, or `None` when the tank is already
+    /// warm (`cmd.heatup_start` is `None`) — in that case the system is simply
+    /// left blocked.
+    pub async fn schedule_warm_by(
+        &self,
+        cmd: WarmByCommand,
+    ) -> Result<Option<SystemTime>, SmartGridError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(SmartGridCmd::ScheduleWarmBy { cmd, respond_to })
+            .await
+            .map_err(|_| SmartGridError::ActorGone)?;
+        rx.await
+            .map_err(|_| SmartGridError::ActorGone)?
+            .map_err(SmartGridError::Apply)
+    }
 }
 
 #[derive(Debug)]
@@ -245,13 +284,32 @@ struct ScheduledResume {
     timer_task: AbortHandle,
 }
 
+/// A pending warm-by heat-up. The single `task` handle tracks whichever phase
+/// is live: it holds the phase-A timer until `HeatupStartFire`, then is
+/// **swapped** to the phase-B watcher so a later manual override aborts the
+/// right task. `generation` is the snapshot taken when the heat-up was
+/// scheduled; both fire handlers reject mismatches.
+struct WarmBySlot {
+    heatup_start: SystemTime,
+    task: AbortHandle,
+    generation: u64,
+    target_c: f32,
+    max_duration: Duration,
+}
+
 struct SmartGridActor {
     gpio: GpioController,
     scheduled_resume: Option<ScheduledResume>,
+    /// Pending warm-by heat-up (phase A or B). Mutually exclusive with a plain
+    /// auto-resume in practice — any mode change cancels both.
+    scheduled_warmby: Option<WarmBySlot>,
     price_state: PriceState,
     config: SmartGridConfig,
     /// Cloned for the resume timer task to post back `ResumeFire`.
     self_tx: mpsc::Sender<SmartGridCmd>,
+    /// Scaled Modbus reader for the warm-by phase-B watcher (tank temp +
+    /// compressor status). `None` in GPIO-only deployments / tests.
+    modbus: Option<Arc<dyn ModbusWriter>>,
     /// When `Some`, every successful mode write is mirrored to Homey to
     /// drive the Cirkulationspump on/off.
     homey: Option<HomeyHooks>,
@@ -270,6 +328,7 @@ pub fn spawn(
     initial_mode: SmartGridMode,
     price_state: PriceState,
     config: SmartGridConfig,
+    modbus: Option<Arc<dyn ModbusWriter>>,
     homey: Option<HomeyHooks>,
     cancel: CancellationToken,
 ) -> Result<(SmartGridHandle, JoinHandle<()>), String> {
@@ -286,9 +345,11 @@ pub fn spawn(
     let actor = SmartGridActor {
         gpio,
         scheduled_resume: None,
+        scheduled_warmby: None,
         price_state,
         config,
         self_tx: tx.clone(),
+        modbus,
         homey,
     };
     let join = tokio::spawn(actor.run(rx, cancel));
@@ -354,9 +415,19 @@ impl SmartGridActor {
                 }
             }
         }
-        // Abort any pending resume timer so we don't leak it past shutdown.
-        if let Some(scheduled) = self.scheduled_resume.take() {
-            scheduled.timer_task.abort();
+        // Abort any pending timers so we don't leak them past shutdown.
+        self.cancel_all_schedules();
+    }
+
+    /// Abort and clear both the auto-resume and warm-by pending timers. Called
+    /// before any mode change and on shutdown so a stale fire can never land
+    /// after the user's intent has moved on.
+    fn cancel_all_schedules(&mut self) {
+        if let Some(prev) = self.scheduled_resume.take() {
+            prev.timer_task.abort();
+        }
+        if let Some(prev) = self.scheduled_warmby.take() {
+            prev.task.abort();
         }
     }
 
@@ -378,23 +449,38 @@ impl SmartGridActor {
                 let _ = respond_to.send(Ok(self.gpio.mode_changed_at()));
             }
             SmartGridCmd::ScheduledResumeAt { respond_to } => {
-                let _ = respond_to.send(self.scheduled_resume.as_ref().map(|s| s.fires_at));
+                let _ = respond_to.send(self.pending_schedule_at());
             }
             SmartGridCmd::CancelScheduledResume { respond_to } => {
-                if let Some(prev) = self.scheduled_resume.take() {
-                    prev.timer_task.abort();
-                    debug!(
-                        "Cancelled pending auto-resume scheduled at {:?}",
-                        prev.fires_at
-                    );
-                }
+                self.cancel_all_schedules();
                 let _ = respond_to.send(());
             }
             SmartGridCmd::ResumeFire {
                 fires_at,
                 generation,
             } => self.on_resume_fire(fires_at, generation),
+            SmartGridCmd::ScheduleWarmBy { cmd, respond_to } => {
+                let result = self.do_warm_by(cmd);
+                let _ = respond_to.send(result);
+            }
+            SmartGridCmd::HeatupStartFire { generation } => self.on_heatup_start_fire(generation),
+            SmartGridCmd::HeatupDoneFire { generation, reason } => {
+                self.on_heatup_done_fire(generation, reason);
+            }
         }
+    }
+
+    /// The next pending flip the dashboard should show: a scheduled auto-resume,
+    /// or a warm-by heat-up start that is still in the future (phase A).
+    fn pending_schedule_at(&self) -> Option<SystemTime> {
+        if let Some(s) = self.scheduled_resume.as_ref() {
+            return Some(s.fires_at);
+        }
+        let now = SystemTime::now();
+        self.scheduled_warmby
+            .as_ref()
+            .filter(|w| w.heatup_start > now)
+            .map(|w| w.heatup_start)
     }
 
     fn do_set_mode(
@@ -409,10 +495,8 @@ impl SmartGridActor {
         self.gpio.bump_mode_generation();
 
         // Always cancel a prior schedule before mutating: a manual change
-        // overrides any pending auto-flip.
-        if let Some(prev) = self.scheduled_resume.take() {
-            prev.timer_task.abort();
-        }
+        // overrides any pending auto-flip or warm-by heat-up.
+        self.cancel_all_schedules();
 
         self.gpio.set_mode(mode).map_err(ApplyModeError::Gpio)?;
 
@@ -497,6 +581,133 @@ impl SmartGridActor {
             error!("Auto-resume: failed to set Normal");
         }
     }
+
+    /// Apply Blocking now and, unless the tank is already warm, schedule the
+    /// phase-A timer that will flip to Normal at `heatup_start`.
+    fn do_warm_by(&mut self, cmd: WarmByCommand) -> Result<Option<SystemTime>, ApplyModeError> {
+        // Same prologue as do_set_mode: bump generation, cancel prior
+        // schedules, block, push pump.
+        self.gpio.bump_mode_generation();
+        self.cancel_all_schedules();
+        self.gpio
+            .set_mode(SmartGridMode::Blocking)
+            .map_err(ApplyModeError::Gpio)?;
+        push_pump_to_homey(self.homey.as_ref(), SmartGridMode::Blocking);
+
+        let Some(heatup_start) = cmd.heatup_start else {
+            info!("Warm-by: tank already at target — staying blocked, no heat-up");
+            return Ok(None);
+        };
+
+        let generation = self.gpio.mode_generation();
+        let tx = self.self_tx.clone();
+        let task = tokio::spawn(async move {
+            // Monotonic sleep, re-checked in ≤60s chunks so an NTP step
+            // misfires by at most that. Mirrors the auto-resume timer.
+            while let Ok(remaining) = heatup_start.duration_since(SystemTime::now()) {
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(remaining.min(Duration::from_mins(1))).await;
+            }
+            let _ = tx.send(SmartGridCmd::HeatupStartFire { generation }).await;
+        })
+        .abort_handle();
+
+        self.scheduled_warmby = Some(WarmBySlot {
+            heatup_start,
+            task,
+            generation,
+            target_c: cmd.target_c,
+            max_duration: cmd.max_duration,
+        });
+        info!("Warm-by heat-up scheduled to start at {heatup_start:?}");
+        Ok(Some(heatup_start))
+    }
+
+    /// Phase A fired: flip to Normal so the heat pump charges the tank, then
+    /// spawn the phase-B watcher and swap the slot's handle to it.
+    fn on_heatup_start_fire(&mut self, generation: u64) {
+        match self
+            .gpio
+            .set_mode_if_not_superseded(SmartGridMode::Normal, generation)
+        {
+            Ok(true) => {}
+            Ok(false) => return, // superseded by a manual change
+            Err(e) => {
+                error!("Warm-by: failed to set Normal at heat-up start: {e}");
+                return;
+            }
+        }
+        push_pump_to_homey(self.homey.as_ref(), SmartGridMode::Normal);
+
+        // The slot must still be the one we scheduled (generation match).
+        let Some(slot) = self
+            .scheduled_warmby
+            .as_mut()
+            .filter(|s| s.generation == generation)
+        else {
+            return;
+        };
+
+        let Some(modbus) = self.modbus.clone() else {
+            // No reader (GPIO-only deployment): fall back to a pure max-duration
+            // timer so we still re-block instead of staying Normal forever.
+            warn!("Warm-by: no Modbus reader — re-block will be time-capped only");
+            let tx = self.self_tx.clone();
+            let max_duration = slot.max_duration;
+            slot.task = tokio::spawn(async move {
+                tokio::time::sleep(max_duration).await;
+                let _ = tx
+                    .send(SmartGridCmd::HeatupDoneFire {
+                        generation,
+                        reason: DoneReason::MaxDuration,
+                    })
+                    .await;
+            })
+            .abort_handle();
+            info!("Warm-by heat-up started — Normal (time-capped re-block)");
+            return;
+        };
+
+        let tx = self.self_tx.clone();
+        let target_c = slot.target_c;
+        let max_duration = slot.max_duration;
+        slot.task = tokio::spawn(run_heatup_watcher(
+            tokio::time::Instant::now(),
+            target_c,
+            max_duration,
+            generation,
+            modbus,
+            tx,
+        ))
+        .abort_handle();
+        info!("Warm-by heat-up started — Normal, watcher running");
+    }
+
+    /// Phase B fired: the heat-up finished — re-block and stay blocked.
+    fn on_heatup_done_fire(&mut self, generation: u64, reason: DoneReason) {
+        match self
+            .gpio
+            .set_mode_if_not_superseded(SmartGridMode::Blocking, generation)
+        {
+            Ok(true) => {}
+            Ok(false) => return, // superseded by a manual change
+            Err(e) => {
+                error!("Warm-by: failed to re-block after heat-up: {e}");
+                return;
+            }
+        }
+        push_pump_to_homey(self.homey.as_ref(), SmartGridMode::Blocking);
+        if self
+            .scheduled_warmby
+            .as_ref()
+            .is_some_and(|s| s.generation == generation)
+        {
+            self.scheduled_warmby = None;
+        }
+        info!("Warm-by heat-up done ({reason:?}) — re-blocked");
+    }
 }
 
 #[cfg(test)]
@@ -521,9 +732,11 @@ pub(crate) mod test_support {
         let actor = SmartGridActor {
             gpio,
             scheduled_resume: None,
+            scheduled_warmby: None,
             price_state,
             config,
             self_tx: tx.clone(),
+            modbus: None,
             homey: None,
         };
         let join = tokio::spawn(actor.run(rx, cancel));
@@ -539,14 +752,27 @@ pub(crate) mod test_support {
         config: SmartGridConfig,
         cancel: CancellationToken,
     ) -> (SmartGridHandle, JoinHandle<()>) {
+        spawn_accepting_test_gpio_with_modbus(price_state, config, None, cancel)
+    }
+
+    /// Like [`spawn_accepting_test_gpio`] but with an injectable Modbus reader
+    /// so the warm-by phase-B watcher can be driven by a fake in tests.
+    pub fn spawn_accepting_test_gpio_with_modbus(
+        price_state: PriceState,
+        config: SmartGridConfig,
+        modbus: Option<Arc<dyn ModbusWriter>>,
+        cancel: CancellationToken,
+    ) -> (SmartGridHandle, JoinHandle<()>) {
         let gpio = GpioController::new_for_test_accepting(20, 21, false);
         let (tx, rx) = mpsc::channel(32);
         let actor = SmartGridActor {
             gpio,
             scheduled_resume: None,
+            scheduled_warmby: None,
             price_state,
             config,
             self_tx: tx.clone(),
+            modbus,
             homey: None,
         };
         let join = tokio::spawn(actor.run(rx, cancel));
@@ -593,11 +819,7 @@ mod tests {
     }
 
     fn test_config() -> SmartGridConfig {
-        SmartGridConfig {
-            auto_resume_enabled: true,
-            auto_resume_window_hours: 12,
-            auto_resume_min_duration_minutes: 30,
-        }
+        SmartGridConfig::default()
     }
 
     #[tokio::test]
@@ -952,11 +1174,7 @@ mod tests {
     #[test]
     fn resolve_fires_at_prefers_explicit_over_computed() {
         let state = PriceState::new("SE3".to_string());
-        let cfg = SmartGridConfig {
-            auto_resume_enabled: true,
-            auto_resume_window_hours: 12,
-            auto_resume_min_duration_minutes: 30,
-        };
+        let cfg = SmartGridConfig::default();
         let explicit = SystemTime::now() + Duration::from_hours(2);
         // Explicit time wins even for a mode whose auto-pick would differ.
         let got = resolve_fires_at(Some(explicit), &state, &cfg, SmartGridMode::Blocking);
@@ -968,11 +1186,7 @@ mod tests {
         // No price data → Blocking auto-pick yields None, and with no explicit
         // time the helper returns that None (proves the fallback is wired).
         let state = PriceState::new("SE3".to_string());
-        let cfg = SmartGridConfig {
-            auto_resume_enabled: true,
-            auto_resume_window_hours: 12,
-            auto_resume_min_duration_minutes: 30,
-        };
+        let cfg = SmartGridConfig::default();
         let got = resolve_fires_at(None, &state, &cfg, SmartGridMode::Blocking);
         assert!(got.is_none());
     }
@@ -999,11 +1213,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, _join) = test_support::spawn_with_test_gpio(
             PriceState::new("SE3".to_string()),
-            SmartGridConfig {
-                auto_resume_enabled: true,
-                auto_resume_window_hours: 12,
-                auto_resume_min_duration_minutes: 30,
-            },
+            SmartGridConfig::default(),
             cancel,
         );
         let target = SystemTime::now() + Duration::from_hours(1);
@@ -1131,8 +1341,7 @@ mod tests {
         state.update_prices(make_run(60, &[0.10, 0.10]), vec![]);
         let cfg = SmartGridConfig {
             auto_resume_enabled: false,
-            auto_resume_window_hours: 12,
-            auto_resume_min_duration_minutes: 30,
+            ..SmartGridConfig::default()
         };
         let (handle, _join) = test_support::spawn_accepting_test_gpio(state, cfg, cancel.clone());
 
@@ -1342,5 +1551,200 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("cache never became stale despite Homey being unreachable");
+    }
+
+    // ── Warm-by heat-up ──────────────────────────────────────────────
+
+    use super::test_support::spawn_accepting_test_gpio_with_modbus;
+
+    /// Modbus fake returning a fixed temperature for any read.
+    struct FakeReader(f32);
+    #[async_trait::async_trait]
+    impl ModbusWriter for FakeReader {
+        async fn write_scaled(&self, _addr: u16, _v: f32) -> Result<(), String> {
+            Ok(())
+        }
+        async fn read_scaled(&self, _addr: u16) -> Result<f32, String> {
+            Ok(self.0)
+        }
+    }
+
+    /// Build a bare actor (not spawned) so the sync fire handlers can be
+    /// driven directly. Returns the receiver to keep `self_tx` alive.
+    fn build_actor(
+        modbus: Option<Arc<dyn ModbusWriter>>,
+    ) -> (SmartGridActor, mpsc::Receiver<SmartGridCmd>) {
+        let (tx, rx) = mpsc::channel(32);
+        let actor = SmartGridActor {
+            gpio: GpioController::new_for_test_accepting(20, 21, false),
+            scheduled_resume: None,
+            scheduled_warmby: None,
+            price_state: PriceState::new("SE3".to_string()),
+            config: test_config(),
+            self_tx: tx,
+            modbus,
+            homey: None,
+        };
+        (actor, rx)
+    }
+
+    fn warmby_cmd(heatup_start: Option<SystemTime>) -> WarmByCommand {
+        WarmByCommand {
+            heatup_start,
+            target_c: 48.0,
+            max_duration: Duration::from_mins(90),
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_by_skip_blocks_without_scheduling() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) = spawn_accepting_test_gpio_with_modbus(
+            PriceState::new("SE3".to_string()),
+            test_config(),
+            None,
+            cancel.clone(),
+        );
+        let scheduled = handle
+            .schedule_warm_by(warmby_cmd(None))
+            .await
+            .expect("schedule_warm_by ok");
+        assert!(scheduled.is_none(), "skip → nothing scheduled");
+        assert!(matches!(
+            handle.read_mode().await.unwrap(),
+            SmartGridMode::Blocking
+        ));
+        assert!(handle.scheduled_resume_at().await.unwrap().is_none());
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn warm_by_schedules_phase_a_and_surfaces_pending() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) = spawn_accepting_test_gpio_with_modbus(
+            PriceState::new("SE3".to_string()),
+            test_config(),
+            Some(Arc::new(FakeReader(20.0))),
+            cancel.clone(),
+        );
+        let start = SystemTime::now() + Duration::from_hours(3);
+        let scheduled = handle
+            .schedule_warm_by(warmby_cmd(Some(start)))
+            .await
+            .expect("ok")
+            .expect("a heat-up start is scheduled");
+        assert_eq!(scheduled, start);
+        // Pending future heat-up start is surfaced for the dashboard.
+        assert_eq!(handle.scheduled_resume_at().await.unwrap(), Some(start));
+        assert!(matches!(
+            handle.read_mode().await.unwrap(),
+            SmartGridMode::Blocking
+        ));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn warm_by_manual_override_cancels_pending_heatup() {
+        let cancel = CancellationToken::new();
+        let (handle, _join) = spawn_accepting_test_gpio_with_modbus(
+            PriceState::new("SE3".to_string()),
+            test_config(),
+            Some(Arc::new(FakeReader(20.0))),
+            cancel.clone(),
+        );
+        let start = SystemTime::now() + Duration::from_hours(3);
+        handle
+            .schedule_warm_by(warmby_cmd(Some(start)))
+            .await
+            .unwrap()
+            .expect("scheduled");
+        // A manual mode change clears the pending warm-by.
+        handle
+            .set_mode(SmartGridMode::Normal, false, None)
+            .await
+            .unwrap();
+        assert!(handle.scheduled_resume_at().await.unwrap().is_none());
+        assert!(matches!(
+            handle.read_mode().await.unwrap(),
+            SmartGridMode::Normal
+        ));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn heatup_done_fire_reblocks_on_generation_match() {
+        let (mut actor, _rx) = build_actor(None);
+        actor.gpio.set_mode(SmartGridMode::Normal).unwrap();
+        let generation = actor.gpio.mode_generation();
+        let dummy = tokio::spawn(async {}).abort_handle();
+        actor.scheduled_warmby = Some(WarmBySlot {
+            heatup_start: SystemTime::now(),
+            task: dummy,
+            generation,
+            target_c: 48.0,
+            max_duration: Duration::from_mins(90),
+        });
+        actor.on_heatup_done_fire(generation, DoneReason::TargetReached);
+        assert!(matches!(actor.gpio.read_mode(), SmartGridMode::Blocking));
+        assert!(actor.scheduled_warmby.is_none(), "slot cleared after done");
+    }
+
+    #[tokio::test]
+    async fn heatup_done_fire_superseded_leaves_mode_untouched() {
+        let (mut actor, _rx) = build_actor(None);
+        actor.gpio.set_mode(SmartGridMode::Normal).unwrap();
+        let stale = actor.gpio.mode_generation();
+        // A manual change happened since the watcher captured its generation.
+        actor.gpio.bump_mode_generation();
+        let dummy = tokio::spawn(async {}).abort_handle();
+        actor.scheduled_warmby = Some(WarmBySlot {
+            heatup_start: SystemTime::now(),
+            task: dummy,
+            generation: stale,
+            target_c: 48.0,
+            max_duration: Duration::from_mins(90),
+        });
+        actor.on_heatup_done_fire(stale, DoneReason::MaxDuration);
+        assert!(
+            matches!(actor.gpio.read_mode(), SmartGridMode::Normal),
+            "stale done-fire must not re-block"
+        );
+    }
+
+    #[tokio::test]
+    async fn heatup_start_fire_flips_to_normal_and_keeps_slot() {
+        let (mut actor, _rx) = build_actor(Some(Arc::new(FakeReader(50.0))));
+        actor.gpio.set_mode(SmartGridMode::Blocking).unwrap();
+        let generation = actor.gpio.mode_generation();
+        let dummy = tokio::spawn(async {}).abort_handle();
+        actor.scheduled_warmby = Some(WarmBySlot {
+            heatup_start: SystemTime::now(),
+            task: dummy,
+            generation,
+            target_c: 48.0,
+            max_duration: Duration::from_mins(90),
+        });
+        actor.on_heatup_start_fire(generation);
+        assert!(
+            matches!(actor.gpio.read_mode(), SmartGridMode::Normal),
+            "phase A flips to Normal"
+        );
+        assert!(
+            actor.scheduled_warmby.is_some(),
+            "slot retained for the phase-B watcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn heatup_start_fire_superseded_does_nothing() {
+        let (mut actor, _rx) = build_actor(Some(Arc::new(FakeReader(50.0))));
+        actor.gpio.set_mode(SmartGridMode::Blocking).unwrap();
+        let stale = actor.gpio.mode_generation();
+        actor.gpio.bump_mode_generation();
+        actor.on_heatup_start_fire(stale);
+        assert!(
+            matches!(actor.gpio.read_mode(), SmartGridMode::Blocking),
+            "stale start-fire must not flip to Normal"
+        );
     }
 }

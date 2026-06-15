@@ -291,11 +291,7 @@ mod tests {
     }
 
     fn test_smartgrid_config() -> SmartGridConfig {
-        SmartGridConfig {
-            auto_resume_enabled: true,
-            auto_resume_window_hours: 12,
-            auto_resume_min_duration_minutes: 30,
-        }
+        SmartGridConfig::default()
     }
 
     #[tokio::test]

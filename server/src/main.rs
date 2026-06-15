@@ -348,6 +348,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // channel survives `homey` being moved into the poller arm below.
     let boost_override_tx_for_dhw = homey.as_ref().map(|b| b.hooks.boost_override_tx.clone());
 
+    // Scaled Modbus reader shared by the SmartGrid warm-by phase-B watcher,
+    // the warm-by route (schedule-time temp read + preview), and the DHW
+    // actor. Built unconditionally — before the GPIO branch — so the warm-by
+    // preview works even when GPIO is absent and no SmartGrid handle exists.
+    let modbus_writer: Arc<dyn dhw::actor::ModbusWriter> =
+        Arc::new(dhw::adapters::CtcActorModbus::new(
+            tx.clone(),
+            Duration::from_secs(config.modbus.request_timeout_secs),
+        ));
+
     // Spawn the SmartGrid actor (required for SmartGrid control). Owns the
     // GpioController and processes all set-mode / read-mode / scheduled-
     // resume commands serially. Routes get a cheap-clone SmartGridHandle.
@@ -373,6 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial_mode,
             price_state.clone(),
             config.smartgrid.clone(),
+            Some(modbus_writer.clone()),
             homey_hooks_for_actor,
             cancel.clone(),
         ) {
@@ -464,15 +475,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dhw_handle = if let (Some(sg_handle), Some(boost_tx)) =
         (smartgrid_handle.clone(), boost_override_tx_for_dhw.clone())
     {
-        let modbus_writer: Arc<dyn dhw::actor::ModbusWriter> =
-            Arc::new(dhw::adapters::CtcActorModbus::new(
-                tx.clone(),
-                Duration::from_secs(config.modbus.request_timeout_secs),
-            ));
         let sg_controller: Arc<dyn dhw::actor::SgController> =
             Arc::new(dhw::adapters::SmartGridAdapter::new(sg_handle));
         let handle = dhw::actor::DhwActor::spawn(
-            modbus_writer,
+            modbus_writer.clone(),
             sg_controller,
             boost_tx,
             store.clone(),
@@ -507,6 +513,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             price_state.clone(),
             config.smartgrid.clone(),
             config.modbus.request_timeout_secs,
+            tz,
+            modbus_writer.clone(),
         ))
         .merge(routes::visibility::routes(
             tx.clone(),

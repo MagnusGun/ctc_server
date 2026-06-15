@@ -360,6 +360,52 @@ impl PriceState {
             .map(|r| r.start)
     }
 
+    /// Start of the cheapest contiguous run of length `run_duration` that
+    /// **finishes at or before `deadline`** and **starts no earlier than
+    /// `deadline - max_lead`**.
+    ///
+    /// This is the deadline-anchored sibling of [`Self::cheapest_run_within`],
+    /// used by the "warm-by" heat-up scheduler: heat the tank during the
+    /// cheapest window that completes by the user's deadline, bounded to a
+    /// lead window so the tank is still warm at the deadline (cooldown over
+    /// the gap between the run end and the deadline stays small).
+    ///
+    /// Boundaries are inclusive: a run whose `end` equals `deadline`, or whose
+    /// start equals `deadline - max_lead`, qualifies. Returns `None` when the
+    /// deadline is already in the past, when no contiguous run of the required
+    /// length fits inside `[deadline - max_lead, deadline]`, or when a run
+    /// would be truncated by the edge of available price data (the caller then
+    /// falls back to starting the heat-up immediately).
+    pub fn cheapest_run_ending_by(
+        &self,
+        deadline: SystemTime,
+        max_lead: Duration,
+        run_duration: Duration,
+    ) -> Option<PricePoint> {
+        // Window for `runs_within` is "now until the deadline", so its cutoff
+        // lands exactly on the deadline. `duration_since` is `Err` when the
+        // deadline is already past → None.
+        let window = deadline.duration_since(SystemTime::now()).ok()?;
+        let deadline_utc = chrono::DateTime::<chrono::Utc>::from(deadline);
+        let lead_start = deadline_utc - chrono::Duration::from_std(max_lead).ok()?;
+
+        self.runs_within(window, run_duration)
+            .into_iter()
+            .filter(|r| {
+                // `runs_within` filters on the run START, so the end-bound and
+                // the lower start-bound must both be re-checked here.
+                r.end.with_timezone(&chrono::Utc) <= deadline_utc
+                    && chrono::DateTime::parse_from_rfc3339(&r.start.starts_at)
+                        .is_ok_and(|s| s.with_timezone(&chrono::Utc) >= lead_start)
+            })
+            .min_by(|a, b| {
+                a.avg
+                    .partial_cmp(&b.avg)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|r| r.start)
+    }
+
     /// All qualifying runs of length `run_duration` whose start is inside
     /// `window`, each scored by duration-weighted average `spot_sek`. Shared
     /// by `cheapest_run_within` (single best) and `cheapest_runs_within`
@@ -871,6 +917,99 @@ mod tests {
             0.20,
             "run must start at first future slot, not the past one",
         );
+    }
+
+    #[test]
+    fn cheapest_run_ending_by_picks_run_finishing_at_deadline() {
+        // Eight contiguous 15-min slots from now+60 to now+180; the last two
+        // are the cheapest. The cheapest 30-min run ends exactly at now+180.
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(
+            make_run(60, &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.1, 0.1]),
+            vec![],
+        );
+        // Deadline captured after the slots, so it sits at/just past the run
+        // end — the boundary is inclusive.
+        let deadline = SystemTime::now() + Duration::from_hours(3);
+        let pick = state
+            .cheapest_run_ending_by(deadline, Duration::from_mins(130), Duration::from_mins(30))
+            .expect("a run finishing by the deadline exists");
+        assert_float_eq(pick.spot_sek, 0.1, "cheapest run ending at deadline wins");
+    }
+
+    #[test]
+    fn cheapest_run_ending_by_excludes_run_finishing_after_deadline() {
+        // Same slots, but the deadline lands before the cheap run finishes, so
+        // it must fall back to a costlier run that does finish in time.
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(
+            make_run(60, &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.1, 0.1]),
+            vec![],
+        );
+        let deadline = SystemTime::now() + Duration::from_mins(170);
+        let pick = state
+            .cheapest_run_ending_by(deadline, Duration::from_mins(130), Duration::from_mins(30))
+            .expect("an earlier run still fits");
+        assert_float_eq(
+            pick.spot_sek,
+            0.5,
+            "cheap run ends after deadline, so it is excluded",
+        );
+    }
+
+    #[test]
+    fn cheapest_run_ending_by_excludes_run_starting_before_lead() {
+        // Cheap run is available but starts before deadline - max_lead, so no
+        // run qualifies inside the lead window.
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(0, &[0.1, 0.1, 0.1, 0.1]), vec![]);
+        let deadline = SystemTime::now() + Duration::from_hours(3);
+        let result = state.cheapest_run_ending_by(
+            deadline,
+            Duration::from_mins(30),
+            Duration::from_mins(30),
+        );
+        assert!(result.is_none(), "run starts before the lead window");
+    }
+
+    #[test]
+    fn cheapest_run_ending_by_none_when_truncated_by_data_edge() {
+        // Only two slots (30 min) but a 60-min run is required — the run can't
+        // accumulate its full length, so nothing qualifies.
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.1, 0.1]), vec![]);
+        let deadline = SystemTime::now() + Duration::from_mins(200);
+        let result = state.cheapest_run_ending_by(
+            deadline,
+            Duration::from_hours(3),
+            Duration::from_hours(1),
+        );
+        assert!(result.is_none(), "run truncated by end of price data");
+    }
+
+    #[test]
+    fn cheapest_run_ending_by_none_when_deadline_in_past() {
+        let state = PriceState::new("SE3".to_string());
+        state.update_prices(make_run(60, &[0.1, 0.1]), vec![]);
+        let deadline = SystemTime::now() - Duration::from_hours(1);
+        let result = state.cheapest_run_ending_by(
+            deadline,
+            Duration::from_hours(2),
+            Duration::from_mins(30),
+        );
+        assert!(result.is_none(), "deadline already passed");
+    }
+
+    #[test]
+    fn cheapest_run_ending_by_none_with_no_price_data() {
+        let state = PriceState::new("SE3".to_string());
+        let deadline = SystemTime::now() + Duration::from_hours(2);
+        let result = state.cheapest_run_ending_by(
+            deadline,
+            Duration::from_hours(2),
+            Duration::from_mins(30),
+        );
+        assert!(result.is_none(), "no price data → no run");
     }
 
     #[test]

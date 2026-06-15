@@ -9,6 +9,8 @@
 
 pub mod actor;
 pub mod gpio;
+pub mod heatup;
+pub mod heatup_watcher;
 pub mod mode;
 pub mod scheduler;
 
