@@ -49,27 +49,40 @@ pub struct WarmByCommand {
     pub max_duration: Duration,
 }
 
-/// Estimate how long the tank needs to heat from `current_c` to `target_c`,
-/// or `None` when the tank is already warm enough (skip the heat-up).
+/// Estimate how long the tank needs to heat to reach `target_c` **at the
+/// deadline**, or `None` when the tank will still be warm enough then (skip).
 ///
-/// The estimate is `(target - current) / rate`, clamped to `max_duration`.
-/// A non-positive rate (impossible after config clamping, but guarded here)
-/// falls back to `max_duration` so we never divide by zero or return a
-/// nonsensically long window.
+/// The decision is deadline-aware: a tank that is warm *now* can be cold by a
+/// deadline hours away, so we predict the temperature at the deadline using a
+/// standby cooldown rate:
+///
+/// ```text
+/// predicted_at_deadline = current - cooldown_rate * minutes_until_deadline
+/// ```
+///
+/// If that prediction is still ≥ target the heat-up is skipped; otherwise the
+/// heat-up is sized to close the gap from the predicted temperature up to the
+/// target (`(target - predicted) / heat_rate`, clamped to `max_duration`).
+/// Because the heat-up is placed close to the deadline, heating to target from
+/// the deadline-predicted temperature lands the tank at target around the
+/// deadline. A non-positive heat rate falls back to `max_duration`.
 #[must_use]
 pub fn estimate_heatup(
     current_c: f32,
     target_c: f32,
-    rate_c_per_min: f32,
+    heat_rate_c_per_min: f32,
+    cooldown_c_per_min: f32,
+    minutes_until_deadline: f32,
     max_duration: Duration,
 ) -> Option<Duration> {
-    if current_c >= target_c {
+    let predicted_at_deadline = current_c - cooldown_c_per_min * minutes_until_deadline.max(0.0);
+    if predicted_at_deadline >= target_c {
         return None;
     }
-    if rate_c_per_min <= 0.0 {
+    if heat_rate_c_per_min <= 0.0 {
         return Some(max_duration);
     }
-    let minutes = (target_c - current_c) / rate_c_per_min;
+    let minutes = (target_c - predicted_at_deadline) / heat_rate_c_per_min;
     let secs = (minutes * 60.0).max(0.0);
     Some(Duration::from_secs_f32(secs).min(max_duration))
 }
@@ -128,29 +141,44 @@ mod tests {
     }
 
     #[test]
-    fn estimate_skips_when_already_warm() {
-        assert!(estimate_heatup(50.0, 48.0, 0.4, Duration::from_mins(90)).is_none());
-        // Exactly at target also skips.
-        assert!(estimate_heatup(48.0, 48.0, 0.4, Duration::from_mins(90)).is_none());
+    fn estimate_skips_only_when_warm_through_the_deadline() {
+        // Warm now AND a near deadline (no meaningful cooldown) → skip.
+        assert!(estimate_heatup(50.0, 48.0, 0.4, 0.05, 30.0, Duration::from_mins(90)).is_none());
+        // Exactly at target with zero cooldown horizon also skips.
+        assert!(estimate_heatup(48.0, 48.0, 0.4, 0.0, 0.0, Duration::from_mins(90)).is_none());
+    }
+
+    #[test]
+    fn estimate_does_not_skip_when_tank_will_cool_below_target() {
+        // Warm now (50 °C) but the deadline is 8 h out: at 0.05 °C/min the tank
+        // loses 24 °C → ~26 °C, well below the 48 °C target → must heat.
+        let d = estimate_heatup(50.0, 48.0, 0.4, 0.05, 480.0, Duration::from_mins(90))
+            .expect("must schedule a heat-up, not skip");
+        // gap = 48 - (50 - 24) = 22 °C at 0.4 °C/min = 55 min.
+        assert_float_eq(
+            d.as_secs_f32(),
+            55.0 * 60.0,
+            "heat-up sized for cooldown deficit",
+        );
     }
 
     #[test]
     fn estimate_sizes_from_temp_gap_and_rate() {
-        // 48 - 24 = 24 °C at 0.4 °C/min = 60 min.
-        let d = estimate_heatup(24.0, 48.0, 0.4, Duration::from_mins(90)).expect("some");
+        // No cooldown horizon: 48 - 24 = 24 °C at 0.4 °C/min = 60 min.
+        let d = estimate_heatup(24.0, 48.0, 0.4, 0.0, 0.0, Duration::from_mins(90)).expect("some");
         assert_float_eq(d.as_secs_f32(), 3600.0, "60 min heat-up");
     }
 
     #[test]
     fn estimate_clamps_to_max_duration() {
         // 48 - 0 = 48 °C at 0.4 = 120 min, capped at 90.
-        let d = estimate_heatup(0.0, 48.0, 0.4, Duration::from_mins(90)).expect("some");
+        let d = estimate_heatup(0.0, 48.0, 0.4, 0.0, 0.0, Duration::from_mins(90)).expect("some");
         assert_eq!(d, Duration::from_mins(90));
     }
 
     #[test]
     fn estimate_non_positive_rate_falls_back_to_cap() {
-        let d = estimate_heatup(20.0, 48.0, 0.0, Duration::from_mins(90)).expect("some");
+        let d = estimate_heatup(20.0, 48.0, 0.0, 0.0, 0.0, Duration::from_mins(90)).expect("some");
         assert_eq!(d, Duration::from_mins(90));
     }
 

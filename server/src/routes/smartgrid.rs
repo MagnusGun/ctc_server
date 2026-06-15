@@ -409,9 +409,22 @@ async fn plan_warm_by(
     let max_lead = Duration::from_mins(u64::from(state.config.warm_by_max_lead_minutes));
     let max_duration = Duration::from_mins(u64::from(state.config.warm_by_max_duration_minutes));
     let rate = state.config.warm_by_heat_rate_c_per_min;
+    let cooldown = state.config.warm_by_cooldown_c_per_min;
+    // How long until the deadline — drives the cooldown prediction so a tank
+    // that is warm now but will cool before a distant deadline still heats.
+    let minutes_until_deadline = deadline
+        .duration_since(SystemTime::now())
+        .map_or(0.0, |d| d.as_secs_f32() / 60.0);
 
-    match estimate_heatup(current_c, target_c, rate, max_duration) {
-        // Already warm — block only, no heat-up.
+    match estimate_heatup(
+        current_c,
+        target_c,
+        rate,
+        cooldown,
+        minutes_until_deadline,
+        max_duration,
+    ) {
+        // Stays warm through the deadline — block only, no heat-up.
         None => Ok(WarmByPlan {
             heatup_start: None,
             skipped: true,
@@ -854,13 +867,24 @@ mod tests {
         handle: Option<SmartGridHandle>,
         price_state: PriceState,
         modbus: Arc<dyn ModbusWriter>,
+        config: SmartGridConfig,
     ) -> SmartGridState {
         SmartGridState {
             handle,
             price_state,
-            config: test_config(),
+            config,
             tz: chrono_tz::Europe::Stockholm,
             modbus: Some(modbus),
+        }
+    }
+
+    /// Config with cooldown disabled, so the deadline-aware skip reduces to a
+    /// plain `current >= target` check — deterministic regardless of how far
+    /// the test's `HH:MM` deadline lands from "now".
+    fn cfg_no_cooldown() -> SmartGridConfig {
+        SmartGridConfig {
+            warm_by_cooldown_c_per_min: 0.0,
+            ..SmartGridConfig::default()
         }
     }
 
@@ -939,7 +963,14 @@ mod tests {
     #[tokio::test]
     async fn warm_by_preview_skips_when_tank_already_warm() {
         let modbus: Arc<dyn ModbusWriter> = Arc::new(FakeTemp(50.0));
-        let state = test_state_with_modbus(None, PriceState::new("SE3".to_string()), modbus);
+        // Cooldown disabled so warm-now (50 ≥ 48) deterministically skips
+        // regardless of how far "23:59" is from the test's wall-clock now.
+        let state = test_state_with_modbus(
+            None,
+            PriceState::new("SE3".to_string()),
+            modbus,
+            cfg_no_cooldown(),
+        );
         let query = WarmByQuery {
             warm_by: "23:59".to_string(),
             target_c: None,
@@ -955,7 +986,12 @@ mod tests {
     async fn warm_by_preview_plans_heatup_when_cold() {
         let modbus: Arc<dyn ModbusWriter> = Arc::new(FakeTemp(20.0));
         // No price data → immediate-start fallback, so a start is still produced.
-        let state = test_state_with_modbus(None, PriceState::new("SE3".to_string()), modbus);
+        let state = test_state_with_modbus(
+            None,
+            PriceState::new("SE3".to_string()),
+            modbus,
+            test_config(),
+        );
         let query = WarmByQuery {
             warm_by: "23:59".to_string(),
             target_c: None,
@@ -978,8 +1014,12 @@ mod tests {
             Some(modbus.clone()),
             cancel,
         );
-        let state =
-            test_state_with_modbus(Some(handle), PriceState::new("SE3".to_string()), modbus);
+        let state = test_state_with_modbus(
+            Some(handle),
+            PriceState::new("SE3".to_string()),
+            modbus,
+            cfg_no_cooldown(),
+        );
         let query = WarmByQuery {
             warm_by: "23:59".to_string(),
             target_c: None,
