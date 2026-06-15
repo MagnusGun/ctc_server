@@ -515,17 +515,23 @@ fn non_finite_samples_stay_out_of_pending_minutes() {
 #[test]
 fn bucket_minutes_helper_collapses_subminute_samples() {
     let (_dir, store) = tmp_db();
+    // Step back to the minute floor so both samples land in the same minute.
+    // Anchoring on the floor (not raw `now`) keeps the test from flaking when
+    // it runs in a minute's final second, where `now + 1s` would spill into the
+    // next minute and produce two buckets instead of one.
     let now = SystemTime::now();
     let now_secs = unix_secs(now).unwrap();
+    let into_minute = u64::try_from(now_secs.rem_euclid(60)).unwrap();
+    let base = now - std::time::Duration::from_secs(into_minute);
+    let expected_minute = now_secs - now_secs.rem_euclid(60);
     // Two sub-minute samples on the same minute → one mean point.
-    store.record_sample(Sensor::Room, now, 18.0).unwrap();
+    store.record_sample(Sensor::Room, base, 18.0).unwrap();
     store
-        .record_sample(Sensor::Room, now + std::time::Duration::from_secs(1), 22.0)
+        .record_sample(Sensor::Room, base + std::time::Duration::from_secs(1), 22.0)
         .unwrap();
     let pts = store.bucket_minutes(Sensor::Room, 0, i64::MAX);
     assert_eq!(pts.len(), 1, "sub-minute samples must collapse");
     assert_float_eq(pts[0].1, 20.0, "bucket mean");
     // Bucket timestamp is the minute floor of the sample time.
-    let expected_minute = now_secs - now_secs.rem_euclid(60);
     assert_eq!(pts[0].0, expected_minute, "bucket key = minute floor");
 }
