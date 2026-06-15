@@ -587,7 +587,12 @@ function App() {
       window.api.getResumeCandidates()
         .then(r => {
           if (aborted) return;
-          const cands = r?.candidates || [];
+          // Backend returns candidates cheapest-first. Keep the cheapest
+          // (recommended) on top, then show the rest in chronological order.
+          const raw = r?.candidates || [];
+          const cands = raw.length
+            ? [raw[0], ...raw.slice(1).sort((a, b) => a.starts_at.localeCompare(b.starts_at))]
+            : raw;
           setResumeCandidates(cands);
           setPickedResume(0);
           setResumeMode(cands.length ? "schedule" : "manual");
